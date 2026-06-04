@@ -1,0 +1,19 @@
+# Python temporary files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Virtual environment (if placed inside workspace)
+env/
+venv/
+ENV/
+
+# QCoDeS Measurement databases (local storage only)
+*.db
+*.db-journal
+
+# VS Code settings (optional, keeps workspace clean for others)
+.vscode/

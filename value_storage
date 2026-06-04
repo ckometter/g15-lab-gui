@@ -1,0 +1,7 @@
+{
+    "exposure_time": 1.0,
+    "settling_time": 1.0,
+    "ramprate1": 0.4,
+    "ramprate2": 5.0,
+    "ramp_step": 0.01
+}
