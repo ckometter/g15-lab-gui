@@ -1,7 +1,9 @@
 {
-    "exposure_time": 1.0,
-    "settling_time": 1.0,
-    "ramprate1": 0.4,
-    "ramprate2": 5.0,
-    "ramp_step": 0.01
+    "exposure_time": 0.001,
+    "settling_time": 0.001,
+    "ramprate1": 0.01,
+    "ramprate2": 0.01,
+    "ramp_step": 0.01,
+    "c1_name": "Vc1",
+    "c2_name": "Vc2"
 }

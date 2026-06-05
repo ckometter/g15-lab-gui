@@ -47,13 +47,17 @@ class RampedSet:
             
         dt = ramp_step / ramp_rate
         
+        self.channel.ramp_stop_requested = False
         for i in range(1, num_steps + 1):
+            if getattr(self.channel, "ramp_stop_requested", False):
+                break
             fraction = i / num_steps
             next_val = current_val + dval * fraction
             param(next_val)
             time.sleep(dt)
             
-        param(target_val)
+        if not getattr(self.channel, "ramp_stop_requested", False):
+            param(target_val)
 
     def volt(self, target_voltage: float):
         self._ramp("volt", target_voltage)

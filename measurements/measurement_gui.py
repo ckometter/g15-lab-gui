@@ -2,10 +2,13 @@ import os
 import sys
 import json
 import time
+import math
+import re
 import h5py
 import numpy as np
 from PyQt6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
+from utils import EnhancedViewBox
 
 # Ensure parent directory is in path for importing station_setup
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -18,18 +21,125 @@ from station_setup import initialize_station
 pg.setConfigOption('background', '#ffffff')
 pg.setConfigOption('foreground', '#1e293b')
 
+class ScientificPointSpinBox(QtWidgets.QSpinBox):
+    """A spin box that accepts integers in scientific notation like 1e3."""
+
+    _sci_pattern = re.compile(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d*)?$')
+
+    def valueFromText(self, text):
+        try:
+            if text.strip() == "":
+                return self.minimum()
+            value = float(text)
+            if not math.isfinite(value):
+                raise ValueError
+            if not value.is_integer():
+                raise ValueError
+            return int(value)
+        except Exception:
+            return self.minimum()
+
+    def validate(self, text, pos):
+        if text.strip() == "":
+            return QtGui.QValidator.State.Intermediate, text, pos
+        if not self._sci_pattern.match(text):
+            return QtGui.QValidator.State.Invalid, text, pos
+        if len(text) > 0 and text[-1] in 'eE+-':
+            return QtGui.QValidator.State.Intermediate, text, pos
+        try:
+            value = float(text)
+            if not math.isfinite(value):
+                return QtGui.QValidator.State.Invalid, text, pos
+            if not value.is_integer():
+                return QtGui.QValidator.State.Invalid, text, pos
+            if self.minimum() <= int(value) <= self.maximum():
+                return QtGui.QValidator.State.Acceptable, text, pos
+            return QtGui.QValidator.State.Intermediate, text, pos
+        except ValueError:
+            return QtGui.QValidator.State.Invalid, text, pos
+
+
+_OriginalQDoubleSpinBox = QtWidgets.QDoubleSpinBox
+
+class ScientificDoubleSpinBox(_OriginalQDoubleSpinBox):
+    """A double spin box that displays and accepts float values in scientific notation with high precision."""
+    
+    _sci_pattern = re.compile(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d*)?$')
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setDecimals(12)  # Maintain high precision internally
+        self.setRange(-1e30, 1e30) # Default large range, can be overridden
+
+    def textFromValue(self, value):
+        if value == 0:
+            return "0"
+        abs_val = abs(value)
+        if abs_val < 1e-3 or abs_val >= 1e5:
+            s = f"{value:.8e}"
+            parts = s.split('e')
+            if len(parts) == 2:
+                mantissa, exponent = parts
+                if '.' in mantissa:
+                    mantissa = mantissa.rstrip('0')
+                    if mantissa.endswith('.'):
+                        mantissa += '0'
+                exp_sign = exponent[0]
+                exp_val = exponent[1:].lstrip('0')
+                if not exp_val:
+                    exp_val = '0'
+                exponent = exp_sign + exp_val
+                s = f"{mantissa}e{exponent}"
+            return s
+        else:
+            s = f"{value:.8f}"
+            if '.' in s:
+                s = s.rstrip('0')
+                if s.endswith('.'):
+                    s += '0'
+            return s
+
+    def valueFromText(self, text):
+        try:
+            if text.strip() == "":
+                return self.minimum()
+            value = float(text)
+            if not math.isfinite(value):
+                raise ValueError
+            return value
+        except Exception:
+            return self.minimum()
+
+    def validate(self, text, pos):
+        if text.strip() == "":
+            return QtGui.QValidator.State.Intermediate, text, pos
+        if not self._sci_pattern.match(text):
+            return QtGui.QValidator.State.Invalid, text, pos
+        if len(text) > 0 and text[-1] in 'eE+-':
+            return QtGui.QValidator.State.Intermediate, text, pos
+        try:
+            value = float(text)
+            if not math.isfinite(value):
+                return QtGui.QValidator.State.Invalid, text, pos
+            if self.minimum() <= value <= self.maximum():
+                return QtGui.QValidator.State.Acceptable, text, pos
+            return QtGui.QValidator.State.Intermediate, text, pos
+        except ValueError:
+            return QtGui.QValidator.State.Invalid, text, pos
+
+# Override the default QDoubleSpinBox class dynamically
+QtWidgets.QDoubleSpinBox = ScientificDoubleSpinBox
+
+
 def transform_c_to_v(c1, c2, a, b, c, d):
     """
     Convert virtual gate coordinates (c1, c2) to physical voltages (v1, v2)
     using the linear mapping:
-      c1 = a*v1 + b*v2
-      c2 = c*v1 + d*v2
+      v1 = a * c1 + b * c2
+      v2 = c * c1 + d * c2
     """
-    det = a * d - b * c
-    if abs(det) < 1e-9:
-        raise ValueError("Determinant of transformation matrix is zero. Coefficients are linearly dependent!")
-    v1 = (d * c1 - b * c2) / det
-    v2 = (-c * c1 + a * c2) / det
+    v1 = a * c1 + b * c2
+    v2 = c * c1 + d * c2
     return v1, v2
 
 
@@ -47,8 +157,12 @@ class SingleRampWorker(QtCore.QThread):
         self.target_val = target_val
         self.param_name = param_name
 
+    def stop(self):
+        self.channel.ramp_stop_requested = True
+
     def run(self):
         try:
+            self.channel.ramp_stop_requested = False
             if self.param_name == "curr":
                 self.channel.set_r.curr(self.target_val)
             else:
@@ -128,21 +242,15 @@ class SweepWorker(QtCore.QThread):
             # Set CCD exposure
             camera.exposure_time(exposure_time)
 
-            # Generate sweep coordinate arrays
+            # Generate sweep coordinate arrays (always full 2D grid)
             c1_arr = np.linspace(c1_start, c1_end, c1_pts) if c1_pts > 1 else np.array([c1_start])
             c2_arr = np.linspace(c2_start, c2_end, c2_pts) if c2_pts > 1 else np.array([c2_start])
-
-            if sweep_mode == "1D Sweep C1 (Hold C2)":
-                c2_arr = np.array([c2_start])
-            elif sweep_mode == "1D Sweep C2 (Hold C1)":
-                c1_arr = np.array([c1_start])
 
             total_points = len(c1_arr) * len(c2_arr)
             point_count = 0
 
-            # Determine outer and inner axes
-            # By default: outer is C1, inner is C2 (or vice versa if 1D)
-            if sweep_mode == "1D Sweep C2 (Hold C1)":
+            # Outer loop holds one gate fixed while the inner loop sweeps the other.
+            if sweep_mode == "Hold C2, sweep C1":
                 outer_arr = c2_arr
                 inner_arr = c1_arr
                 is_c2_outer = True
@@ -260,6 +368,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # Energy calibration axis
         self.energy_axis = np.linspace(1.5, 3.0, 512) # Dummy range initialized at startup
         self.energy_sort_idx = np.arange(512)
+        self.selected_energy = 2.25
+
+        # Gate map point coordinates
+        self.point_gatemap_1 = 0.0
+        self.point_gatemap_2 = 0.0
 
         # Load stored settings or defaults
         self.load_storage()
@@ -327,7 +440,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "settling_time": 0.05,
             "ramprate1": 0.1,
             "ramprate2": 0.1,
-            "ramp_step": 0.0005
+            "ramp_step": 0.0005,
+            "c1_name": "Vc1",
+            "c2_name": "Vc2"
         }
         self.stored_settings = defaults
         if os.path.exists(storage_path):
@@ -343,16 +458,35 @@ class MainWindow(QtWidgets.QMainWindow):
                         self.stored_settings.setdefault("ramprate1", self.stored_settings["ramp_rate_1"])
                     if "ramp_rate_2" in self.stored_settings:
                         self.stored_settings.setdefault("ramprate2", self.stored_settings["ramp_rate_2"])
+                    self.stored_settings.setdefault("c1_name", "Vc1")
+                    self.stored_settings.setdefault("c2_name", "Vc2")
+                    if str(self.stored_settings.get("c1_name", "")).strip().lower() in ("c1", ""):
+                        self.stored_settings["c1_name"] = "Vc1"
+                    if str(self.stored_settings.get("c2_name", "")).strip().lower() in ("c2", ""):
+                        self.stored_settings["c2_name"] = "Vc2"
             except Exception as e:
                 print(f"Error loading value_storage: {e}")
 
     def save_storage(self):
         storage_path = os.path.join(parent_dir, "value_storage")
+        if hasattr(self, "c1_name_edit"):
+            self.stored_settings["c1_name"] = self.c1_name_edit.text()
+        if hasattr(self, "c2_name_edit"):
+            self.stored_settings["c2_name"] = self.c2_name_edit.text()
         try:
             with open(storage_path, "w") as f:
                 json.dump(self.stored_settings, f, indent=4)
         except Exception as e:
             print(f"Error saving to value_storage: {e}")
+
+    def create_scientific_validator(self, minimum, maximum, decimals):
+        validator = QtGui.QDoubleValidator(minimum, maximum, decimals, self)
+        validator.setNotation(QtGui.QDoubleValidator.Notation.ScientificNotation)
+        return validator
+
+    def enable_scientific_input(self, spinbox):
+        if hasattr(spinbox, "lineEdit") and spinbox.lineEdit() is not None:
+            spinbox.lineEdit().setPlaceholderText("e.g. 1e-3")
 
     # --- UI Building ---
     def setup_ui(self):
@@ -416,7 +550,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ch1_setpoint.setDecimals(4)
         self.ch1_setpoint.setSingleStep(0.001)
         self.ch1_setpoint.setKeyboardTracking(False)
-        self.ch1_setpoint.valueChanged.connect(self.on_ch1_setpoint_enter)
+        self.ch1_setpoint.lineEdit().returnPressed.connect(self.on_ch1_setpoint_enter)
         grid1.addWidget(self.ch1_setpoint, 0, 1)
 
         # 3. Source Mode
@@ -429,9 +563,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # 4. Ramp Rate
         grid1.addWidget(QtWidgets.QLabel("Ramp Rate (V/s):"), 2, 0)
         self.ch1_ramp_rate = QtWidgets.QDoubleSpinBox()
-        self.ch1_ramp_rate.setRange(0.001, 100.0)
+        self.ch1_ramp_rate.setRange(1e-6, 100.0)
+        self.ch1_ramp_rate.setSingleStep(1e-6)
         self.ch1_ramp_rate.setValue(self.stored_settings.get("ramprate1", 0.1))
-        self.ch1_ramp_rate.valueChanged.connect(self.on_ch1_ramping_params_changed)
+        self.ch1_ramp_rate.setKeyboardTracking(False)
+        self.ch1_ramp_rate.editingFinished.connect(self.on_ch1_ramping_params_changed)
         grid1.addWidget(self.ch1_ramp_rate, 2, 1)
 
         # 5. Compliance
@@ -442,7 +578,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ch1_compliance.setDecimals(6)
         self.ch1_compliance.setValue(0.01)
         self.ch1_compliance.setSingleStep(0.001)
-        self.ch1_compliance.valueChanged.connect(self.on_compliance_changed)
+        self.ch1_compliance.setKeyboardTracking(False)
+        self.ch1_compliance.editingFinished.connect(self.on_compliance_changed)
         grid1.addWidget(self.ch1_compliance, 3, 1)
         
         ch1_layout.addLayout(grid1)
@@ -490,7 +627,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ch2_setpoint.setDecimals(4)
         self.ch2_setpoint.setSingleStep(0.001)
         self.ch2_setpoint.setKeyboardTracking(False)
-        self.ch2_setpoint.valueChanged.connect(self.on_ch2_setpoint_enter)
+        self.ch2_setpoint.lineEdit().returnPressed.connect(self.on_ch2_setpoint_enter)
         grid2.addWidget(self.ch2_setpoint, 0, 1)
 
         # 3. Source Mode
@@ -503,9 +640,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # 4. Ramp Rate
         grid2.addWidget(QtWidgets.QLabel("Ramp Rate (V/s):"), 2, 0)
         self.ch2_ramp_rate = QtWidgets.QDoubleSpinBox()
-        self.ch2_ramp_rate.setRange(0.001, 100.0)
+        self.ch2_ramp_rate.setRange(1e-6, 100.0)
+        self.ch2_ramp_rate.setSingleStep(1e-6)
         self.ch2_ramp_rate.setValue(self.stored_settings.get("ramprate2", 0.1))
-        self.ch2_ramp_rate.valueChanged.connect(self.on_ch2_ramping_params_changed)
+        self.ch2_ramp_rate.setKeyboardTracking(False)
+        self.ch2_ramp_rate.editingFinished.connect(self.on_ch2_ramping_params_changed)
         grid2.addWidget(self.ch2_ramp_rate, 2, 1)
 
         # 5. Compliance
@@ -516,7 +655,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ch2_compliance.setDecimals(6)
         self.ch2_compliance.setValue(0.01)
         self.ch2_compliance.setSingleStep(0.001)
-        self.ch2_compliance.valueChanged.connect(self.on_compliance_changed)
+        self.ch2_compliance.setKeyboardTracking(False)
+        self.ch2_compliance.editingFinished.connect(self.on_compliance_changed)
         grid2.addWidget(self.ch2_compliance, 3, 1)
         
         ch2_layout.addLayout(grid2)
@@ -548,114 +688,186 @@ class MainWindow(QtWidgets.QMainWindow):
         ctrl_row.setSpacing(10)
 
         # Control 1
-        ctrl_c1_box = QtWidgets.QGroupBox("[ Control Variable 1 ]")
-        ctrl_c1_layout = QtWidgets.QVBoxLayout(ctrl_c1_box)
-        ctrl_c1_layout.addWidget(QtWidgets.QLabel("Virtual Gate C1 (V):"))
+        # Load name from storage if available, else default to "Virtual Gate 1"
+        c1_default_name = self.stored_settings.get("c1_name", "Virtual Gate 1")
+        self.ctrl_c1_box = QtWidgets.QGroupBox(f"[ {c1_default_name} ]")
+        ctrl_c1_layout = QtWidgets.QVBoxLayout(self.ctrl_c1_box)
         
         c1_grid = QtWidgets.QGridLayout()
         c1_grid.setSpacing(6)
+        
         c1_grid.addWidget(QtWidgets.QLabel("Start:"), 0, 0)
         self.c1_start = QtWidgets.QDoubleSpinBox()
         self.c1_start.setRange(-210.0, 210.0)
         self.c1_start.setValue(-0.005)
         self.c1_start.setDecimals(4)
+        self.c1_start.setKeyboardTracking(False)
         c1_grid.addWidget(self.c1_start, 0, 1)
 
-        c1_grid.addWidget(QtWidgets.QLabel("End:"), 0, 2)
+        c1_grid.addWidget(QtWidgets.QLabel("End:"), 1, 0)
         self.c1_end = QtWidgets.QDoubleSpinBox()
         self.c1_end.setRange(-210.0, 210.0)
         self.c1_end.setValue(0.005)
         self.c1_end.setDecimals(4)
-        c1_grid.addWidget(self.c1_end, 0, 3)
+        self.c1_end.setKeyboardTracking(False)
+        c1_grid.addWidget(self.c1_end, 1, 1)
 
-        c1_grid.addWidget(QtWidgets.QLabel("Points:"), 1, 0)
-        self.c1_pts = QtWidgets.QSpinBox()
+        c1_grid.addWidget(QtWidgets.QLabel("Points:"), 2, 0)
+        self.c1_pts = ScientificPointSpinBox()
         self.c1_pts.setRange(1, 1000)
         self.c1_pts.setValue(21)
-        c1_grid.addWidget(self.c1_pts, 1, 1)
+        self.c1_pts.setKeyboardTracking(True)
+        self.c1_pts.lineEdit().setPlaceholderText("e.g. 1e2")
+        c1_grid.addWidget(self.c1_pts, 2, 1)
 
-        c1_grid.addWidget(QtWidgets.QLabel("Step:"), 1, 2)
+        c1_grid.addWidget(QtWidgets.QLabel("Step:"), 3, 0)
         self.c1_step_lbl = QtWidgets.QLabel("0.0 V")
-        c1_grid.addWidget(self.c1_step_lbl, 1, 3)
+        c1_grid.addWidget(self.c1_step_lbl, 3, 1)
         
         ctrl_c1_layout.addLayout(c1_grid)
-        ctrl_row.addWidget(ctrl_c1_box)
+        ctrl_row.addWidget(self.ctrl_c1_box)
 
         # Control 2
-        ctrl_c2_box = QtWidgets.QGroupBox("[ Control Variable 2 ]")
-        ctrl_c2_layout = QtWidgets.QVBoxLayout(ctrl_c2_box)
-        ctrl_c2_layout.addWidget(QtWidgets.QLabel("Virtual Gate C2 (V):"))
+        # Load name from storage if available, else default to "Virtual Gate 2"
+        c2_default_name = self.stored_settings.get("c2_name", "Virtual Gate 2")
+        self.ctrl_c2_box = QtWidgets.QGroupBox(f"[ {c2_default_name} ]")
+        ctrl_c2_layout = QtWidgets.QVBoxLayout(self.ctrl_c2_box)
         
         c2_grid = QtWidgets.QGridLayout()
         c2_grid.setSpacing(6)
+        
         c2_grid.addWidget(QtWidgets.QLabel("Start:"), 0, 0)
         self.c2_start = QtWidgets.QDoubleSpinBox()
         self.c2_start.setRange(-210.0, 210.0)
         self.c2_start.setValue(-0.005)
         self.c2_start.setDecimals(4)
+        self.c2_start.setKeyboardTracking(False)
         c2_grid.addWidget(self.c2_start, 0, 1)
 
-        c2_grid.addWidget(QtWidgets.QLabel("End:"), 0, 2)
+        c2_grid.addWidget(QtWidgets.QLabel("End:"), 1, 0)
         self.c2_end = QtWidgets.QDoubleSpinBox()
         self.c2_end.setRange(-210.0, 210.0)
         self.c2_end.setValue(0.005)
         self.c2_end.setDecimals(4)
-        c2_grid.addWidget(self.c2_end, 0, 3)
+        self.c2_end.setKeyboardTracking(False)
+        c2_grid.addWidget(self.c2_end, 1, 1)
 
-        c2_grid.addWidget(QtWidgets.QLabel("Points:"), 1, 0)
-        self.c2_pts = QtWidgets.QSpinBox()
+        c2_grid.addWidget(QtWidgets.QLabel("Points:"), 2, 0)
+        self.c2_pts = ScientificPointSpinBox()
         self.c2_pts.setRange(1, 1000)
         self.c2_pts.setValue(21)
-        c2_grid.addWidget(self.c2_pts, 1, 1)
+        self.c2_pts.setKeyboardTracking(True)
+        self.c2_pts.lineEdit().setPlaceholderText("e.g. 1e2")
+        c2_grid.addWidget(self.c2_pts, 2, 1)
 
-        c2_grid.addWidget(QtWidgets.QLabel("Step:"), 1, 2)
+        c2_grid.addWidget(QtWidgets.QLabel("Step:"), 3, 0)
         self.c2_step_lbl = QtWidgets.QLabel("0.0 V")
-        c2_grid.addWidget(self.c2_step_lbl, 1, 3)
+        c2_grid.addWidget(self.c2_step_lbl, 3, 1)
 
         ctrl_c2_layout.addLayout(c2_grid)
-        ctrl_row.addWidget(ctrl_c2_box)
+        ctrl_row.addWidget(self.ctrl_c2_box)
         
         left_layout.addLayout(ctrl_row)
 
-        # Bind events to update step sizes dynamically
+        # Bind events to update step sizes and plot scaling dynamically
         for box in (self.c1_start, self.c1_end, self.c1_pts):
-            box.valueChanged.connect(self.update_step_calculations)
+            box.editingFinished.connect(self.on_sweep_range_changed)
         for box in (self.c2_start, self.c2_end, self.c2_pts):
-            box.valueChanged.connect(self.update_step_calculations)
+            box.editingFinished.connect(self.on_sweep_range_changed)
         self.update_step_calculations()
 
-        # --- ROW 3: Gate Variables coefficients (full width) ---
+        # --- ROW 3: Gate Variables (full width) ---
         gate_box = QtWidgets.QGroupBox("[ Gate Variables ]")
-        gate_layout = QtWidgets.QGridLayout(gate_box)
+        gate_layout = QtWidgets.QVBoxLayout(gate_box)
         gate_layout.setSpacing(10)
 
-        gate_layout.addWidget(QtWidgets.QLabel("c1 = v1 * a + v2 * b"), 0, 0, 1, 2)
-        gate_layout.addWidget(QtWidgets.QLabel("a:"), 1, 0)
+        # Name fields
+        names_layout = QtWidgets.QGridLayout()
+        names_layout.setSpacing(10)
+        names_layout.addWidget(QtWidgets.QLabel("Virtual Gate 1 name:"), 0, 0)
+        self.c1_name_edit = QtWidgets.QLineEdit(c1_default_name)
+        names_layout.addWidget(self.c1_name_edit, 0, 1)
+        
+        names_layout.addWidget(QtWidgets.QLabel("Virtual Gate 2 name:"), 1, 0)
+        self.c2_name_edit = QtWidgets.QLineEdit(c2_default_name)
+        names_layout.addWidget(self.c2_name_edit, 1, 1)
+        
+        gate_layout.addLayout(names_layout)
+
+        # Formula 1 layout: Voltage 1 = a * C1 + b * C2
+        f1_layout = QtWidgets.QHBoxLayout()
+        f1_layout.setSpacing(5)
+        self.v1_formula_label = QtWidgets.QLabel("Voltage 1 = ")
+        f1_layout.addWidget(self.v1_formula_label)
+
         self.coeff_a = QtWidgets.QDoubleSpinBox()
         self.coeff_a.setValue(1.0)
         self.coeff_a.setRange(-100, 100)
-        gate_layout.addWidget(self.coeff_a, 1, 1)
-        
-        gate_layout.addWidget(QtWidgets.QLabel("b:"), 1, 2)
+        self.coeff_a.setDecimals(4)
+        self.coeff_a.setSingleStep(0.01)
+        self.coeff_a.setKeyboardTracking(False)
+        f1_layout.addWidget(self.coeff_a)
+
+        self.v1_c1_label = QtWidgets.QLabel(f" * {c1_default_name}  + ")
+        f1_layout.addWidget(self.v1_c1_label)
+
         self.coeff_b = QtWidgets.QDoubleSpinBox()
         self.coeff_b.setValue(0.0)
         self.coeff_b.setRange(-100, 100)
-        gate_layout.addWidget(self.coeff_b, 1, 3)
+        self.coeff_b.setDecimals(4)
+        self.coeff_b.setSingleStep(0.01)
+        self.coeff_b.setKeyboardTracking(False)
+        f1_layout.addWidget(self.coeff_b)
 
-        gate_layout.addWidget(QtWidgets.QLabel("c2 = v1 * c + v2 * d"), 2, 0, 1, 2)
-        gate_layout.addWidget(QtWidgets.QLabel("c:"), 3, 0)
+        self.v1_c2_label = QtWidgets.QLabel(f" * {c2_default_name}")
+        f1_layout.addWidget(self.v1_c2_label)
+        f1_layout.addStretch()
+
+        gate_layout.addLayout(f1_layout)
+
+        # Formula 2 layout: Voltage 2 = c * C1 + d * C2
+        f2_layout = QtWidgets.QHBoxLayout()
+        f2_layout.setSpacing(5)
+        self.v2_formula_label = QtWidgets.QLabel("Voltage 2 = ")
+        f2_layout.addWidget(self.v2_formula_label)
+
         self.coeff_c = QtWidgets.QDoubleSpinBox()
         self.coeff_c.setValue(0.0)
         self.coeff_c.setRange(-100, 100)
-        gate_layout.addWidget(self.coeff_c, 3, 1)
+        self.coeff_c.setDecimals(4)
+        self.coeff_c.setSingleStep(0.01)
+        self.coeff_c.setKeyboardTracking(False)
+        f2_layout.addWidget(self.coeff_c)
 
-        gate_layout.addWidget(QtWidgets.QLabel("d:"), 3, 2)
+        self.v2_c1_label = QtWidgets.QLabel(f" * {c1_default_name}  + ")
+        f2_layout.addWidget(self.v2_c1_label)
+
         self.coeff_d = QtWidgets.QDoubleSpinBox()
         self.coeff_d.setValue(1.0)
         self.coeff_d.setRange(-100, 100)
-        gate_layout.addWidget(self.coeff_d, 3, 3)
+        self.coeff_d.setDecimals(4)
+        self.coeff_d.setSingleStep(0.01)
+        self.coeff_d.setKeyboardTracking(False)
+        f2_layout.addWidget(self.coeff_d)
 
+        self.v2_c2_label = QtWidgets.QLabel(f" * {c2_default_name}")
+        f2_layout.addWidget(self.v2_c2_label)
+        f2_layout.addStretch()
+
+        gate_layout.addLayout(f2_layout)
         left_layout.addWidget(gate_box)
+
+        # Connect name change events to update layouts and axes
+        self.c1_name_edit.textChanged.connect(self.update_variable_names)
+        self.c2_name_edit.textChanged.connect(self.update_variable_names)
+        self.c1_name_edit.editingFinished.connect(self.save_storage)
+        self.c2_name_edit.editingFinished.connect(self.save_storage)
+
+        # Connect coefficient updates to automatically recalculate coordinates
+        self.coeff_a.editingFinished.connect(self.on_sweep_range_changed)
+        self.coeff_b.editingFinished.connect(self.on_sweep_range_changed)
+        self.coeff_c.editingFinished.connect(self.on_sweep_range_changed)
+        self.coeff_d.editingFinished.connect(self.on_sweep_range_changed)
 
         # --- ROW 4: Other Settings & Measurement Control next to each other ---
         bottom_row = QtWidgets.QHBoxLayout()
@@ -668,7 +880,8 @@ class MainWindow(QtWidgets.QMainWindow):
         
         other_layout.addWidget(QtWidgets.QLabel("Sweep Configuration:"))
         self.sweep_mode_combo = QtWidgets.QComboBox()
-        self.sweep_mode_combo.addItems(["2D Sweep (C1 & C2)", "1D Sweep C1 (Hold C2)", "1D Sweep C2 (Hold C1)"])
+        self.sweep_mode_combo.addItems(["Hold C1, sweep C2", "Hold C2, sweep C1"])
+        self.sweep_mode_combo.currentTextChanged.connect(self.on_sweep_range_changed)
         other_layout.addWidget(self.sweep_mode_combo)
 
         self.serpentine_box = QtWidgets.QCheckBox("Serpentine (Snake) Sweep")
@@ -683,7 +896,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.exposure_box.setRange(0.001, 10.0)
         self.exposure_box.setDecimals(3)
         self.exposure_box.setValue(self.stored_settings.get("exposure_time", 0.1))
-        self.exposure_box.valueChanged.connect(self.on_timing_params_changed)
+        self.exposure_box.setKeyboardTracking(False)
+        self.exposure_box.editingFinished.connect(self.on_timing_params_changed)
         timing_ramp_grid.addWidget(self.exposure_box, 0, 1)
 
         timing_ramp_grid.addWidget(QtWidgets.QLabel("Settling (s):"), 1, 0)
@@ -691,7 +905,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settling_box.setRange(0.0, 10.0)
         self.settling_box.setDecimals(3)
         self.settling_box.setValue(self.stored_settings.get("settling_time", 0.05))
-        self.settling_box.valueChanged.connect(self.on_timing_params_changed)
+        self.settling_box.setKeyboardTracking(False)
+        self.settling_box.editingFinished.connect(self.on_timing_params_changed)
         timing_ramp_grid.addWidget(self.settling_box, 1, 1)
 
         timing_ramp_grid.addWidget(QtWidgets.QLabel("Ramp Step (V):"), 2, 0)
@@ -699,11 +914,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ramp_step_box.setRange(0.0001, 1.0)
         self.ramp_step_box.setDecimals(5)
         self.ramp_step_box.setValue(self.stored_settings.get("ramp_step", 0.0005))
-        self.ramp_step_box.valueChanged.connect(self.on_ramp_step_changed)
+        self.ramp_step_box.setKeyboardTracking(False)
+        self.ramp_step_box.editingFinished.connect(self.on_ramp_step_changed)
         timing_ramp_grid.addWidget(self.ramp_step_box, 2, 1)
         
         other_layout.addLayout(timing_ramp_grid)
         bottom_row.addWidget(other_box)
+
+        # Enable scientific notation entry on numeric spin boxes
+        for spin in (
+            self.ch1_setpoint,
+            self.ch1_ramp_rate,
+            self.ch1_compliance,
+            self.ch2_setpoint,
+            self.ch2_ramp_rate,
+            self.ch2_compliance,
+            self.c1_start,
+            self.c1_end,
+            self.c2_start,
+            self.c2_end,
+            self.coeff_a,
+            self.coeff_b,
+            self.coeff_c,
+            self.coeff_d,
+            self.exposure_box,
+            self.settling_box,
+            self.ramp_step_box,
+        ):
+            self.enable_scientific_input(spin)
 
         # Measurement Control Box
         meas_box = QtWidgets.QGroupBox("[ Measurement Control ]")
@@ -718,7 +956,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pause_btn = QtWidgets.QPushButton("⏸ Interrupt")
         self.pause_btn.setStyleSheet("background-color: #ef4444; color: white; font-weight: bold; border: 1px solid #ef4444;")
         self.pause_btn.setEnabled(False)
-        self.pause_btn.clicked.connect(self.pause_sweep)
+        self.pause_btn.clicked.connect(self.on_interrupt_clicked)
         meas_layout.addWidget(self.pause_btn)
 
         self.reset_btn = QtWidgets.QPushButton("↺ Reset")
@@ -759,6 +997,11 @@ class MainWindow(QtWidgets.QMainWindow):
         right_panel.addTab(self.tab3, "Bottom Gate (Ch2 Current)")
         self.setup_tab3()
 
+        # Update initial variable names
+        self.update_variable_names()
+        self.update_coordinates_from_ui()
+        self.reset_plot_scaling()
+
     def setup_tab1(self):
         """Setup 2x2 grid of plots for Gating vs Energy Spectra in Tab 1"""
         layout = QtWidgets.QGridLayout(self.tab1)
@@ -766,7 +1009,9 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setSpacing(6)
 
         # 1. Gate Map Plot (Top Left)
-        self.gatemap_win = pg.PlotWidget(title="2D Gate Map (Integrated Counts)")
+        self.gatemap_win = pg.PlotWidget(viewBox=EnhancedViewBox(), title="2D Gate Map (Integrated Counts)")
+        self.gatemap_win.getViewBox().setMouseEnabled(x=True, y=True)
+        self.gatemap_win.getViewBox().enableAutoRange(enable=False)
         self.gatemap_img = pg.ImageItem()
         self.gatemap_img.setOpts(axisOrder='row-major')
         self.gatemap_win.addItem(self.gatemap_img)
@@ -784,11 +1029,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gatemap_win.addItem(self.cross1_h)
         self.cross1_v.sigPositionChanged.connect(self.on_crosshair_moved)
         self.cross1_h.sigPositionChanged.connect(self.on_crosshair_moved)
+        
+        # Monkey-patch ViewBox to intercept left clicks and reposition crosshair lines
+        viewbox1 = self.gatemap_win.getViewBox()
+        viewbox1.originalMouseClickEvent = viewbox1.mouseClickEvent
+        def gatemap_click_event(ev):
+            if ev.button() == QtCore.Qt.MouseButton.LeftButton:
+                mouse_point = viewbox1.mapSceneToView(ev.scenePos())
+                c1_val = mouse_point.x()
+                c2_val = mouse_point.y()
+                self.update_crosshair_values(c1_val, c2_val, self.selected_energy)
+                self.refresh_slice_plots(c1_val, c2_val)
+                ev.accept()
+            else:
+                viewbox1.originalMouseClickEvent(ev)
+        viewbox1.mouseClickEvent = gatemap_click_event
 
         layout.addWidget(self.gatemap_win, 0, 0)
 
         # 2. Vertical Slice (Top Right)
-        self.vslice_win = pg.PlotWidget(title="Vertical Slice spectra")
+        self.vslice_win = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Vertical Slice spectra")
+        self.vslice_win.getViewBox().setMouseEnabled(x=True, y=True)
+        self.vslice_win.getViewBox().enableAutoRange(enable=False)
         self.vslice_img = pg.ImageItem()
         self.vslice_img.setOpts(axisOrder='row-major')
         self.vslice_win.addItem(self.vslice_img)
@@ -798,14 +1060,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vslice_colorbar = pg.ColorBarItem(values=(0, 65535), colorMap='viridis')
         self.vslice_colorbar.setImageItem(self.vslice_img)
 
-        # Draggable vertical line showing slice marker
-        self.vslice_marker = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('#dc2626', width=1.5, style=QtCore.Qt.PenStyle.DashLine))
-        self.vslice_win.addItem(self.vslice_marker)
+        # Draggable crosshair lines
+        self.vslice_cross_v = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen('#4f46e5', width=2))
+        self.vslice_cross_h = pg.InfiniteLine(angle=0, movable=True, pen=pg.mkPen('#4f46e5', width=2))
+        self.vslice_win.addItem(self.vslice_cross_v)
+        self.vslice_win.addItem(self.vslice_cross_h)
+        self.vslice_cross_v.sigPositionChanged.connect(self.on_vslice_crosshair_moved)
+        self.vslice_cross_h.sigPositionChanged.connect(self.on_vslice_crosshair_moved)
+
+        # Monkey-patch ViewBox to intercept left clicks and reposition crosshair lines
+        viewbox_vslice = self.vslice_win.getViewBox()
+        viewbox_vslice.originalMouseClickEvent = viewbox_vslice.mouseClickEvent
+        def vslice_click_event(ev):
+            if ev.button() == QtCore.Qt.MouseButton.LeftButton:
+                mouse_point = viewbox_vslice.mapSceneToView(ev.scenePos())
+                c1_val = self.cross1_v.value()
+                c2_val = mouse_point.y()
+                energy_val = mouse_point.x()
+                self.update_crosshair_values(c1_val, c2_val, energy_val)
+                self.refresh_slice_plots(c1_val, c2_val)
+                ev.accept()
+            else:
+                viewbox_vslice.originalMouseClickEvent(ev)
+        viewbox_vslice.mouseClickEvent = vslice_click_event
 
         layout.addWidget(self.vslice_win, 0, 1)
 
         # 3. Horizontal Slice (Bottom Left)
-        self.hslice_win = pg.PlotWidget(title="Horizontal Slice spectra")
+        self.hslice_win = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Horizontal Slice spectra")
+        self.hslice_win.getViewBox().setMouseEnabled(x=True, y=True)
+        self.hslice_win.getViewBox().enableAutoRange(enable=False)
         self.hslice_img = pg.ImageItem()
         self.hslice_img.setOpts(axisOrder='row-major')
         self.hslice_win.addItem(self.hslice_img)
@@ -815,22 +1099,66 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hslice_colorbar = pg.ColorBarItem(values=(0, 65535), colorMap='viridis')
         self.hslice_colorbar.setImageItem(self.hslice_img)
 
-        self.hslice_marker = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('#dc2626', width=1.5, style=QtCore.Qt.PenStyle.DashLine))
-        self.hslice_win.addItem(self.hslice_marker)
+        # Draggable crosshair lines
+        self.hslice_cross_v = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen('#4f46e5', width=2))
+        self.hslice_cross_h = pg.InfiniteLine(angle=0, movable=True, pen=pg.mkPen('#4f46e5', width=2))
+        self.hslice_win.addItem(self.hslice_cross_v)
+        self.hslice_win.addItem(self.hslice_cross_h)
+        self.hslice_cross_v.sigPositionChanged.connect(self.on_hslice_crosshair_moved)
+        self.hslice_cross_h.sigPositionChanged.connect(self.on_hslice_crosshair_moved)
+
+        # Monkey-patch ViewBox to intercept left clicks and reposition crosshair lines
+        viewbox_hslice = self.hslice_win.getViewBox()
+        viewbox_hslice.originalMouseClickEvent = viewbox_hslice.mouseClickEvent
+        def hslice_click_event(ev):
+            if ev.button() == QtCore.Qt.MouseButton.LeftButton:
+                mouse_point = viewbox_hslice.mapSceneToView(ev.scenePos())
+                c1_val = mouse_point.x()
+                c2_val = self.cross1_h.value()
+                energy_val = mouse_point.y()
+                self.update_crosshair_values(c1_val, c2_val, energy_val)
+                self.refresh_slice_plots(c1_val, c2_val)
+                ev.accept()
+            else:
+                viewbox_hslice.originalMouseClickEvent(ev)
+        viewbox_hslice.mouseClickEvent = hslice_click_event
 
         layout.addWidget(self.hslice_win, 1, 0)
 
         # 4. Spectrum at Cross (Bottom Right)
-        self.spectrum_win = pg.PlotWidget(title="CCD Spectrum at Gating Crosshair")
+        self.spectrum_win = pg.PlotWidget(viewBox=EnhancedViewBox(), title="CCD Spectrum at Gating Crosshair")
+        self.spectrum_win.getViewBox().setMouseEnabled(x=True, y=True)
+        self.spectrum_win.getViewBox().enableAutoRange(axis='x', enable=False)
+        self.spectrum_win.getViewBox().enableAutoRange(axis='y', enable=False)
         self.spectrum_curve = self.spectrum_win.plot(pen=pg.mkPen('#7c3aed', width=2))
         self.spectrum_win.setLabel('left', 'Counts')
         self.spectrum_win.setLabel('bottom', 'Energy', units='eV')
         self.spectrum_win.showGrid(x=True, y=True, alpha=0.3)
 
-        # Draggable region to define integration window for Gate Map
-        self.int_region = pg.LinearRegionItem(values=(2.4, 2.6), brush=pg.mkBrush(16, 185, 129, 40), pen=pg.mkPen('#10b981', width=1.5))
-        self.spectrum_win.addItem(self.int_region)
-        self.int_region.sigRegionChanged.connect(self.on_integration_region_changed)
+        # Draggable vertical lines (spectrum_v1 and spectrum_v2) to highlight region (X-axis integration window)
+        self.spectrum_v_region = pg.LinearRegionItem(
+            orientation='vertical',
+            values=(2.4, 2.6),
+            brush=pg.mkBrush(16, 185, 129, 40), # green transparent fill
+            pen=pg.mkPen('#10b981', width=1.5)  # continuous green line
+        )
+        self.spectrum_win.addItem(self.spectrum_v_region, ignoreBounds=True)
+        self.spectrum_v1 = self.spectrum_v_region.lines[0]
+        self.spectrum_v2 = self.spectrum_v_region.lines[1]
+        self.spectrum_v_region.sigRegionChanged.connect(self.on_integration_region_changed)
+
+        # Draggable horizontal lines (spectrum_h1 and spectrum_h2) to highlight region (Y-axis counts window)
+        self.spectrum_h_region = pg.LinearRegionItem(
+            orientation='horizontal',
+            values=(1000.0, 5000.0),
+            brush=pg.mkBrush(16, 185, 129, 40), # green transparent fill
+            pen=pg.mkPen('#10b981', width=1.5)  # continuous green line
+        )
+        self.spectrum_win.addItem(self.spectrum_h_region, ignoreBounds=True)
+        self.spectrum_h1 = self.spectrum_h_region.lines[0]
+        self.spectrum_h2 = self.spectrum_h_region.lines[1]
+        self.spectrum_h_region.sigRegionChanged.connect(self.on_integration_region_changed)
+
 
         layout.addWidget(self.spectrum_win, 1, 1)
 
@@ -840,12 +1168,14 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setContentsMargins(5, 5, 5, 5)
 
         # Left: Heatmap
-        self.t2_heatmap_win = pg.PlotWidget(title="Top Gate Current Heatmap")
+        self.t2_heatmap_win = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Top Gate Current Heatmap")
+        self.t2_heatmap_win.getViewBox().setMouseEnabled(x=True, y=True)
+        self.t2_heatmap_win.getViewBox().enableAutoRange(enable=False)
         self.t2_heatmap_img = pg.ImageItem()
         self.t2_heatmap_img.setOpts(axisOrder='row-major')
         self.t2_heatmap_win.addItem(self.t2_heatmap_img)
         self.t2_heatmap_win.setLabel('left', 'Virtual Gate C2', units='V')
-        self.t2_heatmap_win.setLabel('bottom', 'Physical Vtop (Ch1)', units='V')
+        self.t2_heatmap_win.setLabel('bottom', 'Virtual Gate C1', units='V')
 
         self.t2_colorbar = pg.ColorBarItem(colorMap='viridis')
         self.t2_colorbar.setImageItem(self.t2_heatmap_img)
@@ -857,6 +1187,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t2_heatmap_win.addItem(self.cross2_h)
         self.cross2_v.sigPositionChanged.connect(self.on_tab2_crosshair_moved)
         self.cross2_h.sigPositionChanged.connect(self.on_tab2_crosshair_moved)
+        
+        # Monkey-patch ViewBox to intercept left clicks and reposition crosshair lines
+        viewbox2 = self.t2_heatmap_win.getViewBox()
+        viewbox2.originalMouseClickEvent = viewbox2.mouseClickEvent
+        def t2_click_event(ev):
+            if ev.button() == QtCore.Qt.MouseButton.LeftButton:
+                mouse_point = viewbox2.mapSceneToView(ev.scenePos())
+                self.cross2_v.blockSignals(True)
+                self.cross2_h.blockSignals(True)
+                self.cross2_v.setValue(mouse_point.x())
+                self.cross2_h.setValue(mouse_point.y())
+                self.cross2_v.blockSignals(False)
+                self.cross2_h.blockSignals(False)
+                self.on_tab2_crosshair_moved()
+                ev.accept()
+            else:
+                viewbox2.originalMouseClickEvent(ev)
+        viewbox2.mouseClickEvent = t2_click_event
 
         layout.addWidget(self.t2_heatmap_win, 3)
 
@@ -864,14 +1212,20 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout = QtWidgets.QVBoxLayout()
         right_layout.setSpacing(6)
 
-        self.t2_hslice_win = pg.PlotWidget(title="Slice at fixed C2")
+        self.t2_hslice_win = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Slice at fixed C2")
+        self.t2_hslice_win.getViewBox().setMouseEnabled(x=True, y=True)
+        self.t2_hslice_win.getViewBox().enableAutoRange(axis='x', enable=False)
+        self.t2_hslice_win.getViewBox().enableAutoRange(axis='y', enable=True)
         self.t2_hslice_curve = self.t2_hslice_win.plot(pen=pg.mkPen('#2563eb', width=2))
         self.t2_hslice_win.setLabel('left', 'Current', units='A')
-        self.t2_hslice_win.setLabel('bottom', 'Vtop (Ch1)', units='V')
+        self.t2_hslice_win.setLabel('bottom', 'Virtual Gate C1', units='V')
         self.t2_hslice_win.showGrid(x=True, y=True, alpha=0.3)
         right_layout.addWidget(self.t2_hslice_win)
 
-        self.t2_vslice_win = pg.PlotWidget(title="Slice at fixed Vtop")
+        self.t2_vslice_win = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Slice at fixed C1")
+        self.t2_vslice_win.getViewBox().setMouseEnabled(x=True, y=True)
+        self.t2_vslice_win.getViewBox().enableAutoRange(axis='x', enable=False)
+        self.t2_vslice_win.getViewBox().enableAutoRange(axis='y', enable=True)
         self.t2_vslice_curve = self.t2_vslice_win.plot(pen=pg.mkPen('#d97706', width=2))
         self.t2_vslice_win.setLabel('left', 'Current', units='A')
         self.t2_vslice_win.setLabel('bottom', 'Virtual Gate C2', units='V')
@@ -886,12 +1240,14 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setContentsMargins(5, 5, 5, 5)
 
         # Left: Heatmap
-        self.t3_heatmap_win = pg.PlotWidget(title="Bottom Gate Current Heatmap")
+        self.t3_heatmap_win = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Bottom Gate Current Heatmap")
+        self.t3_heatmap_win.getViewBox().setMouseEnabled(x=True, y=True)
+        self.t3_heatmap_win.getViewBox().enableAutoRange(enable=False)
         self.t3_heatmap_img = pg.ImageItem()
         self.t3_heatmap_img.setOpts(axisOrder='row-major')
         self.t3_heatmap_win.addItem(self.t3_heatmap_img)
-        self.t3_heatmap_win.setLabel('left', 'Virtual Gate C1', units='V')
-        self.t3_heatmap_win.setLabel('bottom', 'Physical Vbottom (Ch2)', units='V')
+        self.t3_heatmap_win.setLabel('left', 'Virtual Gate C2', units='V')
+        self.t3_heatmap_win.setLabel('bottom', 'Virtual Gate C1', units='V')
 
         self.t3_colorbar = pg.ColorBarItem(colorMap='viridis')
         self.t3_colorbar.setImageItem(self.t3_heatmap_img)
@@ -903,6 +1259,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t3_heatmap_win.addItem(self.cross3_h)
         self.cross3_v.sigPositionChanged.connect(self.on_tab3_crosshair_moved)
         self.cross3_h.sigPositionChanged.connect(self.on_tab3_crosshair_moved)
+        
+        # Monkey-patch ViewBox to intercept left clicks and reposition crosshair lines
+        viewbox3 = self.t3_heatmap_win.getViewBox()
+        viewbox3.originalMouseClickEvent = viewbox3.mouseClickEvent
+        def t3_click_event(ev):
+            if ev.button() == QtCore.Qt.MouseButton.LeftButton:
+                mouse_point = viewbox3.mapSceneToView(ev.scenePos())
+                self.cross3_v.blockSignals(True)
+                self.cross3_h.blockSignals(True)
+                self.cross3_v.setValue(mouse_point.x())
+                self.cross3_h.setValue(mouse_point.y())
+                self.cross3_v.blockSignals(False)
+                self.cross3_h.blockSignals(False)
+                self.on_tab3_crosshair_moved()
+                ev.accept()
+            else:
+                viewbox3.originalMouseClickEvent(ev)
+        viewbox3.mouseClickEvent = t3_click_event
 
         layout.addWidget(self.t3_heatmap_win, 3)
 
@@ -910,17 +1284,23 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout = QtWidgets.QVBoxLayout()
         right_layout.setSpacing(6)
 
-        self.t3_hslice_win = pg.PlotWidget(title="Slice at fixed C1")
+        self.t3_hslice_win = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Slice at fixed C2")
+        self.t3_hslice_win.getViewBox().setMouseEnabled(x=True, y=True)
+        self.t3_hslice_win.getViewBox().enableAutoRange(axis='x', enable=False)
+        self.t3_hslice_win.getViewBox().enableAutoRange(axis='y', enable=True)
         self.t3_hslice_curve = self.t3_hslice_win.plot(pen=pg.mkPen('#2563eb', width=2))
         self.t3_hslice_win.setLabel('left', 'Current', units='A')
-        self.t3_hslice_win.setLabel('bottom', 'Vbottom (Ch2)', units='V')
+        self.t3_hslice_win.setLabel('bottom', 'Virtual Gate C1', units='V')
         self.t3_hslice_win.showGrid(x=True, y=True, alpha=0.3)
         right_layout.addWidget(self.t3_hslice_win)
 
-        self.t3_vslice_win = pg.PlotWidget(title="Slice at fixed Vbottom")
+        self.t3_vslice_win = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Slice at fixed C1")
+        self.t3_vslice_win.getViewBox().setMouseEnabled(x=True, y=True)
+        self.t3_vslice_win.getViewBox().enableAutoRange(axis='x', enable=False)
+        self.t3_vslice_win.getViewBox().enableAutoRange(axis='y', enable=True)
         self.t3_vslice_curve = self.t3_vslice_win.plot(pen=pg.mkPen('#d97706', width=2))
         self.t3_vslice_win.setLabel('left', 'Current', units='A')
-        self.t3_vslice_win.setLabel('bottom', 'Virtual Gate C1', units='V')
+        self.t3_vslice_win.setLabel('bottom', 'Virtual Gate C2', units='V')
         self.t3_vslice_win.showGrid(x=True, y=True, alpha=0.3)
         right_layout.addWidget(self.t3_vslice_win)
 
@@ -1098,6 +1478,84 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 getattr(self, f"{axis}_step_lbl").setText("N/A")
 
+    def update_coordinates_from_ui(self):
+        """Build coordinates and grids from UI control values."""
+        c1_start = self.c1_start.value()
+        c1_end = self.c1_end.value()
+        c1_pts = self.c1_pts.value()
+
+        c2_start = self.c2_start.value()
+        c2_end = self.c2_end.value()
+        c2_pts = self.c2_pts.value()
+
+        c1_pts_actual = c1_pts
+        c2_pts_actual = c2_pts
+
+        self.c1_coords = np.linspace(c1_start, c1_end, c1_pts_actual) if c1_pts_actual > 1 else np.array([c1_start])
+        self.c2_coords = np.linspace(c2_start, c2_end, c2_pts_actual) if c2_pts_actual > 1 else np.array([c2_start])
+
+        a = self.coeff_a.value()
+        b = self.coeff_b.value()
+        c = self.coeff_c.value()
+        d = self.coeff_d.value()
+
+        self.v1_grid = np.zeros((c2_pts_actual, c1_pts_actual))
+        self.v2_grid = np.zeros((c2_pts_actual, c1_pts_actual))
+        for j, c2_val in enumerate(self.c2_coords):
+            for i, c1_val in enumerate(self.c1_coords):
+                v1, v2 = transform_c_to_v(c1_val, c2_val, a, b, c, d)
+                self.v1_grid[j, i] = v1
+                self.v2_grid[j, i] = v2
+
+    def on_sweep_range_changed(self):
+        """Called dynamically when sweep parameters are changed in the UI."""
+        self.update_step_calculations()
+        if not self.is_running:
+            self.update_coordinates_from_ui()
+            self.reset_plot_scaling()
+
+    def update_variable_names(self):
+        """Dynamically update control group box titles, labels, equations and plot axes on user edit."""
+        c1_name = self.c1_name_edit.text().strip() or "Vc1"
+        c2_name = self.c2_name_edit.text().strip() or "Vc2"
+
+        # Update group box titles
+        self.ctrl_c1_box.setTitle(f"[ {c1_name} ]")
+        self.ctrl_c2_box.setTitle(f"[ {c2_name} ]")
+
+        # Update formulas labels
+        self.v1_c1_label.setText(f" * {c1_name}  + ")
+        self.v1_c2_label.setText(f" * {c2_name}")
+        self.v2_c1_label.setText(f" * {c1_name}  + ")
+        self.v2_c2_label.setText(f" * {c2_name}")
+
+        # Format axes label strings
+        c1_label = f"Vc1 ({c1_name})" if c1_name.lower() != "vc1" else "Vc1"
+        c2_label = f"Vc2 ({c2_name})" if c2_name.lower() != "vc2" else "Vc2"
+
+        # Update plot axis labels if they exist
+        if hasattr(self, 'gatemap_win'):
+            self.gatemap_win.setLabel('bottom', c1_label, units='V')
+            self.gatemap_win.setLabel('left', c2_label, units='V')
+        if hasattr(self, 'vslice_win'):
+            self.vslice_win.setLabel('left', c2_label, units='V')
+        if hasattr(self, 'hslice_win'):
+            self.hslice_win.setLabel('bottom', c1_label, units='V')
+        if hasattr(self, 't2_heatmap_win'):
+            self.t2_heatmap_win.setLabel('bottom', c1_label, units='V')
+            self.t2_heatmap_win.setLabel('left', c2_label, units='V')
+        if hasattr(self, 't2_hslice_win'):
+            self.t2_hslice_win.setLabel('bottom', c1_label, units='V')
+        if hasattr(self, 't2_vslice_win'):
+            self.t2_vslice_win.setLabel('bottom', c2_label, units='V')
+        if hasattr(self, 't3_heatmap_win'):
+            self.t3_heatmap_win.setLabel('bottom', c1_label, units='V')
+            self.t3_heatmap_win.setLabel('left', c2_label, units='V')
+        if hasattr(self, 't3_hslice_win'):
+            self.t3_hslice_win.setLabel('bottom', c1_label, units='V')
+        if hasattr(self, 't3_vslice_win'):
+            self.t3_vslice_win.setLabel('bottom', c2_label, units='V')
+
     def on_ch1_setpoint_enter(self):
         """Enter key pressed in Setpoint 1 - execute background ramping."""
         val = self.ch1_setpoint.value()
@@ -1113,6 +1571,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def ramp_channel(self, channel, target, param_name, ch_name):
         unit = "A" if param_name == "curr" else "V"
         self.status_lbl.setText(f"Status: Ramping {ch_name} to {target} {unit}...")
+        self.set_inputs_enabled(False)
+        self.pause_btn.setEnabled(True)
         
         self.ramp_worker = SingleRampWorker(channel, target, param_name)
         self.ramp_worker.finished.connect(self.on_ramp_finished)
@@ -1120,10 +1580,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ramp_worker.start()
 
     def on_ramp_finished(self):
-        self.status_lbl.setText("Status: Ramping complete.")
+        if self.ramp_worker and getattr(self.ramp_worker.channel, "ramp_stop_requested", False):
+            self.status_lbl.setText("Status: Ramping interrupted.")
+        else:
+            self.status_lbl.setText("Status: Ramping complete.")
+        self.set_inputs_enabled(True)
+        self.pause_btn.setEnabled(False)
 
     def on_ramp_error(self, err_msg):
         self.status_lbl.setText(f"Status: Ramping error")
+        self.set_inputs_enabled(True)
+        self.pause_btn.setEnabled(False)
         QtWidgets.QMessageBox.critical(self, "Ramping Error", f"Error ramping channel:\n{err_msg}")
 
     def toggle_ch1_output(self, enabled):
@@ -1301,55 +1768,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         # Prepare parameters and validate
-        a = self.coeff_a.value()
-        b = self.coeff_b.value()
-        c = self.coeff_c.value()
-        d = self.coeff_d.value()
-        
-        det = a * d - b * c
-        if abs(det) < 1e-9:
-            QtWidgets.QMessageBox.critical(self, "Invalid Coefficients", "The transformation matrix is singular (determinant = 0). Choose linearly independent coefficients.")
-            return
-
-        # Build coordinate arrays
-        c1_start = self.c1_start.value()
-        c1_end = self.c1_end.value()
-        c1_pts = self.c1_pts.value()
-
-        c2_start = self.c2_start.value()
-        c2_end = self.c2_end.value()
-        c2_pts = self.c2_pts.value()
-
-        sweep_mode = self.sweep_mode_combo.currentText()
-
-        # Build ranges for validation and storage allocation
-        if sweep_mode == "1D Sweep C1 (Hold C2)":
-            c2_pts_actual = 1
-            c1_pts_actual = c1_pts
-        elif sweep_mode == "1D Sweep C2 (Hold C1)":
-            c1_pts_actual = 1
-            c2_pts_actual = c2_pts
-        else:
-            c1_pts_actual = c1_pts
-            c2_pts_actual = c2_pts
-
-        self.c1_coords = np.linspace(c1_start, c1_end, c1_pts_actual) if c1_pts_actual > 1 else np.array([c1_start])
-        self.c2_coords = np.linspace(c2_start, c2_end, c2_pts_actual) if c2_pts_actual > 1 else np.array([c2_start])
+        self.update_coordinates_from_ui()
+        c1_pts_actual = len(self.c1_coords)
+        c2_pts_actual = len(self.c2_coords)
 
         # Allocate data containers
         self.data_spectra = np.zeros((c2_pts_actual, c1_pts_actual, 512))
         self.data_current_ch1 = np.zeros((c2_pts_actual, c1_pts_actual))
         self.data_current_ch2 = np.zeros((c2_pts_actual, c1_pts_actual))
         self.data_measured_mask = np.zeros((c2_pts_actual, c1_pts_actual), dtype=bool)
-
-        # Precalculate grid coordinates for Tab 2/3 Heatmaps
-        self.v1_grid = np.zeros((c2_pts_actual, c1_pts_actual))
-        self.v2_grid = np.zeros((c2_pts_actual, c1_pts_actual))
-        for j, c2 in enumerate(self.c2_coords):
-            for i, c1 in enumerate(self.c1_coords):
-                v1, v2 = transform_c_to_v(c1, c2, a, b, c, d)
-                self.v1_grid[j, i] = v1
-                self.v2_grid[j, i] = v2
 
         # Initialize heatmap images with zero arrays of the correct size
         # so pyqtgraph can resolve their size when setRect is called
@@ -1378,10 +1805,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Start sweep thread
         params = {
-            'a': a, 'b': b, 'c': c, 'd': d,
-            'c1_start': c1_start, 'c1_end': c1_end, 'c1_pts': c1_pts,
-            'c2_start': c2_start, 'c2_end': c2_end, 'c2_pts': c2_pts,
-            'sweep_mode': sweep_mode,
+            'a': self.coeff_a.value(),
+            'b': self.coeff_b.value(),
+            'c': self.coeff_c.value(),
+            'd': self.coeff_d.value(),
+            'c1_start': self.c1_start.value(),
+            'c1_end': self.c1_end.value(),
+            'c1_pts': self.c1_pts.value(),
+            'c2_start': self.c2_start.value(),
+            'c2_end': self.c2_end.value(),
+            'c2_pts': self.c2_pts.value(),
+            'sweep_mode': self.sweep_mode_combo.currentText(),
             'serpentine': self.serpentine_box.isChecked(),
             'exposure_time': self.exposure_box.value(),
             'settling_time': self.settling_box.value()
@@ -1404,6 +1838,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sweep_worker.finished.connect(self.on_sweep_finished)
         self.sweep_worker.error_occurred.connect(self.on_sweep_error)
         self.sweep_worker.start()
+
+    def on_interrupt_clicked(self):
+        if self.ramp_worker and self.ramp_worker.isRunning():
+            self.ramp_worker.stop()
+            self.status_lbl.setText("Status: Interrupting ramp...")
+            self.pause_btn.setEnabled(False)
+        elif self.is_running:
+            self.pause_sweep()
 
     def pause_sweep(self):
         if not self.is_running:
@@ -1476,52 +1918,224 @@ class MainWindow(QtWidgets.QMainWindow):
     def reset_plot_scaling(self):
         """Set initial geometric sizes and labels for heatmap plots."""
         # Tab 1: Gate Map (integrated spectra)
-        dx = (self.c1_coords[-1] - self.c1_coords[0]) / (len(self.c1_coords) - 1) if len(self.c1_coords) > 1 else 1.0
-        dy = (self.c2_coords[-1] - self.c2_coords[0]) / (len(self.c2_coords) - 1) if len(self.c2_coords) > 1 else 1.0
+        width1 = self.c1_coords[-1] - self.c1_coords[0]
+        x_start1 = self.c1_coords[0]
+        c1_min = min(self.c1_coords[0], self.c1_coords[-1])
+        c1_max = max(self.c1_coords[0], self.c1_coords[-1])
+        if len(self.c1_coords) <= 1 or width1 == 0:
+            width1 = 1.0
+            x_start1 = self.c1_coords[0] - 0.5
+            c1_min = x_start1
+            c1_max = x_start1 + 1.0
+
+        height1 = self.c2_coords[-1] - self.c2_coords[0]
+        y_start1 = self.c2_coords[0]
+        c2_min = min(self.c2_coords[0], self.c2_coords[-1])
+        c2_max = max(self.c2_coords[0], self.c2_coords[-1])
+        if len(self.c2_coords) <= 1 or height1 == 0:
+            height1 = 1.0
+            y_start1 = self.c2_coords[0] - 0.5
+            c2_min = y_start1
+            c2_max = y_start1 + 1.0
+        # Update viewbox bounds for gate map
+        self.gatemap_win.getViewBox().update_bounds(c1_min, c1_max, c2_min, c2_max)
+        # Determine energy axis limits for slice and spectrum plots
+        energy_min = min(self.energy_axis[0], self.energy_axis[-1])
+        energy_max = max(self.energy_axis[0], self.energy_axis[-1])
+        # Update viewbox bounds for other plots based on their axes
+        # Vertical Slice: X=Energy, Y=C2
+        self.vslice_win.getViewBox().update_bounds(energy_min, energy_max, c2_min, c2_max)
+        # Horizontal Slice: X=C1, Y=Energy
+        self.hslice_win.getViewBox().update_bounds(c1_min, c1_max, energy_min, energy_max)
+        # Spectrum: X=Energy, Y=Uncapped
+        self.spectrum_win.getViewBox().update_bounds(energy_min, energy_max, None, None)
+
+        rect1 = QtCore.QRectF(x_start1, y_start1, width1, height1)
+        if self.gatemap_img.image is not None:
+            self.gatemap_img.setRect(rect1)
         
-        # Set bounds for Gate Map
-        rect1 = QtCore.QRectF(self.c1_coords[0] - dx/2, self.c2_coords[0] - dy/2, 
-                              self.c1_coords[-1] - self.c1_coords[0] + dx, 
-                              self.c2_coords[-1] - self.c2_coords[0] + dy)
-        self.gatemap_img.setRect(rect1)
+        vb1 = self.gatemap_win.getViewBox()
+        vb1.invertX(self.c1_coords[0] > self.c1_coords[-1])
+        vb1.invertY(self.c2_coords[0] > self.c2_coords[-1])
+        vb1.setRange(xRange=(c1_min, c1_max), yRange=(c2_min, c2_max), padding=0)
 
         # Tab 1: Vertical Slice (Y axis is C2, X axis is Energy)
-        dE = self.energy_axis[1] - self.energy_axis[0]
-        rect_vslice = QtCore.QRectF(self.energy_axis[0] - dE/2, self.c2_coords[0] - dy/2,
-                                    self.energy_axis[-1] - self.energy_axis[0] + dE,
-                                    self.c2_coords[-1] - self.c2_coords[0] + dy)
-        self.vslice_img.setRect(rect_vslice)
+        width_vslice = self.energy_axis[-1] - self.energy_axis[0]
+        x_start_vslice = self.energy_axis[0]
+        energy_min = min(self.energy_axis[0], self.energy_axis[-1])
+        energy_max = max(self.energy_axis[0], self.energy_axis[-1])
+        if len(self.energy_axis) <= 1 or width_vslice == 0:
+            width_vslice = 1.0
+            x_start_vslice = self.energy_axis[0] - 0.5
+            energy_min = x_start_vslice
+            energy_max = x_start_vslice + 1.0
+
+        height_vslice = self.c2_coords[-1] - self.c2_coords[0]
+        y_start_vslice = self.c2_coords[0]
+        if len(self.c2_coords) <= 1 or height_vslice == 0:
+            height_vslice = 1.0
+            y_start_vslice = self.c2_coords[0] - 0.5
+
+        rect_vslice = QtCore.QRectF(x_start_vslice, y_start_vslice, width_vslice, height_vslice)
+        if self.vslice_img.image is not None:
+            self.vslice_img.setRect(rect_vslice)
+        
+        vb_vslice = self.vslice_win.getViewBox()
+        vb_vslice.invertY(self.c2_coords[0] > self.c2_coords[-1])
+        vb_vslice.setRange(xRange=(energy_min, energy_max), yRange=(c2_min, c2_max), padding=0)
 
         # Tab 1: Horizontal Slice (X axis is C1, Y axis is Energy)
-        rect_hslice = QtCore.QRectF(self.c1_coords[0] - dx/2, self.energy_axis[0] - dE/2,
-                                    self.c1_coords[-1] - self.c1_coords[0] + dx,
-                                    self.energy_axis[-1] - self.energy_axis[0] + dE)
-        self.hslice_img.setRect(rect_hslice)
+        width_hslice = self.c1_coords[-1] - self.c1_coords[0]
+        x_start_hslice = self.c1_coords[0]
+        if len(self.c1_coords) <= 1 or width_hslice == 0:
+            width_hslice = 1.0
+            x_start_hslice = self.c1_coords[0] - 0.5
 
-        # Tab 2: Top Gate Current Heatmap (X axis is Vtop physical, Y axis is C2)
-        # Physical grids may not be perfectly uniform, but we map using minimum/maximum coordinates
-        v1_min, v1_max = np.min(self.v1_grid), np.max(self.v1_grid)
-        dv1 = (v1_max - v1_min) / (self.v1_grid.shape[1] - 1) if self.v1_grid.shape[1] > 1 else 1.0
-        rect2 = QtCore.QRectF(v1_min - dv1/2, self.c2_coords[0] - dy/2,
-                              v1_max - v1_min + dv1,
-                              self.c2_coords[-1] - self.c2_coords[0] + dy)
-        self.t2_heatmap_img.setRect(rect2)
+        height_hslice = self.energy_axis[-1] - self.energy_axis[0]
+        y_start_hslice = self.energy_axis[0]
+        if len(self.energy_axis) <= 1 or height_hslice == 0:
+            height_hslice = 1.0
+            y_start_hslice = self.energy_axis[0] - 0.5
 
-        # Tab 3: Bottom Gate Current Heatmap (X axis is Vbottom physical, Y axis is C1)
-        v2_min, v2_max = np.min(self.v2_grid), np.max(self.v2_grid)
-        dv2 = (v2_max - v2_min) / (self.v2_grid.shape[0] - 1) if self.v2_grid.shape[0] > 1 else 1.0
-        rect3 = QtCore.QRectF(v2_min - dv2/2, self.c1_coords[0] - dx/2,
-                              v2_max - v2_min + dv2,
-                              self.c1_coords[-1] - self.c1_coords[0] + dx)
-        self.t3_heatmap_img.setRect(rect3)
+        rect_hslice = QtCore.QRectF(x_start_hslice, y_start_hslice, width_hslice, height_hslice)
+        if self.hslice_img.image is not None:
+            self.hslice_img.setRect(rect_hslice)
+        
+        vb_hslice = self.hslice_win.getViewBox()
+        vb_hslice.invertX(self.c1_coords[0] > self.c1_coords[-1])
+        vb_hslice.setRange(xRange=(c1_min, c1_max), yRange=(energy_min, energy_max), padding=0)
 
-        # Initialize crosshairs to center of ranges
-        self.cross1_v.setValue((self.c1_coords[0] + self.c1_coords[-1]) / 2)
-        self.cross1_h.setValue((self.c2_coords[0] + self.c2_coords[-1]) / 2)
-        self.cross2_v.setValue((v1_min + v1_max) / 2)
-        self.cross2_h.setValue((self.c2_coords[0] + self.c2_coords[-1]) / 2)
-        self.cross3_v.setValue((v2_min + v2_max) / 2)
-        self.cross3_h.setValue((self.c1_coords[0] + self.c1_coords[-1]) / 2)
+        # Tab 1: Spectrum plot Energy range
+        self.spectrum_win.getViewBox().setRange(xRange=(energy_min, energy_max), padding=0)
+        
+        # Block region signals during scaling reset to avoid cascading updates/crashes
+        self.spectrum_v_region.blockSignals(True)
+        self.spectrum_h_region.blockSignals(True)
+
+        # Center the vertical region lines dynamically inside the active energy range (30% to 70% of the span)
+        e_range = energy_max - energy_min
+        self.spectrum_v_region.setRegion((energy_min + 0.3 * e_range, energy_min + 0.7 * e_range))
+
+        # Center the horizontal region lines dynamically inside the active counts range (30% to 70% of the span)
+        if np.any(self.data_measured_mask):
+            measured_spectra = self.data_spectra[self.data_measured_mask]
+            y_min = np.min(measured_spectra)
+            y_max = np.max(measured_spectra)
+        else:
+            y_min = 200.0
+            y_max = 15000.0
+
+        y_range = y_max - y_min
+        if y_range <= 0:
+            y_range = 1.0
+        self.spectrum_h_region.setRegion((y_min + 0.3 * y_range, y_min + 0.7 * y_range))
+        self.spectrum_win.getViewBox().setRange(yRange=(y_min - 0.1 * y_range, y_max + 0.1 * y_range), padding=0)
+
+        self.spectrum_v_region.blockSignals(False)
+        self.spectrum_h_region.blockSignals(False)
+
+        # Tab 2: Top Gate Current Heatmap (X axis is C1, Y axis is C2)
+        rect2 = QtCore.QRectF(x_start1, y_start1, width1, height1)
+        if self.t2_heatmap_img.image is not None:
+            self.t2_heatmap_img.setRect(rect2)
+        
+        vb_t2 = self.t2_heatmap_win.getViewBox()
+        vb_t2.invertX(self.c1_coords[0] > self.c1_coords[-1])
+        vb_t2.invertY(self.c2_coords[0] > self.c2_coords[-1])
+        vb_t2.setRange(xRange=(c1_min, c1_max), yRange=(c2_min, c2_max), padding=0)
+
+        # Tab 2: Top Gate Slice X ranges
+        vb_t2_hslice = self.t2_hslice_win.getViewBox()
+        vb_t2_hslice.invertX(self.c1_coords[0] > self.c1_coords[-1])
+        vb_t2_hslice.setRange(xRange=(c1_min, c1_max), padding=0.05)
+        
+        vb_t2_vslice = self.t2_vslice_win.getViewBox()
+        vb_t2_vslice.invertX(self.c2_coords[0] > self.c2_coords[-1])
+        vb_t2_vslice.setRange(xRange=(c2_min, c2_max), padding=0.05)
+
+        # Update bounds for Tab 2 plots:
+        # Heatmap: X=C1, Y=C2
+        self.t2_heatmap_win.getViewBox().update_bounds(c1_min, c1_max, c2_min, c2_max)
+        # fixed C2 Slice: X=C1, Y=Current
+        self.t2_hslice_win.getViewBox().update_bounds(c1_min, c1_max, None, None)
+        # fixed C1 Slice: X=C2, Y=Current
+        self.t2_vslice_win.getViewBox().update_bounds(c2_min, c2_max, None, None)
+
+        # Tab 3: Bottom Gate Current Heatmap (X axis is C1, Y axis is C2)
+        rect3 = QtCore.QRectF(x_start1, y_start1, width1, height1)
+        if self.t3_heatmap_img.image is not None:
+            self.t3_heatmap_img.setRect(rect3)
+        
+        vb_t3 = self.t3_heatmap_win.getViewBox()
+        vb_t3.invertX(self.c1_coords[0] > self.c1_coords[-1])
+        vb_t3.invertY(self.c2_coords[0] > self.c2_coords[-1])
+        vb_t3.setRange(xRange=(c1_min, c1_max), yRange=(c2_min, c2_max), padding=0)
+
+        # Tab 3: Bottom Gate Slice X ranges
+        vb_t3_hslice = self.t3_hslice_win.getViewBox()
+        vb_t3_hslice.invertX(self.c1_coords[0] > self.c1_coords[-1])
+        vb_t3_hslice.setRange(xRange=(c1_min, c1_max), padding=0.05)
+        
+        vb_t3_vslice = self.t3_vslice_win.getViewBox()
+        vb_t3_vslice.invertX(self.c2_coords[0] > self.c2_coords[-1])
+        vb_t3_vslice.setRange(xRange=(c2_min, c2_max), padding=0.05)
+
+        # Update bounds for Tab 3 plots:
+        # Heatmap: X=C1, Y=C2
+        self.t3_heatmap_win.getViewBox().update_bounds(c1_min, c1_max, c2_min, c2_max)
+        # fixed C2 Slice: X=C1, Y=Current
+        self.t3_hslice_win.getViewBox().update_bounds(c1_min, c1_max, None, None)
+        # fixed C1 Slice: X=C2, Y=Current
+        self.t3_vslice_win.getViewBox().update_bounds(c2_min, c2_max, None, None)
+
+        # Initialize crosshairs to current point_gatemap values, or center of ranges if out of bounds
+        p1 = self.point_gatemap_1
+        p2 = self.point_gatemap_2
+        
+        # Check if stored values are within current coordinate ranges
+        c1_range_min = min(self.c1_coords[0], self.c1_coords[-1])
+        c1_range_max = max(self.c1_coords[0], self.c1_coords[-1])
+        c2_range_min = min(self.c2_coords[0], self.c2_coords[-1])
+        c2_range_max = max(self.c2_coords[0], self.c2_coords[-1])
+        
+        if not (c1_range_min <= p1 <= c1_range_max):
+            p1 = (self.c1_coords[0] + self.c1_coords[-1]) / 2
+        if not (c2_range_min <= p2 <= c2_range_max):
+            p2 = (self.c2_coords[0] + self.c2_coords[-1]) / 2
+
+        self.selected_energy = (self.energy_axis[0] + self.energy_axis[-1]) / 2
+        self.update_crosshair_values(p1, p2, self.selected_energy)
+        
+        self.cross2_v.setValue(p1)
+        self.cross2_h.setValue(p2)
+        self.cross3_v.setValue(p1)
+        self.cross3_h.setValue(p2)
+
+        # Set custom tick labels showing start, end, and intermediate coordinate values
+        def generate_ticks(start, end):
+            if start == end:
+                return [(start, f"{start:.4f}".rstrip('0').rstrip('.'))]
+            vals = np.linspace(start, end, 5)
+            ticks = []
+            for val in vals:
+                ticks.append((val, f"{val:.4f}".rstrip('0').rstrip('.')))
+            return ticks
+
+        ticks_c1 = generate_ticks(self.c1_coords[0], self.c1_coords[-1])
+        ticks_c2 = generate_ticks(self.c2_coords[0], self.c2_coords[-1])
+
+        self.gatemap_win.getAxis('bottom').setTicks([ticks_c1])
+        self.gatemap_win.getAxis('left').setTicks([ticks_c2])
+        self.vslice_win.getAxis('left').setTicks([ticks_c2])
+        self.hslice_win.getAxis('bottom').setTicks([ticks_c1])
+        self.t2_heatmap_win.getAxis('bottom').setTicks([ticks_c1])
+        self.t2_heatmap_win.getAxis('left').setTicks([ticks_c2])
+        self.t2_hslice_win.getAxis('bottom').setTicks([ticks_c1])
+        self.t2_vslice_win.getAxis('bottom').setTicks([ticks_c2])
+        self.t3_heatmap_win.getAxis('bottom').setTicks([ticks_c1])
+        self.t3_heatmap_win.getAxis('left').setTicks([ticks_c2])
+        self.t3_hslice_win.getAxis('bottom').setTicks([ticks_c1])
+        self.t3_vslice_win.getAxis('bottom').setTicks([ticks_c2])
 
     # --- Live Rendering updates ---
     def update_heatmaps_and_slices(self):
@@ -1530,13 +2144,16 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         # 1. Gate Map Integration
-        e_min, e_max = self.int_region.getRegion()
+        e_min, e_max = sorted(self.spectrum_v_region.getRegion())
+        h_min, h_max = sorted(self.spectrum_h_region.getRegion())
         # Find indices corresponding to this energy window
         idx_range = np.where((self.energy_axis >= e_min) & (self.energy_axis <= e_max))[0]
         
         if len(idx_range) > 0:
-            # Sum counts over the chosen spectral region
-            integrated_map = np.sum(self.data_spectra[:, :, idx_range], axis=2)
+            # Clip/clamp the intensity spectra within the horizontal region limits and integrate
+            sub_spectra = self.data_spectra[:, :, idx_range]
+            clamped_spectra = np.clip(sub_spectra, h_min, h_max) - h_min
+            integrated_map = np.sum(clamped_spectra, axis=2)
         else:
             integrated_map = np.zeros((len(self.c2_coords), len(self.c1_coords)))
 
@@ -1557,7 +2174,7 @@ class MainWindow(QtWidgets.QMainWindow):
             c1_meas = self.data_current_ch1[self.data_measured_mask]
             self.t2_colorbar.setLevels((np.min(c1_meas), np.max(c1_meas)))
 
-        self.t3_heatmap_img.setImage(self.data_current_ch2.T)
+        self.t3_heatmap_img.setImage(self.data_current_ch2)
         if np.any(self.data_measured_mask):
             c2_meas = self.data_current_ch2[self.data_measured_mask]
             self.t3_colorbar.setLevels((np.min(c2_meas), np.max(c2_meas)))
@@ -1571,6 +2188,39 @@ class MainWindow(QtWidgets.QMainWindow):
         """Called dynamically as the shaded spectral region is dragged."""
         self.update_heatmaps_and_slices()
 
+
+
+    def update_crosshair_values(self, c1_val, c2_val, energy_val):
+        """Helper to synchronize all Tab 1 crosshair values with signals blocked to avoid feedback loops."""
+        self.selected_energy = energy_val
+        self.point_gatemap_1 = c1_val
+        self.point_gatemap_2 = c2_val
+
+        # Block signals to avoid infinite recursion loops
+        self.cross1_v.blockSignals(True)
+        self.cross1_h.blockSignals(True)
+        self.vslice_cross_v.blockSignals(True)
+        self.vslice_cross_h.blockSignals(True)
+        self.hslice_cross_v.blockSignals(True)
+        self.hslice_cross_h.blockSignals(True)
+
+        self.cross1_v.setValue(c1_val)
+        self.cross1_h.setValue(c2_val)
+        
+        self.vslice_cross_v.setValue(energy_val)
+        self.vslice_cross_h.setValue(c2_val)
+        
+        self.hslice_cross_v.setValue(c1_val)
+        self.hslice_cross_h.setValue(energy_val)
+
+        # Unblock signals
+        self.cross1_v.blockSignals(False)
+        self.cross1_h.blockSignals(False)
+        self.vslice_cross_v.blockSignals(False)
+        self.vslice_cross_h.blockSignals(False)
+        self.hslice_cross_v.blockSignals(False)
+        self.hslice_cross_h.blockSignals(False)
+
     def on_crosshair_moved(self):
         """Update Tab 1 slice cuts and spectrum plot when crosshairs are dragged."""
         if not np.any(self.data_measured_mask):
@@ -1578,7 +2228,39 @@ class MainWindow(QtWidgets.QMainWindow):
 
         c1_val = self.cross1_v.value()
         c2_val = self.cross1_h.value()
+        energy_val = self.selected_energy
 
+        self.update_crosshair_values(c1_val, c2_val, energy_val)
+        self.refresh_slice_plots(c1_val, c2_val)
+
+    def on_vslice_crosshair_moved(self):
+        """Called when crosshairs in vslice_win (top right) are dragged."""
+        if not np.any(self.data_measured_mask):
+            return
+        c1_val = self.cross1_v.value()
+        c2_val = self.vslice_cross_h.value()
+        energy_val = self.vslice_cross_v.value()
+        
+        self.update_crosshair_values(c1_val, c2_val, energy_val)
+        self.refresh_slice_plots(c1_val, c2_val)
+
+    def on_hslice_crosshair_moved(self):
+        """Called when crosshairs in hslice_win (bottom left) are dragged."""
+        if not np.any(self.data_measured_mask):
+            return
+        c1_val = self.hslice_cross_v.value()
+        c2_val = self.cross1_h.value()
+        energy_val = self.hslice_cross_h.value()
+        
+        self.update_crosshair_values(c1_val, c2_val, energy_val)
+        self.refresh_slice_plots(c1_val, c2_val)
+
+
+
+    def refresh_slice_plots(self, c1_val, c2_val):
+        """Redraws slice plots based on updated coordinates."""
+        if not np.any(self.data_measured_mask) or self.data_spectra.ndim < 3 or self.c1_coords.size == 0 or self.c2_coords.size == 0:
+            return
         # Find closest grid indexes
         idx_c1 = np.argmin(np.abs(self.c1_coords - c1_val))
         idx_c2 = np.argmin(np.abs(self.c2_coords - c2_val))
@@ -1586,45 +2268,43 @@ class MainWindow(QtWidgets.QMainWindow):
         # 1. Update 1D Spectrum at crosshair intersection
         spectrum = self.data_spectra[idx_c2, idx_c1, :]
         self.spectrum_curve.setData(self.energy_axis, spectrum)
+        
+        # Manually scale the Y-axis to fit only the spectrum curve if autoRange is still enabled
+        vb_spec = self.spectrum_win.getViewBox()
+        if vb_spec.state['autoRange'][1]:
+            y_min = np.min(spectrum)
+            y_max = np.max(spectrum)
+            y_range = y_max - y_min
+            if y_range <= 0:
+                y_range = 1.0
+            vb_spec.setRange(yRange=(y_min - 0.1 * y_range, y_max + 0.1 * y_range), padding=0)
 
         # 2. Update Vertical Slice (all C2 coordinates at fixed C1)
-        # Array shape: (c2_len, 512)
         vslice_data = self.data_spectra[:, idx_c1, :]
         self.vslice_img.setImage(vslice_data)
-        
-        # Position dashed line indicator on vertical slice
-        self.vslice_marker.setValue(self.c2_coords[idx_c2])
 
         # 3. Update Horizontal Slice (all C1 coordinates at fixed C2)
-        # Array shape: (512, c1_len) - transposed for row-major format
         hslice_data = self.data_spectra[idx_c2, :, :].T
         self.hslice_img.setImage(hslice_data)
-        
-        # Position dashed line indicator on horizontal slice
-        self.hslice_marker.setValue(self.c1_coords[idx_c1])
 
     def on_tab2_crosshair_moved(self):
         """Update Tab 2 slices when its crosshair is dragged."""
         if not np.any(self.data_measured_mask):
             return
 
-        v1_val = self.cross2_v.value()
+        c1_val = self.cross2_v.value()
         c2_val = self.cross2_h.value()
 
         # Find closest indices in grid
-        # Average v1 value along columns
-        v1_avg = np.mean(self.v1_grid, axis=0)
-        idx_v1 = np.argmin(np.abs(v1_avg - v1_val))
+        idx_c1 = np.argmin(np.abs(self.c1_coords - c1_val))
         idx_c2 = np.argmin(np.abs(self.c2_coords - c2_val))
 
-        # Horizontal slice: Current vs Vtop (at fixed C2)
-        # We grab the row along the C2 coordinate
-        curr_vs_v1 = self.data_current_ch1[idx_c2, :]
-        v1_coords_row = self.v1_grid[idx_c2, :]
-        self.t2_hslice_curve.setData(v1_coords_row, curr_vs_v1)
+        # Horizontal slice: Current vs C1 (at fixed C2)
+        curr_vs_c1 = self.data_current_ch1[idx_c2, :]
+        self.t2_hslice_curve.setData(self.c1_coords, curr_vs_c1)
 
-        # Vertical slice: Current vs C2 (at fixed Vtop)
-        curr_vs_c2 = self.data_current_ch1[:, idx_v1]
+        # Vertical slice: Current vs C2 (at fixed C1)
+        curr_vs_c2 = self.data_current_ch1[:, idx_c1]
         self.t2_vslice_curve.setData(self.c2_coords, curr_vs_c2)
 
     def on_tab3_crosshair_moved(self):
@@ -1632,22 +2312,20 @@ class MainWindow(QtWidgets.QMainWindow):
         if not np.any(self.data_measured_mask):
             return
 
-        v2_val = self.cross3_v.value()
-        c1_val = self.cross3_h.value()
+        c1_val = self.cross3_v.value()
+        c2_val = self.cross3_h.value()
 
         # Find closest indices in grid
-        v2_avg = np.mean(self.v2_grid, axis=1) # average along rows
-        idx_v2 = np.argmin(np.abs(v2_avg - v2_val))
         idx_c1 = np.argmin(np.abs(self.c1_coords - c1_val))
+        idx_c2 = np.argmin(np.abs(self.c2_coords - c2_val))
 
-        # Horizontal slice: Current vs Vbottom (at fixed C1)
-        curr_vs_v2 = self.data_current_ch2[:, idx_c1]
-        v2_coords_col = self.v2_grid[:, idx_c1]
-        self.t3_hslice_curve.setData(v2_coords_col, curr_vs_v2)
+        # Horizontal slice: Current vs C1 (at fixed C2)
+        curr_vs_c1 = self.data_current_ch2[idx_c2, :]
+        self.t3_hslice_curve.setData(self.c1_coords, curr_vs_c1)
 
-        # Vertical slice: Current vs C1 (at fixed Vbottom)
-        curr_vs_c1 = self.data_current_ch2[idx_v2, :]
-        self.t3_vslice_curve.setData(self.c1_coords, curr_vs_c1)
+        # Vertical slice: Current vs C2 (at fixed C1)
+        curr_vs_c2 = self.data_current_ch2[:, idx_c1]
+        self.t3_vslice_curve.setData(self.c2_coords, curr_vs_c2)
 
     # --- HDF5 Data Storage Saving ---
     def save_sweep_data(self):
@@ -1691,6 +2369,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 f.attrs["coeff_b"] = self.coeff_b.value()
                 f.attrs["coeff_c"] = self.coeff_c.value()
                 f.attrs["coeff_d"] = self.coeff_d.value()
+                f.attrs["c1_name"] = self.c1_name_edit.text()
+                f.attrs["c2_name"] = self.c2_name_edit.text()
                 f.attrs["exposure_time"] = self.exposure_box.value()
                 f.attrs["settling_time"] = self.settling_box.value()
                 f.attrs["timestamp"] = timestamp
@@ -1705,6 +2385,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.sweep_worker and self.sweep_worker.isRunning():
             self.sweep_worker.stop()
             self.sweep_worker.wait()
+        self.save_storage()
         event.accept()
 
 

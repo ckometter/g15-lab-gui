@@ -162,7 +162,17 @@ class PrincetonPylon(Instrument):
             try:
                 monochromator = Instrument.find_instrument('monochromator')
                 wl_mono = float(monochromator.wavelength())
-                wl_source = float(self.source_wavelength())
+                
+                # Align the base wavelength to the center of the measurable range (wl_mono) when v2 = 0
+                wl_source = wl_mono
+                try:
+                    smu = Instrument.find_instrument('smu')
+                    v2 = smu.ch2.volt()
+                    # Position of the peak is changed by physical voltage v2 (Channel 2)
+                    wl_source += 500.0 * v2
+                except Exception:
+                    pass
+
                 # Shift spot horizontally based on difference (0.05 nm/pixel dispersion)
                 # If monochromator wavelength is larger than source, peak shifts to left (lower pixel index)
                 dispersion = 0.05
@@ -174,27 +184,24 @@ class PrincetonPylon(Instrument):
             r2 = (x - center_x)**2 + (y - center_y)**2
             dispersion = 0.05
             wl_sigma = float(self.source_sigma())
-            sigma = wl_sigma / dispersion
             
-            # Spot peak intensity proportional to exposure time
-            peak = 15000.0 * (self._exposure_time / 0.1)
-            
-            # Make the peak intensity vary with Top and Bottom gates to simulate quantum transport/gating
+            # Width of the peak is changed proportionally by physical voltage v1 (Channel 1)
+            width_factor = 1.0
             try:
                 smu = Instrument.find_instrument('smu')
-                v_top_mv = smu.ch1.volt() * 1000.0
-                v_bot_mv = smu.ch2.volt() * 1000.0
-                # Create a diagonal charge transition line pattern (voltages are in mV now to match the sweep range)
-                gate_factor = 0.1 + 0.9 * (np.exp(-((v_top_mv - v_bot_mv)**2) / 8.0) + 
-                                           0.3 * np.exp(-((v_top_mv + v_bot_mv - 5.0)**2) / 5.0))
-                #peak *= gate_factor
+                v1 = smu.ch1.volt()
+                width_factor = max(0.1, 1.0 + 100.0 * v1)
+                wl_sigma *= width_factor
             except Exception:
                 pass
 
-                
+            sigma = wl_sigma / dispersion
+            
+            # Spot peak intensity proportional to exposure time, normalized by width_factor
+            # to make sure the vertically-summed 1D spectrum peak height is independent of v1.
+            peak = (15000.0 * (self._exposure_time / 0.1)) / width_factor
+            
             background = 200.0
-            # Noise is disabled in simulation mode to ensure that the intensity remains mathematically
-            # constant across sweeps and plots as a single uniform color.
             noise = 0.0
             
             frame = peak * np.exp(-r2 / (2 * sigma**2)) + background + noise
