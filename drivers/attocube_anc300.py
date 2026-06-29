@@ -38,16 +38,36 @@ if PhysicalANC300 is not None:
                 print(f"Initialized Attocube ANC300 '{name}' in Simulation Mode.")
             else:
                 super().__init__(name, address, **kwargs)
+                # Disable snapshot queries for trigger parameters to avoid hardware warning errors
+                for ax_name in ['axis1', 'axis2', 'axis3']:
+                    ax = getattr(self, ax_name, None)
+                    if not ax and ax_name in self.submodules:
+                        ax = self.submodules[ax_name]
+                    if ax and hasattr(ax, 'parameters'):
+                        for p_name in ['triggerUp', 'triggerDown']:
+                            if p_name in ax.parameters:
+                                ax.parameters[p_name].snapshot_get = False
+                for submod in self.submodules.values():
+                    if hasattr(submod, 'parameters'):
+                        for p_name in ['triggerUp', 'triggerDown']:
+                            if p_name in submod.parameters:
+                                submod.parameters[p_name].snapshot_get = False
+
+        def _open_resource(self, address: str, visalib: str | None):
+            resource, visabackend, resource_manager = super()._open_resource(address, visalib)
+            if 'ASRL' in address:
+                resource.baud_rate = 38400
+            return resource, visabackend, resource_manager
 
         def get_voltage(self, axis: int) -> float:
             """Get fine scanning DC offset voltage for the given axis (1, 2, or 3)."""
             if self.simulated:
                 return self._voltages.get(axis, 0.0)
             else:
-                # physical mode: check if native driver axis offset parameter exists
+                # physical mode: check if native driver axis voltage parameter exists (geto)
                 axis_obj = getattr(self, f'axis{axis}', None)
-                if axis_obj and hasattr(axis_obj, 'offset'):
-                    return float(axis_obj.offset())
+                if axis_obj and hasattr(axis_obj, 'voltage'):
+                    return float(axis_obj.voltage())
                 # fallback parameter
                 param_name = f'voltage_ch{axis}'
                 if hasattr(self, param_name):

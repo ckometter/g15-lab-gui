@@ -1,3 +1,4 @@
+import threading
 from qcodes.instrument import VisaInstrument, Instrument
 from qcodes.instrument import InstrumentChannel
 
@@ -23,13 +24,22 @@ class RampedSet:
         with open(storage_path, "r") as f:
             data = json.load(f)
         
-        ramp_rate = data.get(field_rate)
+        dg_data = data.get("dual_gate", {})
+        ramp_rate = dg_data.get(field_rate)
+        if ramp_rate is None:
+            ramp_rate = dg_data.get(f"ramp_rate_{self.channel.channel_num}")
+        if ramp_rate is None:
+            ramp_rate = dg_data.get("ramp_rate")
+        if ramp_rate is None:
+            ramp_rate = data.get(field_rate)
         if ramp_rate is None:
             ramp_rate = data.get(f"ramp_rate_{self.channel.channel_num}")
         if ramp_rate is None:
             ramp_rate = data.get("ramp_rate", 0.1)
             
-        ramp_step = data.get(field_step, 0.0005)
+        ramp_step = dg_data.get(field_step)
+        if ramp_step is None:
+            ramp_step = data.get(field_step, 0.0005)
         
         param = getattr(self.channel, parameter_name)
         
@@ -37,7 +47,12 @@ class RampedSet:
             param(target_val)
             return
             
-        current_val = param()
+        try:
+            current_val = param.get_latest()
+            if current_val is None:
+                current_val = param()
+        except Exception:
+            current_val = param()
         dval = target_val - current_val
         
         num_steps = int(abs(dval) / ramp_step)
@@ -47,17 +62,48 @@ class RampedSet:
             
         dt = ramp_step / ramp_rate
         
+        # Calculate expected ramping duration
+        ramp_time = abs(dval) / ramp_rate
+        new_timeout = max(5.0, ramp_time + 10.0)
+        
+        # Temporarily increase VISA timeout on the parent SMU instrument to avoid warnings
+        smu = self.channel.parent
+        old_timeout = None
+        if hasattr(smu, "timeout") and not getattr(smu, "simulated", False):
+            try:
+                if hasattr(smu, "_lock"):
+                    with smu._lock:
+                        old_timeout = smu.timeout()
+                        smu.timeout(new_timeout)
+                else:
+                    old_timeout = smu.timeout()
+                    smu.timeout(new_timeout)
+            except Exception:
+                old_timeout = None
+
         self.channel.ramp_stop_requested = False
-        for i in range(1, num_steps + 1):
-            if getattr(self.channel, "ramp_stop_requested", False):
-                break
-            fraction = i / num_steps
-            next_val = current_val + dval * fraction
-            param(next_val)
-            time.sleep(dt)
-            
-        if not getattr(self.channel, "ramp_stop_requested", False):
-            param(target_val)
+        try:
+            for i in range(1, num_steps + 1):
+                if getattr(self.channel, "ramp_stop_requested", False):
+                    break
+                fraction = i / num_steps
+                next_val = current_val + dval * fraction
+                param(next_val)
+                time.sleep(dt)
+                
+            if not getattr(self.channel, "ramp_stop_requested", False):
+                param(target_val)
+        finally:
+            # Restore the original visa timeout
+            if old_timeout is not None and hasattr(smu, "timeout") and not getattr(smu, "simulated", False):
+                try:
+                    if hasattr(smu, "_lock"):
+                        with smu._lock:
+                            smu.timeout(old_timeout)
+                    else:
+                        smu.timeout(old_timeout)
+                except Exception:
+                    pass
 
     def volt(self, target_voltage: float):
         self._ramp("volt", target_voltage)
@@ -234,7 +280,14 @@ class B2902BChannel(InstrumentChannel):
             if os.path.exists(storage_path):
                 with open(storage_path, "r") as f:
                     data = json.load(f)
-                    val = data.get(f"ramprate{self.channel_num}")
+                    dg_data = data.get("dual_gate", {})
+                    val = dg_data.get(f"ramprate{self.channel_num}")
+                    if val is None:
+                        val = dg_data.get(f"ramp_rate_{self.channel_num}")
+                    if val is None:
+                        val = dg_data.get("ramp_rate")
+                    if val is None:
+                        val = data.get(f"ramprate{self.channel_num}")
                     if val is None:
                         val = data.get(f"ramp_rate_{self.channel_num}")
                     if val is None:
@@ -258,7 +311,10 @@ class B2902BChannel(InstrumentChannel):
             if os.path.exists(storage_path):
                 with open(storage_path, "r") as f:
                     data = json.load(f)
-                    val = data.get("ramp_step")
+                    dg_data = data.get("dual_gate", {})
+                    val = dg_data.get("ramp_step")
+                    if val is None:
+                        val = data.get("ramp_step")
                     if val is not None:
                         if self._ramp_step != val:
                             self._ramp_step = val
@@ -305,7 +361,9 @@ class B2902BChannel(InstrumentChannel):
                         data = json.load(f)
                     except Exception:
                         pass
-            data[key] = value
+            if "dual_gate" not in data:
+                data["dual_gate"] = {}
+            data["dual_gate"][key] = value
             with open(storage_path, "w") as f:
                 json.dump(data, f, indent=4)
         except Exception as e:
@@ -342,6 +400,7 @@ class KeysightB2902B(VisaInstrument):
     QCoDeS driver for the Keysight B2902B Dual-Channel Power Source.
     """
     def __init__(self, name, address, **kwargs):
+        self._lock = threading.RLock()
         # Remove and close any existing instrument with the same name to avoid collision
         try:
             instr = Instrument.find_instrument(name)
@@ -363,6 +422,12 @@ class KeysightB2902B(VisaInstrument):
             Instrument.__init__(self, name, **kwargs)
         else:
             super().__init__(name, address, terminator='\n', **kwargs)
+            try:
+                self.visa_handle.clear()
+            except Exception:
+                pass
+            # Clear status and error queue to prevent visa timeouts
+            self.write('*CLS')
             # Initialize source mode to VOLT for both channels
             self.write(':SOUR1:FUNC:MODE VOLT')
             self.write(':SOUR2:FUNC:MODE VOLT')
@@ -385,22 +450,35 @@ class KeysightB2902B(VisaInstrument):
             
     def return_to_local(self):
         if not self.simulated:
-            self.write(':SYST:LOC')
+            try:
+                self.visa_handle.clear()
+            except Exception:
+                pass
+            try:
+                self.write('*CLS')
+            except Exception:
+                pass
 
     def ask(self, cmd: str) -> str:
         if self.simulated:
             return "0.0"
-        return super().ask(cmd)
+        with self._lock:
+            return super().ask(cmd)
 
     def write(self, cmd: str) -> None:
         if self.simulated:
             return
-        super().write(cmd)
+        with self._lock:
+            super().write(cmd)
 
     def close(self) -> None:
         if getattr(self, 'simulated', False):
             Instrument.close(self)
         else:
+            try:
+                self.visa_handle.clear()
+            except Exception:
+                pass
             try:
                 super().close()
             except Exception:

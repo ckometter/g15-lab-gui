@@ -204,7 +204,7 @@ class PrincetonPylon(Instrument):
             background = 200.0
             noise = 0.0
             
-            frame = peak * np.exp(-r2 / (2 * sigma**2)) + background + noise
+            frame = peak * np.exp(-r2 / (2 * sigma**2)) + background + noise *0
             # Clip pixel values between 0 and 65535 (16-bit CCD depth)
             return np.clip(frame, 0, 65535).astype(np.uint16)
         else:

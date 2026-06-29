@@ -17,3 +17,7 @@ ENV/
 
 # VS Code settings (optional, keeps workspace clean for others)
 .vscode/
+
+# Ignore local measurement data directory
+data/
+

@@ -8,14 +8,22 @@ import h5py
 import numpy as np
 from PyQt6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
-from utils import EnhancedViewBox
+try:
+    from .utils import EnhancedViewBox, calculate_expected_duration
+except ImportError:
+    import sys
+    import os
+    _measurements_dir = os.path.dirname(os.path.abspath(__file__))
+    if _measurements_dir not in sys.path:
+        sys.path.insert(0, _measurements_dir)
+    from utils import EnhancedViewBox, calculate_expected_duration
 
 # Ensure parent directory is in path for importing station_setup
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
-from station_setup import initialize_station
+from station_setup import initialize_station, simulated_devices
 
 # Setup pyqtgraph themes (Light Theme)
 pg.setConfigOption('background', '#ffffff')
@@ -28,8 +36,8 @@ class ScientificPointSpinBox(QtWidgets.QSpinBox):
 
     def valueFromText(self, text):
         try:
-            if text.strip() == "":
-                return self.minimum()
+            if text.strip() in ("", "-", "+"):
+                return int(max(self.minimum(), min(self.maximum(), 0)))
             value = float(text)
             if not math.isfinite(value):
                 raise ValueError
@@ -37,10 +45,12 @@ class ScientificPointSpinBox(QtWidgets.QSpinBox):
                 raise ValueError
             return int(value)
         except Exception:
-            return self.minimum()
+            return int(max(self.minimum(), min(self.maximum(), 0)))
 
     def validate(self, text, pos):
         if text.strip() == "":
+            return QtGui.QValidator.State.Intermediate, text, pos
+        if text.strip() in ("-", "+"):
             return QtGui.QValidator.State.Intermediate, text, pos
         if not self._sci_pattern.match(text):
             return QtGui.QValidator.State.Invalid, text, pos
@@ -101,17 +111,19 @@ class ScientificDoubleSpinBox(_OriginalQDoubleSpinBox):
 
     def valueFromText(self, text):
         try:
-            if text.strip() == "":
-                return self.minimum()
+            if text.strip() in ("", "-", "+", "-.", "+.", "."):
+                return max(self.minimum(), min(self.maximum(), 0.0))
             value = float(text)
             if not math.isfinite(value):
                 raise ValueError
             return value
         except Exception:
-            return self.minimum()
+            return max(self.minimum(), min(self.maximum(), 0.0))
 
     def validate(self, text, pos):
         if text.strip() == "":
+            return QtGui.QValidator.State.Intermediate, text, pos
+        if text.strip() in ("-", "+", "-.", "+.", "."):
             return QtGui.QValidator.State.Intermediate, text, pos
         if not self._sci_pattern.match(text):
             return QtGui.QValidator.State.Invalid, text, pos
@@ -161,20 +173,30 @@ class SingleRampWorker(QtCore.QThread):
         self.channel.ramp_stop_requested = True
 
     def run(self):
-        try:
-            self.channel.ramp_stop_requested = False
-            if self.param_name == "curr":
-                self.channel.set_r.curr(self.target_val)
-            else:
-                self.channel.set_r.volt(self.target_val)
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
             try:
-                # Release front-panel remote lock
-                self.channel.parent.return_to_local()
-            except Exception:
-                pass
-            self.finished.emit()
-        except Exception as e:
-            self.error.emit(str(e))
+                self.channel.ramp_stop_requested = False
+                if self.param_name == "curr":
+                    self.channel.set_r.curr(self.target_val)
+                else:
+                    self.channel.set_r.volt(self.target_val)
+                break
+            except Exception as e:
+                if attempt == max_retries:
+                    self.error.emit(str(e))
+                    return
+                try:
+                    self.channel.parent.visa_handle.clear()
+                except Exception:
+                    pass
+                time.sleep(0.1)
+        try:
+            # Release front-panel remote lock
+            self.channel.parent.return_to_local()
+        except Exception:
+            pass
+        self.finished.emit()
 
 
 class SweepWorker(QtCore.QThread):
@@ -182,9 +204,10 @@ class SweepWorker(QtCore.QThread):
     Background worker thread that runs the gate sweep measurement.
     Communicates back to the main thread via Qt signals.
     """
-    point_measured = QtCore.pyqtSignal(int, int, float, float, float, float, np.ndarray, float, float)
+    point_measured = QtCore.pyqtSignal(int, int, float, float, float, float, np.ndarray, float, float, float, float, float)
     progress_updated = QtCore.pyqtSignal(int, int)
     status_updated = QtCore.pyqtSignal(str)
+    voltage_updated = QtCore.pyqtSignal(float, float)
     finished = QtCore.pyqtSignal()
     error_occurred = QtCore.pyqtSignal(str)
 
@@ -200,6 +223,14 @@ class SweepWorker(QtCore.QThread):
     def pause(self):
         self.mutex.lock()
         self._is_paused = True
+        try:
+            self.station.smu.ch1.ramp_stop_requested = True
+        except Exception:
+            pass
+        try:
+            self.station.smu.ch2.ramp_stop_requested = True
+        except Exception:
+            pass
         self.mutex.unlock()
 
     def resume(self):
@@ -212,10 +243,47 @@ class SweepWorker(QtCore.QThread):
         self.mutex.lock()
         self._is_running = False
         self._is_paused = False
+        try:
+            self.station.smu.ch1.ramp_stop_requested = True
+        except Exception:
+            pass
+        try:
+            self.station.smu.ch2.ramp_stop_requested = True
+        except Exception:
+            pass
         self.pause_cond.wakeAll()
         self.mutex.unlock()
 
+    def check_pause_and_stop(self):
+        self.mutex.lock()
+        while self._is_paused:
+            self.status_updated.emit("Status: Paused")
+            self.pause_cond.wait(self.mutex)
+        if not self._is_running:
+            self.mutex.unlock()
+            try:
+                self.station.smu.return_to_local()
+            except Exception:
+                pass
+            return False
+        self.mutex.unlock()
+        return True
+
     def run(self):
+        smu = getattr(self.station, "smu", None)
+        try:
+            try:
+                self._do_run()
+            finally:
+                if smu is not None:
+                    try:
+                        smu.return_to_local()
+                    except Exception:
+                        pass
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
+    def _do_run(self):
         try:
             smu = self.station.smu
             camera = self.station.camera
@@ -238,9 +306,33 @@ class SweepWorker(QtCore.QThread):
             serpentine = self.params['serpentine']
             exposure_time = self.params['exposure_time']
             settling_time = self.params['settling_time']
+            num_pixels = self.params.get('num_pixels', 1340)
 
-            # Set CCD exposure
+            # --- Read multi-exposure settings from value_storage ---
+            num_spectra   = 1
+            accum_method  = "Sum"
+            do_average    = False
+            storage_path  = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "value_storage"
+            )
+            if os.path.exists(storage_path):
+                try:
+                    with open(storage_path, "r") as f:
+                        vs = json.load(f)
+                    single_data = vs.get("single_spectra", {})
+                    num_spectra  = int(single_data.get("num_spectra",  vs.get("num_spectra", 1)))
+                    accum_method = str(single_data.get("accum_method", vs.get("accum_method", "Sum")))
+                    do_average   = str(single_data.get("average",      vs.get("average",      "No"))) == "Yes"
+                except Exception as e:
+                    print(f"SweepWorker: could not read value_storage ({e}), using defaults")
+
+            # Set CCD exposure and native frames count directly on the remote camera
             camera.exposure_time(exposure_time)
+            try:
+                camera.num_frames(num_spectra)
+            except Exception as e:
+                print(f"SweepWorker: Error setting remote num_frames: {e}")
 
             # Generate sweep coordinate arrays (always full 2D grid)
             c1_arr = np.linspace(c1_start, c1_end, c1_pts) if c1_pts > 1 else np.array([c1_start])
@@ -268,14 +360,8 @@ class SweepWorker(QtCore.QThread):
 
                 for idx_inner in inner_indices:
                     # Thread pause / stop safety check
-                    self.mutex.lock()
-                    while self._is_paused:
-                        self.status_updated.emit("Status: Paused")
-                        self.pause_cond.wait(self.mutex)
-                    if not self._is_running:
-                        self.mutex.unlock()
+                    if not self.check_pause_and_stop():
                         return
-                    self.mutex.unlock()
 
                     val_inner = inner_arr[idx_inner]
 
@@ -294,56 +380,467 @@ class SweepWorker(QtCore.QThread):
                     # 1. Transform to physical voltages
                     v1, v2 = transform_c_to_v(c1, c2, a, b, c, d)
 
-                    # 2. Ramp physical voltages (blocking hardware set call)
-                    self.status_updated.emit(f"Status: GOTO V1={v1:.4f}V, V2={v2:.4f}V")
-                    smu.ch1.set_r.volt(v1)
-                    smu.ch2.set_r.volt(v2)
+                    # 2. Ramp physical voltages (blocking hardware set call, with interrupt retry loop)
+                    self.voltage_updated.emit(v1, v2)
+                    while True:
+                        if not self.check_pause_and_stop():
+                            return
+                        
+                        smu.ch1.ramp_stop_requested = False
+                        smu.ch2.ramp_stop_requested = False
+                        
+                        max_retries = 3
+                        for attempt in range(1, max_retries + 1):
+                            try:
+                                smu.ch1.set_r.volt(v1)
+                                break
+                            except Exception as ex:
+                                if attempt == max_retries:
+                                    raise ex
+                                print(f"SweepWorker: Retrying SMU1 set voltage (attempt {attempt+1}/{max_retries}) due to error: {ex}")
+                                try:
+                                    smu.visa_handle.clear()
+                                except Exception:
+                                    pass
+                                time.sleep(0.1)
+                                
+                        for attempt in range(1, max_retries + 1):
+                            try:
+                                smu.ch2.set_r.volt(v2)
+                                break
+                            except Exception as ex:
+                                if attempt == max_retries:
+                                    raise ex
+                                print(f"SweepWorker: Retrying SMU2 set voltage (attempt {attempt+1}/{max_retries}) due to error: {ex}")
+                                try:
+                                    smu.visa_handle.clear()
+                                except Exception:
+                                    pass
+                                time.sleep(0.1)
+                        
+                        # If ramping was interrupted, loop again to handle pause/stop check
+                        if getattr(smu.ch1, "ramp_stop_requested", False) or getattr(smu.ch2, "ramp_stop_requested", False):
+                            continue
+                        break
 
                     # 3. Wait settling time
                     if settling_time > 0:
-                        time.sleep(settling_time)
+                        sleep_end = time.time() + settling_time
+                        while time.time() < sleep_end:
+                            if not self.check_pause_and_stop():
+                                return
+                            time.sleep(0.05)
 
-                    # 4. Measure
-                    self.status_updated.emit("Status: Acquiring CCD spectrum...")
-                    img = camera.image()
-                    spectrum = np.sum(img, axis=0) # Sum vertically to get 1D spectrum counts
+                    # 4. Acquire spectrum with multi-exposure accumulation
+                    self.status_updated.emit(
+                        f"Status: Acquiring spectrum ({num_spectra}x, {accum_method})..."
+                    )
+                    spectrum = None
+                    if not self.check_pause_and_stop():
+                        return
+                    try:
+                        res = camera.remote_lf.get_spectrum()
+                        if res is not None:
+                            intensities, _ = res
+                            intensities_arr = np.array(intensities, dtype=float)
+                            if intensities_arr.ndim == 2:
+                                if do_average or accum_method == "Average":
+                                    intensities_arr = np.mean(intensities_arr, axis=0)
+                                else:
+                                    intensities_arr = np.sum(intensities_arr, axis=0)
+                            spectrum = intensities_arr
+                    except Exception as e:
+                        if self._is_running:
+                            print(f"SweepWorker error fetching spectrum: {e}")
+                    
+                    if spectrum is None:
+                        spectrum = np.zeros(num_pixels)
 
-                    # Query hardware output states before measuring current
+                    if not self.check_pause_and_stop():
+                        return
+
+                    # Query hardware output states before measuring current and voltage
                     # to prevent automated query-based power-on
                     try:
                         ch1_on = bool(smu.ch1.output())
                         curr_ch1 = smu.ch1.measure_curr() if ch1_on else 0.0
+                        meas_v1 = smu.ch1.measure_volt() if ch1_on else 0.0
                     except Exception:
                         curr_ch1 = 0.0
+                        meas_v1 = 0.0
 
                     try:
                         ch2_on = bool(smu.ch2.output())
                         curr_ch2 = smu.ch2.measure_curr() if ch2_on else 0.0
+                        meas_v2 = smu.ch2.measure_volt() if ch2_on else 0.0
                     except Exception:
                         curr_ch2 = 0.0
+                        meas_v2 = 0.0
+
+                    meas_b = 0.0
+                    magnet = getattr(self.station, 'magnet', None)
+                    if magnet is not None:
+                        try:
+                            meas_b = magnet.output_field()
+                        except Exception:
+                            try:
+                                meas_b = magnet.field()
+                            except Exception:
+                                pass
 
                     point_count += 1
-                    self.point_measured.emit(i, j, c1, c2, v1, v2, spectrum, curr_ch1, curr_ch2)
+                    self.point_measured.emit(i, j, c1, c2, v1, v2, spectrum, curr_ch1, curr_ch2, meas_v1, meas_v2, meas_b)
                     self.progress_updated.emit(point_count, total_points)
 
-            try:
-                smu.return_to_local()
-            except Exception:
-                pass
             self.finished.emit()
 
         except Exception as e:
-            try:
-                smu.return_to_local()
-            except Exception:
-                pass
             self.error_occurred.emit(str(e))
 
 
+class ViewControlPopup(QtWidgets.QFrame):
+    """Dropdown style floating popup widget containing controls for autoscaling plots."""
+    def __init__(self, parent_window, has_grid=True):
+        super().__init__(parent_window, QtCore.Qt.WindowType.Tool | QtCore.Qt.WindowType.FramelessWindowHint)
+        self.parent_window = parent_window
+        self.has_grid = has_grid
+        self.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
+        self.setFrameShadow(QtWidgets.QFrame.Shadow.Raised)
+        self.setFixedWidth(160)
+        self.hide()
+        self._init_ui()
+        
+    def _init_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+        
+        self.setStyleSheet("""
+            QFrame {
+                background-color: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+            }
+            QLabel {
+                font-weight: bold;
+                color: #1e293b;
+                border: none;
+                background-color: transparent;
+            }
+        """)
+        
+        # 1. 2D Layout Selector Grid
+        if self.has_grid:
+            layout.addWidget(QtWidgets.QLabel("Target Plots:"))
+            self.grid_layout = QtWidgets.QGridLayout()
+            self.grid_layout.setSpacing(4)
+            
+            self.btn_grid_A = QtWidgets.QPushButton("")
+            self.btn_grid_B = QtWidgets.QPushButton("")
+            self.btn_grid_C = QtWidgets.QPushButton("")
+            self.btn_grid_D = QtWidgets.QPushButton("")
+            self.btn_grid_AC = QtWidgets.QPushButton("")
+            
+            self.btn_grid_A.setToolTip("Top-Left: 2D Gate Map (Integrated Counts)")
+            self.btn_grid_B.setToolTip("Top-Right: Vertical Slice spectra")
+            self.btn_grid_C.setToolTip("Bottom-Left: Horizontal Slice spectra")
+            self.btn_grid_D.setToolTip("Bottom-Right: CCD Spectrum")
+            self.btn_grid_AC.setToolTip("Left: Top Gate Current Heatmap")
+            
+            btn_style = """
+                QPushButton {
+                    background-color: #f8fafc;
+                    border: 1px solid #cbd5e1;
+                    font-weight: bold;
+                    border-radius: 4px;
+                    min-width: 32px;
+                    min-height: 32px;
+                    color: #1e293b;
+                }
+                QPushButton:hover {
+                    background-color: #f1f5f9;
+                }
+                QPushButton:checked {
+                    background-color: #3b82f6;
+                    color: white;
+                    border-color: #2563eb;
+                }
+            """
+            for btn in (self.btn_grid_A, self.btn_grid_B, self.btn_grid_C, self.btn_grid_D, self.btn_grid_AC):
+                btn.setCheckable(True)
+                btn.setChecked(True)
+                btn.setStyleSheet(btn_style)
+            
+            # Initial setup: assume tab 0 (4-plot layout)
+            self.grid_layout.addWidget(self.btn_grid_A, 0, 0)
+            self.grid_layout.addWidget(self.btn_grid_B, 0, 1)
+            self.grid_layout.addWidget(self.btn_grid_C, 1, 0)
+            self.grid_layout.addWidget(self.btn_grid_D, 1, 1)
+            self.btn_grid_AC.hide()
+            
+            layout.addLayout(self.grid_layout)
+
+        
+        # 2. Axis Selection Buttons
+        layout.addWidget(QtWidgets.QLabel("Autoscale Axis:"))
+        axis_layout = QtWidgets.QHBoxLayout()
+        axis_layout.setSpacing(2)
+        
+        self.btn_group = QtWidgets.QButtonGroup(self)
+        self.btn_group.setExclusive(True)
+        
+        self.btn_axis_both = QtWidgets.QToolButton()
+        self.btn_axis_both.setText("✥")
+        self.btn_axis_both.setToolTip("Autoscale both axes")
+        
+        self.btn_axis_x = QtWidgets.QToolButton()
+        self.btn_axis_x.setText("↔")
+        self.btn_axis_x.setToolTip("Autoscale X axis only")
+        
+        self.btn_axis_y = QtWidgets.QToolButton()
+        self.btn_axis_y.setText("↕")
+        self.btn_axis_y.setToolTip("Autoscale Y axis only")
+        
+        axis_btn_style = """
+            QToolButton {
+                background-color: #f8fafc;
+                border: 1px solid #cbd5e1;
+                font-weight: bold;
+                border-radius: 4px;
+                min-width: 30px;
+                min-height: 30px;
+                font-size: 14px;
+                color: #1e293b;
+            }
+            QToolButton:hover {
+                background-color: #f1f5f9;
+            }
+            QToolButton:checked {
+                background-color: #3b82f6;
+                color: white;
+                border-color: #2563eb;
+            }
+        """
+        
+        for btn in (self.btn_axis_both, self.btn_axis_x, self.btn_axis_y):
+            btn.setCheckable(True)
+            btn.setStyleSheet(axis_btn_style)
+            self.btn_group.addButton(btn)
+            axis_layout.addWidget(btn)
+            
+        self.btn_axis_both.setChecked(True)
+        layout.addLayout(axis_layout)
+        
+        # 3. Plot Source Selector
+        layout.addWidget(QtWidgets.QLabel("Plot Source:"))
+        self.combo_source = QtWidgets.QComboBox()
+        self.combo_source.addItems(["Signal", "Signal - Background", "(S-R)/(R-B)"])
+        self.combo_source.setStyleSheet("""
+            QComboBox {
+                background-color: #f8fafc;
+                border: 1px solid #cbd5e1;
+                border-radius: 4px;
+                padding: 4px;
+                color: #1e293b;
+            }
+            QComboBox:hover {
+                background-color: #f1f5f9;
+            }
+        """)
+        self.combo_source.currentIndexChanged.connect(self.parent_window.on_plot_source_changed)
+        layout.addWidget(self.combo_source)
+        
+        # 4. Autoscale Now Button
+        self.btn_scale_now = QtWidgets.QPushButton("Autoscale Now")
+        self.btn_scale_now.setStyleSheet("""
+            QPushButton {
+                background-color: #6366f1;
+                color: white;
+                border: 1px solid #4f46e5;
+                padding: 6px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #4f46e5;
+            }
+        """)
+        self.btn_scale_now.clicked.connect(self.parent_window.perform_autoscale)
+        layout.addWidget(self.btn_scale_now)
+
+    def get_source_option(self):
+        return self.combo_source.currentText()
+
+    def get_axis_mode(self):
+        if self.btn_axis_both.isChecked():
+            return "Both"
+        elif self.btn_axis_x.isChecked():
+            return "X"
+        elif self.btn_axis_y.isChecked():
+            return "Y"
+        else:
+            return "None"
+
+    def update_grid_layout(self, tab_idx):
+        if not self.has_grid:
+            return
+        # Remove all widgets
+        for btn in (self.btn_grid_A, self.btn_grid_B, self.btn_grid_C, self.btn_grid_D, self.btn_grid_AC):
+            self.grid_layout.removeWidget(btn)
+            btn.hide()
+            
+        if tab_idx == 0:
+            # 4-plot layout: A (0,0), B (0,1), C (1,0), D (1,1)
+            self.btn_grid_A.setToolTip("Top-Left: 2D Gate Map (Integrated Counts)")
+            self.btn_grid_B.setToolTip("Top-Right: Vertical Slice spectra")
+            self.btn_grid_C.setToolTip("Bottom-Left: Horizontal Slice spectra")
+            self.btn_grid_D.setToolTip("Bottom-Right: CCD Spectrum")
+            
+            self.btn_grid_A.show()
+            self.btn_grid_B.show()
+            self.btn_grid_C.show()
+            self.btn_grid_D.show()
+            self.grid_layout.addWidget(self.btn_grid_A, 0, 0)
+            self.grid_layout.addWidget(self.btn_grid_B, 0, 1)
+            self.grid_layout.addWidget(self.btn_grid_C, 1, 0)
+            self.grid_layout.addWidget(self.btn_grid_D, 1, 1)
+        elif tab_idx == 1:
+            # 3-plot layout (Current tabs): AC on left (spanning 2 rows), B on top-right, D on bottom-right
+            self.btn_grid_AC.setToolTip("Left: Top Gate Current Heatmap")
+            self.btn_grid_B.setToolTip("Top-Right: Slice at fixed C2")
+            self.btn_grid_D.setToolTip("Bottom-Right: Slice at fixed C1")
+            
+            self.btn_grid_AC.show()
+            self.btn_grid_B.show()
+            self.btn_grid_D.show()
+            self.grid_layout.addWidget(self.btn_grid_AC, 0, 0, 2, 1)
+            self.grid_layout.addWidget(self.btn_grid_B, 0, 1)
+            self.grid_layout.addWidget(self.btn_grid_D, 1, 1)
+        elif tab_idx == 2:
+            # 3-plot layout (Current tabs): AC on left (spanning 2 rows), B on top-right, D on bottom-right
+            self.btn_grid_AC.setToolTip("Left: Bottom Gate Current Heatmap")
+            self.btn_grid_B.setToolTip("Top-Right: Slice at fixed C2")
+            self.btn_grid_D.setToolTip("Bottom-Right: Slice at fixed C1")
+            
+            self.btn_grid_AC.show()
+            self.btn_grid_B.show()
+            self.btn_grid_D.show()
+            self.grid_layout.addWidget(self.btn_grid_AC, 0, 0, 2, 1)
+            self.grid_layout.addWidget(self.btn_grid_B, 0, 1)
+            self.grid_layout.addWidget(self.btn_grid_D, 1, 1)
+
+class LiveStatusWorker(QtCore.QThread):
+    """
+    Background worker thread to continuously poll B, V1, V2 at 5 Hz.
+    """
+    status_updated = QtCore.pyqtSignal(float, float, float)
+
+    def __init__(self, station, parent=None):
+        super().__init__(parent)
+        self.station = station
+        self._stop_requested = False
+        self._is_paused = False
+        self._actively_polling = False
+
+    def stop(self):
+        self._stop_requested = True
+
+    def pause(self):
+        self._is_paused = True
+        import time
+        t0 = time.time()
+        while self._actively_polling and time.time() < t0 + 1.0:
+            time.sleep(0.01)
+
+    def resume(self):
+        self._is_paused = False
+
+    def run(self):
+        while not self._stop_requested:
+            if self._is_paused or getattr(self.station, "live_status_paused", False):
+                self.msleep(100)
+                continue
+            
+            self._actively_polling = True
+            try:
+                # Read magnet field
+                b_val = 0.0
+                magnet = getattr(self.station, 'magnet', None)
+                if magnet is not None:
+                    try:
+                        b_val = magnet.field()
+                    except Exception:
+                        try:
+                            b_val = magnet.output_field()
+                        except Exception:
+                            pass
+                
+                # Read SMU voltages
+                v1_val = 0.0
+                v2_val = 0.0
+                smu = getattr(self.station, 'smu', None)
+                if smu is not None:
+                    if getattr(smu, "simulated", False):
+                        try:
+                            v1_val = smu.ch1.volt()
+                        except Exception:
+                            pass
+                        try:
+                            v2_val = smu.ch2.volt()
+                        except Exception:
+                            pass
+                    else:
+                        old_timeout = None
+                        try:
+                            if hasattr(smu, "_lock"):
+                                with smu._lock:
+                                    old_timeout = smu.timeout()
+                                    smu.timeout(0.5)
+                            else:
+                                old_timeout = smu.timeout()
+                                smu.timeout(0.5)
+                        except Exception:
+                            old_timeout = None
+
+                        try:
+                            v1_val = smu.ch1.volt()
+                        except Exception:
+                            try:
+                                smu.visa_handle.clear()
+                            except Exception:
+                                pass
+                        
+                        try:
+                            v2_val = smu.ch2.volt()
+                        except Exception:
+                            try:
+                                smu.visa_handle.clear()
+                            except Exception:
+                                pass
+
+                        if old_timeout is not None:
+                            try:
+                                if hasattr(smu, "_lock"):
+                                    with smu._lock:
+                                        smu.timeout(old_timeout)
+                                else:
+                                    smu.timeout(old_timeout)
+                            except Exception:
+                                pass
+                
+                self.status_updated.emit(b_val, v1_val, v2_val)
+            except Exception:
+                pass
+            finally:
+                self._actively_polling = False
+            
+            self.msleep(200) # 5 Hz
+
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, station):
+    def __init__(self, station, embed=False):
         super().__init__()
         self.station = station
+        self._embed = embed
         self.setWindowTitle("Electrostatic Gate Control & 2D Sweep Spectrometer")
         self.setMinimumSize(1280, 850)
 
@@ -352,6 +849,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.is_paused = False
         self.sweep_worker = None
         self.ramp_worker = None
+        self.single_spectra_window = None
+        
+        # Time tracking for expected end calculation
+        self.sweep_start_time = None
+        self.sweep_total_duration = 0.0
+        self.total_paused_time = 0.0
+        self.pause_start_time = None
 
         # Data grids
         self.c1_coords = np.array([])
@@ -364,6 +868,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.data_current_ch1 = np.array([])
         self.data_current_ch2 = np.array([])
         self.data_measured_mask = np.array([]) # Tracks which points are measured
+        self.data_measured_b = np.array([])
 
         # Energy calibration axis
         self.energy_axis = np.linspace(1.5, 3.0, 512) # Dummy range initialized at startup
@@ -431,6 +936,62 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
         except Exception as e:
             print(f"Startup warning: could not sync SMU states ({e})")
+        
+        self.view_control_popup = ViewControlPopup(self, has_grid=True)
+
+        # Start background 5 Hz status polling worker
+        self.live_status_worker = LiveStatusWorker(self.station, parent=self)
+        self.live_status_worker.status_updated.connect(self.on_live_status_updated)
+        self.live_status_worker.start()
+
+    def setup_histogram_lut(self, plot_win, image_item, interactive=True):
+        """Helper to create a HistogramLUTItem with the colorbar positioned between the plot and the scale."""
+        hist = pg.HistogramLUTItem(gradientPosition='left')
+        hist.setImageItem(image_item)
+        hist.gradient.loadPreset('viridis')
+        
+        # Rearrange layout to place colorbar between plot (2D heatmap) and scale (histogram + axis)
+        hist.layout.removeItem(hist.gradient)
+        hist.layout.removeItem(hist.vb)
+        hist.layout.removeItem(hist.axis)
+        hist.layout.addItem(hist.gradient, 0, 0) # Left column: Colorbar (Gradient)
+        hist.layout.addItem(hist.vb, 0, 1)       # Middle column: Histogram Plot
+        hist.layout.addItem(hist.axis, 0, 2)     # Right column: Scale (Axis)
+        
+        # Set compact widths and layout margins/spacings to prevent squeezing/clipping
+        hist.layout.setContentsMargins(0, 0, 0, 0)
+        hist.layout.setSpacing(2)
+        
+        # Make the intensity plot (vb) wider so that the curves are clearly visible
+        hist.layout.setColumnFixedWidth(0, 12)  # Gradient colorbar
+        hist.layout.setColumnFixedWidth(1, 45)  # ViewBox (intensity histogram plot)
+        hist.layout.setColumnFixedWidth(2, 35)  # Axis (numbers scale)
+        
+        hist.gradient.setMinimumWidth(0)
+        hist.gradient.setMaximumWidth(12)
+        hist.vb.setMinimumWidth(0)
+        hist.vb.setMaximumWidth(45)
+        hist.axis.setMinimumWidth(0)
+        hist.axis.setMaximumWidth(35)
+        
+        hist.setMinimumWidth(92)
+        hist.setMaximumWidth(100)
+        
+        if not interactive:
+            hist.region.setMovable(False)
+            for line in hist.region.lines:
+                line.setMovable(False)
+            hist.gradient.setEnabled(False)
+            hist.vb.setMouseEnabled(x=False, y=False)
+            
+        # Adjust plot title span to span all 6 columns (0 to 5) so it doesn't force Column 1 to be too wide
+        pi = plot_win.getPlotItem()
+        pi.layout.removeItem(pi.titleLabel)
+        pi.layout.addItem(pi.titleLabel, 0, 0, 1, 6)
+            
+        plot_win.getPlotItem().layout.addItem(hist, 2, 5)
+        plot_win.getPlotItem().layout.setColumnFixedWidth(4, 3)
+        return hist
 
     # --- Value Storage Persistence ---
     def load_storage(self):
@@ -442,28 +1003,63 @@ class MainWindow(QtWidgets.QMainWindow):
             "ramprate2": 0.1,
             "ramp_step": 0.0005,
             "c1_name": "Vc1",
-            "c2_name": "Vc2"
+            "c2_name": "Vc2",
+            "v1_compliance": 0.01,
+            "v2_compliance": 0.01,
+            "c1_start": -0.005,
+            "c1_end": 0.005,
+            "c1_pts": 21,
+            "c2_start": -0.005,
+            "c2_end": 0.005,
+            "c2_pts": 21,
+            "coeff_a": 1.0,
+            "coeff_b": 0.0,
+            "coeff_c": 0.0,
+            "coeff_d": 1.0,
+            "sweep_mode": "Hold C1, sweep C2",
+            "serpentine": True
         }
-        self.stored_settings = defaults
+        self.stored_settings = defaults.copy()
         if os.path.exists(storage_path):
             try:
                 with open(storage_path, "r") as f:
-                    self.stored_settings = json.load(f)
-                    # Migrate old ramp_rate keys if present
-                    if "ramp_rate" in self.stored_settings:
-                        old_rate = self.stored_settings["ramp_rate"]
-                        self.stored_settings.setdefault("ramprate1", old_rate)
-                        self.stored_settings.setdefault("ramprate2", old_rate)
-                    if "ramp_rate_1" in self.stored_settings:
-                        self.stored_settings.setdefault("ramprate1", self.stored_settings["ramp_rate_1"])
-                    if "ramp_rate_2" in self.stored_settings:
-                        self.stored_settings.setdefault("ramprate2", self.stored_settings["ramp_rate_2"])
-                    self.stored_settings.setdefault("c1_name", "Vc1")
-                    self.stored_settings.setdefault("c2_name", "Vc2")
-                    if str(self.stored_settings.get("c1_name", "")).strip().lower() in ("c1", ""):
-                        self.stored_settings["c1_name"] = "Vc1"
-                    if str(self.stored_settings.get("c2_name", "")).strip().lower() in ("c2", ""):
-                        self.stored_settings["c2_name"] = "Vc2"
+                    raw_data = json.load(f)
+                
+                shared_data = raw_data.get("shared", {})
+                dg_data = raw_data.get("dual_gate", {})
+                
+                self.stored_settings["exposure_time"] = shared_data.get("exposure_time", raw_data.get("exposure_time", defaults["exposure_time"]))
+                self.stored_settings["settling_time"] = shared_data.get("settling_time", raw_data.get("settling_time", defaults["settling_time"]))
+                
+                for key in defaults:
+                    if key not in ("exposure_time", "settling_time"):
+                        if key == "v1_compliance":
+                            self.stored_settings[key] = dg_data.get("v1_compliance", dg_data.get("c1_compliance", raw_data.get("v1_compliance", raw_data.get("c1_compliance", defaults[key]))))
+                        elif key == "v2_compliance":
+                            self.stored_settings[key] = dg_data.get("v2_compliance", dg_data.get("c2_compliance", raw_data.get("v2_compliance", raw_data.get("c2_compliance", defaults[key]))))
+                        elif key == "c1_name":
+                            self.stored_settings[key] = shared_data.get("c1_name", dg_data.get("c1_name", raw_data.get("c1_name", defaults["c1_name"])))
+                        elif key == "c2_name":
+                            self.stored_settings[key] = shared_data.get("c2_name", dg_data.get("c2_name", raw_data.get("c2_name", defaults["c2_name"])))
+                        elif key in ("coeff_a", "coeff_b", "coeff_c", "coeff_d"):
+                            legacy_key = f"dg_coeff_{key[-1]}"
+                            self.stored_settings[key] = shared_data.get(key, dg_data.get(legacy_key, raw_data.get(legacy_key, defaults[key])))
+                        else:
+                            self.stored_settings[key] = dg_data.get(key, raw_data.get(key, defaults[key]))
+
+                # Migrate old ramp_rate keys if present
+                if "ramp_rate" in raw_data:
+                    old_rate = raw_data["ramp_rate"]
+                    self.stored_settings.setdefault("ramprate1", old_rate)
+                    self.stored_settings.setdefault("ramprate2", old_rate)
+                if "ramp_rate_1" in raw_data:
+                    self.stored_settings.setdefault("ramprate1", raw_data["ramp_rate_1"])
+                if "ramp_rate_2" in raw_data:
+                    self.stored_settings.setdefault("ramprate2", raw_data["ramp_rate_2"])
+                if str(self.stored_settings.get("c1_name", "")).strip().lower() in ("c1", ""):
+                    self.stored_settings["c1_name"] = "Vc1"
+                if str(self.stored_settings.get("c2_name", "")).strip().lower() in ("c2", ""):
+                    self.stored_settings["c2_name"] = "Vc2"
             except Exception as e:
                 print(f"Error loading value_storage: {e}")
 
@@ -473,11 +1069,187 @@ class MainWindow(QtWidgets.QMainWindow):
             self.stored_settings["c1_name"] = self.c1_name_edit.text()
         if hasattr(self, "c2_name_edit"):
             self.stored_settings["c2_name"] = self.c2_name_edit.text()
+        if hasattr(self, "coeff_a"):
+            self.stored_settings["coeff_a"] = self.coeff_a.value()
+        if hasattr(self, "coeff_b"):
+            self.stored_settings["coeff_b"] = self.coeff_b.value()
+        if hasattr(self, "coeff_c"):
+            self.stored_settings["coeff_c"] = self.coeff_c.value()
+        if hasattr(self, "coeff_d"):
+            self.stored_settings["coeff_d"] = self.coeff_d.value()
         try:
+            current_data = {}
+            if os.path.exists(storage_path):
+                with open(storage_path, "r") as f:
+                    try:
+                        current_data = json.load(f)
+                    except Exception:
+                        pass
+            if "shared" not in current_data:
+                current_data["shared"] = {}
+            if "dual_gate" not in current_data:
+                current_data["dual_gate"] = {}
+            current_data["shared"]["exposure_time"] = self.stored_settings.get("exposure_time", 0.1)
+            current_data["shared"]["settling_time"] = self.stored_settings.get("settling_time", 0.05)
+            current_data["shared"]["c1_name"] = self.stored_settings.get("c1_name", "Vc1")
+            current_data["shared"]["c2_name"] = self.stored_settings.get("c2_name", "Vc2")
+            current_data["shared"]["coeff_a"] = self.stored_settings.get("coeff_a", 1.0)
+            current_data["shared"]["coeff_b"] = self.stored_settings.get("coeff_b", 0.0)
+            current_data["shared"]["coeff_c"] = self.stored_settings.get("coeff_c", 0.0)
+            current_data["shared"]["coeff_d"] = self.stored_settings.get("coeff_d", 1.0)
+            camera = getattr(self.station, "camera", None)
+            current_data["shared"]["spectrometer"] = getattr(camera, "spectrometer_type", "lightfieldG15")
+            current_data["dual_gate"]["ramprate1"] = self.stored_settings.get("ramprate1", 0.1)
+            current_data["dual_gate"]["ramprate2"] = self.stored_settings.get("ramprate2", 0.1)
+            current_data["dual_gate"]["ramp_step"] = self.stored_settings.get("ramp_step", 0.0005)
+            current_data["dual_gate"]["c1_name"] = self.stored_settings.get("c1_name", "Vc1")
+            current_data["dual_gate"]["c2_name"] = self.stored_settings.get("c2_name", "Vc2")
+            
+            # New inputs
+            if hasattr(self, "ch1_compliance"):
+                current_data["dual_gate"]["v1_compliance"] = self.ch1_compliance.value()
+            if hasattr(self, "ch2_compliance"):
+                current_data["dual_gate"]["v2_compliance"] = self.ch2_compliance.value()
+            if hasattr(self, "c1_start"):
+                current_data["dual_gate"]["c1_start"] = self.c1_start.value()
+            if hasattr(self, "c1_end"):
+                current_data["dual_gate"]["c1_end"] = self.c1_end.value()
+            if hasattr(self, "c1_pts"):
+                current_data["dual_gate"]["c1_pts"] = self.c1_pts.value()
+                c1_step = abs(self.c1_end.value() - self.c1_start.value()) / (self.c1_pts.value() - 1) if self.c1_pts.value() > 1 else 0.0
+                current_data["dual_gate"]["c1_step"] = c1_step
+            if hasattr(self, "c2_start"):
+                current_data["dual_gate"]["c2_start"] = self.c2_start.value()
+            if hasattr(self, "c2_end"):
+                current_data["dual_gate"]["c2_end"] = self.c2_end.value()
+            if hasattr(self, "c2_pts"):
+                current_data["dual_gate"]["c2_pts"] = self.c2_pts.value()
+                c2_step = abs(self.c2_end.value() - self.c2_start.value()) / (self.c2_pts.value() - 1) if self.c2_pts.value() > 1 else 0.0
+                current_data["dual_gate"]["c2_step"] = c2_step
+            if hasattr(self, "sweep_mode_combo"):
+                current_data["dual_gate"]["sweep_mode"] = self.sweep_mode_combo.currentText()
+            if hasattr(self, "serpentine_box"):
+                current_data["dual_gate"]["serpentine"] = self.serpentine_box.isChecked()
+
+            # Purge deprecated root-level keys and legacy c1/c2 compliance keys
+            deprecated_keys = [
+                "exposure_time", "settling_time", "ramprate1", "ramprate2", "ramp_step", 
+                "c1_name", "c2_name", "grating", "wavelength", "target_temp", "num_spectra", 
+                "average", "accum_method", "plot_mode", "x_axis_scale", "plot_modes", 
+                "b_coord_name", "b_start", "b_end", "b_pts", "v_start", "v_end", "v_pts", 
+                "v_fixed", "variable_order", "serpentine", "faraday_comp", "faraday_rot", 
+                "end_ramp_zero", "end_ramp_ground", "bv_coeff_a", "bv_coeff_b", "bv_coeff_c", 
+                "bv_coeff_d", "pol_exc_vertical", "pol_exc_horizontal", "pol_exc_manual", 
+                "pol_coll_vertical", "pol_coll_horizontal", "pol_coll_manual",
+                "c1_compliance", "c2_compliance",
+                "dg_coeff_a", "dg_coeff_b", "dg_coeff_c", "dg_coeff_d"
+            ]
+            for key in deprecated_keys:
+                current_data.pop(key, None)
+                if "dual_gate" in current_data:
+                    current_data["dual_gate"].pop("c1_compliance", None)
+                    current_data["dual_gate"].pop("c2_compliance", None)
+                    current_data["dual_gate"].pop("dg_coeff_a", None)
+                    current_data["dual_gate"].pop("dg_coeff_b", None)
+                    current_data["dual_gate"].pop("dg_coeff_c", None)
+                    current_data["dual_gate"].pop("dg_coeff_d", None)
+                
             with open(storage_path, "w") as f:
-                json.dump(self.stored_settings, f, indent=4)
+                json.dump(current_data, f, indent=4)
         except Exception as e:
             print(f"Error saving to value_storage: {e}")
+
+    def reload_gui_from_storage(self):
+        self.load_storage()
+        
+        self.c1_name_edit.blockSignals(True)
+        self.c1_name_edit.setText(self.stored_settings.get("c1_name", "Vc1"))
+        self.c1_name_edit.blockSignals(False)
+
+        self.c2_name_edit.blockSignals(True)
+        self.c2_name_edit.setText(self.stored_settings.get("c2_name", "Vc2"))
+        self.c2_name_edit.blockSignals(False)
+
+        self.ch1_ramp_rate.blockSignals(True)
+        self.ch1_ramp_rate.setValue(self.stored_settings.get("ramprate1", 0.1))
+        self.ch1_ramp_rate.blockSignals(False)
+
+        self.ch2_ramp_rate.blockSignals(True)
+        self.ch2_ramp_rate.setValue(self.stored_settings.get("ramprate2", 0.1))
+        self.ch2_ramp_rate.blockSignals(False)
+
+        self.exposure_box.blockSignals(True)
+        self.exposure_box.setValue(self.stored_settings.get("exposure_time", 0.1))
+        self.exposure_box.blockSignals(False)
+
+        self.settling_box.blockSignals(True)
+        self.settling_box.setValue(self.stored_settings.get("settling_time", 0.05))
+        self.settling_box.blockSignals(False)
+
+        # Compliance
+        self.ch1_compliance.blockSignals(True)
+        self.ch1_compliance.setValue(self.stored_settings.get("v1_compliance", 0.01))
+        self.ch1_compliance.blockSignals(False)
+
+        self.ch2_compliance.blockSignals(True)
+        self.ch2_compliance.setValue(self.stored_settings.get("v2_compliance", 0.01))
+        self.ch2_compliance.blockSignals(False)
+
+        # Sweep range C1
+        self.c1_start.blockSignals(True)
+        self.c1_start.setValue(self.stored_settings.get("c1_start", -0.005))
+        self.c1_start.blockSignals(False)
+
+        self.c1_end.blockSignals(True)
+        self.c1_end.setValue(self.stored_settings.get("c1_end", 0.005))
+        self.c1_end.blockSignals(False)
+
+        self.c1_pts.blockSignals(True)
+        self.c1_pts.setValue(self.stored_settings.get("c1_pts", 21))
+        self.c1_pts.blockSignals(False)
+
+        # Sweep range C2
+        self.c2_start.blockSignals(True)
+        self.c2_start.setValue(self.stored_settings.get("c2_start", -0.005))
+        self.c2_start.blockSignals(False)
+
+        self.c2_end.blockSignals(True)
+        self.c2_end.setValue(self.stored_settings.get("c2_end", 0.005))
+        self.c2_end.blockSignals(False)
+
+        self.c2_pts.blockSignals(True)
+        self.c2_pts.setValue(self.stored_settings.get("c2_pts", 21))
+        self.c2_pts.blockSignals(False)
+
+        # Basis change coefficients
+        self.coeff_a.blockSignals(True)
+        self.coeff_a.setValue(self.stored_settings.get("coeff_a", 1.0))
+        self.coeff_a.blockSignals(False)
+
+        self.coeff_b.blockSignals(True)
+        self.coeff_b.setValue(self.stored_settings.get("coeff_b", 0.0))
+        self.coeff_b.blockSignals(False)
+
+        self.coeff_c.blockSignals(True)
+        self.coeff_c.setValue(self.stored_settings.get("coeff_c", 0.0))
+        self.coeff_c.blockSignals(False)
+
+        self.coeff_d.blockSignals(True)
+        self.coeff_d.setValue(self.stored_settings.get("coeff_d", 1.0))
+        self.coeff_d.blockSignals(False)
+
+        # Sweep mode and serpentine
+        self.sweep_mode_combo.blockSignals(True)
+        self.sweep_mode_combo.setCurrentText(self.stored_settings.get("sweep_mode", "Hold C1, sweep C2"))
+        self.sweep_mode_combo.blockSignals(False)
+
+        self.serpentine_box.blockSignals(True)
+        self.serpentine_box.setChecked(self.stored_settings.get("serpentine", True))
+        self.serpentine_box.blockSignals(False)
+
+        self.update_step_calculations()
+        self.update_variable_names()
+        self.on_compliance_changed()
 
     def create_scientific_validator(self, minimum, maximum, decimals):
         validator = QtGui.QDoubleValidator(minimum, maximum, decimals, self)
@@ -490,17 +1262,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # --- UI Building ---
     def setup_ui(self):
-        # Initialize Status Bar and Connection Status Indicator
-        status_bar = self.statusBar()
-        self.conn_status_lbl = QtWidgets.QLabel()
-        if self.station.smu.simulated:
-            self.conn_status_lbl.setText("Keysight SMU: SIMULATED (Connection Locked/Failed)  ")
-            self.conn_status_lbl.setStyleSheet("color: #f9e2af; font-weight: bold; font-family: Consolas, monospace;")
+        # Initialize Status Bar and Connection Status Indicator (only when not embedded)
+        if not getattr(self, "_embed", False):
+            status_bar = self.statusBar()
+            self.conn_status_lbl = QtWidgets.QLabel()
+            if self.station.smu.simulated:
+                self.conn_status_lbl.setText("Keysight SMU: SIMULATED (Connection Locked/Failed)  ")
+                self.conn_status_lbl.setStyleSheet("color: #f9e2af; font-weight: bold; font-family: Consolas, monospace;")
+            else:
+                self.conn_status_lbl.setText("Keysight SMU: CONNECTED (Physical)  ")
+                self.conn_status_lbl.setStyleSheet("color: #a6e3a1; font-weight: bold; font-family: Consolas, monospace;")
+            status_bar.addPermanentWidget(self.conn_status_lbl)
         else:
-            self.conn_status_lbl.setText("Keysight SMU: CONNECTED (Physical)  ")
-            self.conn_status_lbl.setStyleSheet("color: #a6e3a1; font-weight: bold; font-family: Consolas, monospace;")
-        status_bar.addPermanentWidget(self.conn_status_lbl)
-
+            # When embedded, still create the label for potential internal use but do not add to status bar
+            self.conn_status_lbl = QtWidgets.QLabel()
+            if self.station.smu.simulated:
+                self.conn_status_lbl.setText("Keysight SMU: SIMULATED (Connection Locked/Failed)  ")
+                self.conn_status_lbl.setStyleSheet("color: #f9e2af; font-weight: bold; font-family: Consolas, monospace;")
+            else:
+                self.conn_status_lbl.setText("Keysight SMU: CONNECTED (Physical)  ")
+                self.conn_status_lbl.setStyleSheet("color: #a6e3a1; font-weight: bold; font-family: Consolas, monospace;")
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QtWidgets.QHBoxLayout(central_widget)
@@ -520,8 +1301,8 @@ class MainWindow(QtWidgets.QMainWindow):
         main_layout.addWidget(scroll_area)
 
         # Right Column (Tabs Panel)
-        right_panel = QtWidgets.QTabWidget()
-        main_layout.addWidget(right_panel, 1)
+        self.right_panel = QtWidgets.QTabWidget()
+        main_layout.addWidget(self.right_panel, 1)
 
         # --- ROW 1: Keysight Channel 1 & Keysight Channel 2 next to each other ---
         smu_row = QtWidgets.QHBoxLayout()
@@ -576,7 +1357,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ch1_compliance = QtWidgets.QDoubleSpinBox()
         self.ch1_compliance.setRange(1e-9, 3.0)
         self.ch1_compliance.setDecimals(6)
-        self.ch1_compliance.setValue(0.01)
+        self.ch1_compliance.setValue(self.stored_settings.get("v1_compliance", 0.01))
         self.ch1_compliance.setSingleStep(0.001)
         self.ch1_compliance.setKeyboardTracking(False)
         self.ch1_compliance.editingFinished.connect(self.on_compliance_changed)
@@ -653,7 +1434,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ch2_compliance = QtWidgets.QDoubleSpinBox()
         self.ch2_compliance.setRange(1e-9, 3.0)
         self.ch2_compliance.setDecimals(6)
-        self.ch2_compliance.setValue(0.01)
+        self.ch2_compliance.setValue(self.stored_settings.get("v2_compliance", 0.01))
         self.ch2_compliance.setSingleStep(0.001)
         self.ch2_compliance.setKeyboardTracking(False)
         self.ch2_compliance.editingFinished.connect(self.on_compliance_changed)
@@ -699,7 +1480,7 @@ class MainWindow(QtWidgets.QMainWindow):
         c1_grid.addWidget(QtWidgets.QLabel("Start:"), 0, 0)
         self.c1_start = QtWidgets.QDoubleSpinBox()
         self.c1_start.setRange(-210.0, 210.0)
-        self.c1_start.setValue(-0.005)
+        self.c1_start.setValue(self.stored_settings.get("c1_start", -0.005))
         self.c1_start.setDecimals(4)
         self.c1_start.setKeyboardTracking(False)
         c1_grid.addWidget(self.c1_start, 0, 1)
@@ -707,7 +1488,7 @@ class MainWindow(QtWidgets.QMainWindow):
         c1_grid.addWidget(QtWidgets.QLabel("End:"), 1, 0)
         self.c1_end = QtWidgets.QDoubleSpinBox()
         self.c1_end.setRange(-210.0, 210.0)
-        self.c1_end.setValue(0.005)
+        self.c1_end.setValue(self.stored_settings.get("c1_end", 0.005))
         self.c1_end.setDecimals(4)
         self.c1_end.setKeyboardTracking(False)
         c1_grid.addWidget(self.c1_end, 1, 1)
@@ -715,7 +1496,7 @@ class MainWindow(QtWidgets.QMainWindow):
         c1_grid.addWidget(QtWidgets.QLabel("Points:"), 2, 0)
         self.c1_pts = ScientificPointSpinBox()
         self.c1_pts.setRange(1, 1000)
-        self.c1_pts.setValue(21)
+        self.c1_pts.setValue(self.stored_settings.get("c1_pts", 21))
         self.c1_pts.setKeyboardTracking(True)
         self.c1_pts.lineEdit().setPlaceholderText("e.g. 1e2")
         c1_grid.addWidget(self.c1_pts, 2, 1)
@@ -739,7 +1520,7 @@ class MainWindow(QtWidgets.QMainWindow):
         c2_grid.addWidget(QtWidgets.QLabel("Start:"), 0, 0)
         self.c2_start = QtWidgets.QDoubleSpinBox()
         self.c2_start.setRange(-210.0, 210.0)
-        self.c2_start.setValue(-0.005)
+        self.c2_start.setValue(self.stored_settings.get("c2_start", -0.005))
         self.c2_start.setDecimals(4)
         self.c2_start.setKeyboardTracking(False)
         c2_grid.addWidget(self.c2_start, 0, 1)
@@ -747,7 +1528,7 @@ class MainWindow(QtWidgets.QMainWindow):
         c2_grid.addWidget(QtWidgets.QLabel("End:"), 1, 0)
         self.c2_end = QtWidgets.QDoubleSpinBox()
         self.c2_end.setRange(-210.0, 210.0)
-        self.c2_end.setValue(0.005)
+        self.c2_end.setValue(self.stored_settings.get("c2_end", 0.005))
         self.c2_end.setDecimals(4)
         self.c2_end.setKeyboardTracking(False)
         c2_grid.addWidget(self.c2_end, 1, 1)
@@ -755,7 +1536,7 @@ class MainWindow(QtWidgets.QMainWindow):
         c2_grid.addWidget(QtWidgets.QLabel("Points:"), 2, 0)
         self.c2_pts = ScientificPointSpinBox()
         self.c2_pts.setRange(1, 1000)
-        self.c2_pts.setValue(21)
+        self.c2_pts.setValue(self.stored_settings.get("c2_pts", 21))
         self.c2_pts.setKeyboardTracking(True)
         self.c2_pts.lineEdit().setPlaceholderText("e.g. 1e2")
         c2_grid.addWidget(self.c2_pts, 2, 1)
@@ -801,7 +1582,7 @@ class MainWindow(QtWidgets.QMainWindow):
         f1_layout.addWidget(self.v1_formula_label)
 
         self.coeff_a = QtWidgets.QDoubleSpinBox()
-        self.coeff_a.setValue(1.0)
+        self.coeff_a.setValue(self.stored_settings.get("coeff_a", 1.0))
         self.coeff_a.setRange(-100, 100)
         self.coeff_a.setDecimals(4)
         self.coeff_a.setSingleStep(0.01)
@@ -812,7 +1593,7 @@ class MainWindow(QtWidgets.QMainWindow):
         f1_layout.addWidget(self.v1_c1_label)
 
         self.coeff_b = QtWidgets.QDoubleSpinBox()
-        self.coeff_b.setValue(0.0)
+        self.coeff_b.setValue(self.stored_settings.get("coeff_b", 0.0))
         self.coeff_b.setRange(-100, 100)
         self.coeff_b.setDecimals(4)
         self.coeff_b.setSingleStep(0.01)
@@ -832,7 +1613,7 @@ class MainWindow(QtWidgets.QMainWindow):
         f2_layout.addWidget(self.v2_formula_label)
 
         self.coeff_c = QtWidgets.QDoubleSpinBox()
-        self.coeff_c.setValue(0.0)
+        self.coeff_c.setValue(self.stored_settings.get("coeff_c", 0.0))
         self.coeff_c.setRange(-100, 100)
         self.coeff_c.setDecimals(4)
         self.coeff_c.setSingleStep(0.01)
@@ -843,7 +1624,7 @@ class MainWindow(QtWidgets.QMainWindow):
         f2_layout.addWidget(self.v2_c1_label)
 
         self.coeff_d = QtWidgets.QDoubleSpinBox()
-        self.coeff_d.setValue(1.0)
+        self.coeff_d.setValue(self.stored_settings.get("coeff_d", 1.0))
         self.coeff_d.setRange(-100, 100)
         self.coeff_d.setDecimals(4)
         self.coeff_d.setSingleStep(0.01)
@@ -881,11 +1662,13 @@ class MainWindow(QtWidgets.QMainWindow):
         other_layout.addWidget(QtWidgets.QLabel("Sweep Configuration:"))
         self.sweep_mode_combo = QtWidgets.QComboBox()
         self.sweep_mode_combo.addItems(["Hold C1, sweep C2", "Hold C2, sweep C1"])
+        self.sweep_mode_combo.setCurrentText(self.stored_settings.get("sweep_mode", "Hold C1, sweep C2"))
         self.sweep_mode_combo.currentTextChanged.connect(self.on_sweep_range_changed)
         other_layout.addWidget(self.sweep_mode_combo)
 
         self.serpentine_box = QtWidgets.QCheckBox("Serpentine (Snake) Sweep")
-        self.serpentine_box.setChecked(True)
+        self.serpentine_box.setChecked(self.stored_settings.get("serpentine", True))
+        self.serpentine_box.stateChanged.connect(self.save_storage)
         other_layout.addWidget(self.serpentine_box)
 
         # Timing and Ramping Grid
@@ -909,16 +1692,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settling_box.editingFinished.connect(self.on_timing_params_changed)
         timing_ramp_grid.addWidget(self.settling_box, 1, 1)
 
-        timing_ramp_grid.addWidget(QtWidgets.QLabel("Ramp Step (V):"), 2, 0)
-        self.ramp_step_box = QtWidgets.QDoubleSpinBox()
-        self.ramp_step_box.setRange(0.0001, 1.0)
-        self.ramp_step_box.setDecimals(5)
-        self.ramp_step_box.setValue(self.stored_settings.get("ramp_step", 0.0005))
-        self.ramp_step_box.setKeyboardTracking(False)
-        self.ramp_step_box.editingFinished.connect(self.on_ramp_step_changed)
-        timing_ramp_grid.addWidget(self.ramp_step_box, 2, 1)
+        # Ramp Step is managed only in value_storage and cannot be changed in the GUI
         
         other_layout.addLayout(timing_ramp_grid)
+
         bottom_row.addWidget(other_box)
 
         # Enable scientific notation entry on numeric spin boxes
@@ -939,7 +1716,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.coeff_d,
             self.exposure_box,
             self.settling_box,
-            self.ramp_step_box,
         ):
             self.enable_scientific_input(spin)
 
@@ -973,6 +1749,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_lbl.setStyleSheet("color: #4f46e5; font-style: italic; font-weight: bold;")
         meas_layout.addWidget(self.status_lbl)
 
+        self.lbl_current_b = QtWidgets.QLabel("B = --‑‑ T")
+        self.lbl_current_b.setStyleSheet("color: #1e293b; font-weight: bold;")
+        meas_layout.addWidget(self.lbl_current_b)
+
+        self.lbl_target_vc1 = QtWidgets.QLabel("Vc1 = --‑‑ V")
+        self.lbl_target_vc1.setStyleSheet("color: #1e293b; font-weight: bold;")
+        meas_layout.addWidget(self.lbl_target_vc1)
+
+        self.lbl_target_vc2 = QtWidgets.QLabel("Vc2 = --‑‑ V")
+        self.lbl_target_vc2.setStyleSheet("color: #1e293b; font-weight: bold;")
+        meas_layout.addWidget(self.lbl_target_vc2)
+
+        self.lbl_expected_end = QtWidgets.QLabel("Expected End: --:--:--")
+        self.lbl_expected_end.setStyleSheet("color: #1e293b; font-weight: bold;")
+        meas_layout.addWidget(self.lbl_expected_end)
+
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setValue(0)
         meas_layout.addWidget(self.progress_bar)
@@ -984,18 +1776,38 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Tab 1: Gate Sweep (CCD Spectra)
         self.tab1 = QtWidgets.QWidget()
-        right_panel.addTab(self.tab1, "Gate Sweep (Spectra)")
+        self.right_panel.addTab(self.tab1, "Gate Sweep (Spectra)")
         self.setup_tab1()
 
         # Tab 2: Top Gate current
         self.tab2 = QtWidgets.QWidget()
-        right_panel.addTab(self.tab2, "Top Gate (Ch1 Current)")
+        self.right_panel.addTab(self.tab2, "Top Gate (Ch1 Current)")
         self.setup_tab2()
 
         # Tab 3: Bottom Gate current
         self.tab3 = QtWidgets.QWidget()
-        right_panel.addTab(self.tab3, "Bottom Gate (Ch2 Current)")
+        self.right_panel.addTab(self.tab3, "Bottom Gate (Ch2 Current)")
         self.setup_tab3()
+
+        # Add View Control button as corner widget of QTabWidget
+        self.btn_view_control = QtWidgets.QPushButton("View Control ▾")
+        self.btn_view_control.setStyleSheet("""
+            QPushButton {
+                background-color: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 6px 12px;
+                font-weight: bold;
+                color: #1e293b;
+            }
+            QPushButton:hover {
+                background-color: #f8fafc;
+                border-color: #94a3b8;
+            }
+        """)
+        self.right_panel.setCornerWidget(self.btn_view_control, QtCore.Qt.Corner.TopRightCorner)
+        self.btn_view_control.clicked.connect(self.toggle_view_control_popup)
+        self.right_panel.currentChanged.connect(self.on_tab_changed)
 
         # Update initial variable names
         self.update_variable_names()
@@ -1018,9 +1830,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gatemap_win.setLabel('left', 'Virtual Gate C2', units='V')
         self.gatemap_win.setLabel('bottom', 'Virtual Gate C1', units='V')
         
-        # Color bar
-        self.gatemap_colorbar = pg.ColorBarItem(values=(0, 65535), colorMap='viridis')
-        self.gatemap_colorbar.setImageItem(self.gatemap_img)
+        # Color bar / Histogram
+        self.gatemap_colorbar = self.setup_histogram_lut(self.gatemap_win, self.gatemap_img, interactive=False)
         
         # Crosshair lines
         self.cross1_v = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen('#4f46e5', width=2))
@@ -1057,16 +1868,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vslice_win.setLabel('left', 'Virtual Gate C2', units='V')
         self.vslice_win.setLabel('bottom', 'Energy', units='eV')
         
-        self.vslice_colorbar = pg.ColorBarItem(values=(0, 65535), colorMap='viridis')
-        self.vslice_colorbar.setImageItem(self.vslice_img)
+        self.vslice_colorbar = self.setup_histogram_lut(self.vslice_win, self.vslice_img, interactive=True)
 
         # Draggable crosshair lines
         self.vslice_cross_v = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen('#4f46e5', width=2))
         self.vslice_cross_h = pg.InfiniteLine(angle=0, movable=True, pen=pg.mkPen('#4f46e5', width=2))
-        self.vslice_win.addItem(self.vslice_cross_v)
-        self.vslice_win.addItem(self.vslice_cross_h)
-        self.vslice_cross_v.sigPositionChanged.connect(self.on_vslice_crosshair_moved)
-        self.vslice_cross_h.sigPositionChanged.connect(self.on_vslice_crosshair_moved)
+        # Do not add crosshair lines to Vertical Slice plot (Plot B) per user request
+        # self.vslice_win.addItem(self.vslice_cross_v)
+        # self.vslice_win.addItem(self.vslice_cross_h)
+        # self.vslice_cross_v.sigPositionChanged.connect(self.on_vslice_crosshair_moved)
+        # self.vslice_cross_h.sigPositionChanged.connect(self.on_vslice_crosshair_moved)
 
         # Monkey-patch ViewBox to intercept left clicks and reposition crosshair lines
         viewbox_vslice = self.vslice_win.getViewBox()
@@ -1076,7 +1887,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 mouse_point = viewbox_vslice.mapSceneToView(ev.scenePos())
                 c1_val = self.cross1_v.value()
                 c2_val = mouse_point.y()
-                energy_val = mouse_point.x()
+                energy_val = self.selected_energy # Keep current selected energy instead of changing it
                 self.update_crosshair_values(c1_val, c2_val, energy_val)
                 self.refresh_slice_plots(c1_val, c2_val)
                 ev.accept()
@@ -1093,19 +1904,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hslice_img = pg.ImageItem()
         self.hslice_img.setOpts(axisOrder='row-major')
         self.hslice_win.addItem(self.hslice_img)
-        self.hslice_win.setLabel('left', 'Energy', units='eV')
-        self.hslice_win.setLabel('bottom', 'Virtual Gate C1', units='V')
+        self.hslice_win.setLabel('left', 'Virtual Gate C1', units='V')
+        self.hslice_win.setLabel('bottom', 'Energy', units='eV')
 
-        self.hslice_colorbar = pg.ColorBarItem(values=(0, 65535), colorMap='viridis')
-        self.hslice_colorbar.setImageItem(self.hslice_img)
+        self.hslice_colorbar = self.setup_histogram_lut(self.hslice_win, self.hslice_img, interactive=True)
 
         # Draggable crosshair lines
         self.hslice_cross_v = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen('#4f46e5', width=2))
         self.hslice_cross_h = pg.InfiniteLine(angle=0, movable=True, pen=pg.mkPen('#4f46e5', width=2))
-        self.hslice_win.addItem(self.hslice_cross_v)
-        self.hslice_win.addItem(self.hslice_cross_h)
-        self.hslice_cross_v.sigPositionChanged.connect(self.on_hslice_crosshair_moved)
-        self.hslice_cross_h.sigPositionChanged.connect(self.on_hslice_crosshair_moved)
+        # Do not add crosshair lines to Horizontal Slice plot (Plot C) per user request
+        # self.hslice_win.addItem(self.hslice_cross_v)
+        # self.hslice_win.addItem(self.hslice_cross_h)
+        # self.hslice_cross_v.sigPositionChanged.connect(self.on_hslice_crosshair_moved)
+        # self.hslice_cross_h.sigPositionChanged.connect(self.on_hslice_crosshair_moved)
 
         # Monkey-patch ViewBox to intercept left clicks and reposition crosshair lines
         viewbox_hslice = self.hslice_win.getViewBox()
@@ -1113,9 +1924,9 @@ class MainWindow(QtWidgets.QMainWindow):
         def hslice_click_event(ev):
             if ev.button() == QtCore.Qt.MouseButton.LeftButton:
                 mouse_point = viewbox_hslice.mapSceneToView(ev.scenePos())
-                c1_val = mouse_point.x()
+                c1_val = mouse_point.y()
                 c2_val = self.cross1_h.value()
-                energy_val = mouse_point.y()
+                energy_val = mouse_point.x()
                 self.update_crosshair_values(c1_val, c2_val, energy_val)
                 self.refresh_slice_plots(c1_val, c2_val)
                 ev.accept()
@@ -1177,8 +1988,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t2_heatmap_win.setLabel('left', 'Virtual Gate C2', units='V')
         self.t2_heatmap_win.setLabel('bottom', 'Virtual Gate C1', units='V')
 
-        self.t2_colorbar = pg.ColorBarItem(colorMap='viridis')
-        self.t2_colorbar.setImageItem(self.t2_heatmap_img)
+        self.t2_colorbar = self.setup_histogram_lut(self.t2_heatmap_win, self.t2_heatmap_img, interactive=True)
 
         # Draggable crosshair
         self.cross2_v = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen('#ea580c', width=2))
@@ -1249,8 +2059,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t3_heatmap_win.setLabel('left', 'Virtual Gate C2', units='V')
         self.t3_heatmap_win.setLabel('bottom', 'Virtual Gate C1', units='V')
 
-        self.t3_colorbar = pg.ColorBarItem(colorMap='viridis')
-        self.t3_colorbar.setImageItem(self.t3_heatmap_img)
+        self.t3_colorbar = self.setup_histogram_lut(self.t3_heatmap_win, self.t3_heatmap_img, interactive=True)
 
         # Draggable crosshair
         self.cross3_v = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen('#16a34a', width=2))
@@ -1465,6 +2274,12 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 QtWidgets.QMessageBox.warning(self, "Read Error", f"Failed to read Channel 2:\n{e}")
 
+    def on_live_status_updated(self, b_val, v1_val, v2_val):
+        self._last_polled_b = b_val
+        self.lbl_current_b.setText(f"B = {b_val:.4f} T")
+        self.lbl_target_vc1.setText(f"V1 = {v1_val:.4f} V")
+        self.lbl_target_vc2.setText(f"V2 = {v2_val:.4f} V")
+
     # --- Event Handlers & Input Syncing ---
     def update_step_calculations(self):
         """Calculate and display step sizes for gating variables dynamically."""
@@ -1513,6 +2328,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.is_running:
             self.update_coordinates_from_ui()
             self.reset_plot_scaling()
+            self.save_storage()
 
     def update_variable_names(self):
         """Dynamically update control group box titles, labels, equations and plot axes on user edit."""
@@ -1540,7 +2356,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'vslice_win'):
             self.vslice_win.setLabel('left', c2_label, units='V')
         if hasattr(self, 'hslice_win'):
-            self.hslice_win.setLabel('bottom', c1_label, units='V')
+            self.hslice_win.setLabel('left', c1_label, units='V')
         if hasattr(self, 't2_heatmap_win'):
             self.t2_heatmap_win.setLabel('bottom', c1_label, units='V')
             self.t2_heatmap_win.setLabel('left', c2_label, units='V')
@@ -1569,6 +2385,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ramp_channel(self.station.smu.ch2, val, mode, "Channel 2")
 
     def ramp_channel(self, channel, target, param_name, ch_name):
+        if hasattr(self, 'live_status_worker') and self.live_status_worker:
+            self.live_status_worker.pause()
+        self.station.live_status_paused = True
         unit = "A" if param_name == "curr" else "V"
         self.status_lbl.setText(f"Status: Ramping {ch_name} to {target} {unit}...")
         self.set_inputs_enabled(False)
@@ -1580,6 +2399,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ramp_worker.start()
 
     def on_ramp_finished(self):
+        self.station.live_status_paused = False
+        if hasattr(self, 'live_status_worker') and self.live_status_worker:
+            self.live_status_worker.resume()
         if self.ramp_worker and getattr(self.ramp_worker.channel, "ramp_stop_requested", False):
             self.status_lbl.setText("Status: Ramping interrupted.")
         else:
@@ -1588,6 +2410,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pause_btn.setEnabled(False)
 
     def on_ramp_error(self, err_msg):
+        self.station.live_status_paused = False
+        if hasattr(self, 'live_status_worker') and self.live_status_worker:
+            self.live_status_worker.resume()
         self.status_lbl.setText(f"Status: Ramping error")
         self.set_inputs_enabled(True)
         self.pause_btn.setEnabled(False)
@@ -1627,6 +2452,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.station.smu.ch2.curr_limit(self.ch2_compliance.value())
         except Exception:
             pass
+
+        self.save_storage()
 
     def on_mode_changed(self):
         # Update physical instrument modes
@@ -1699,16 +2526,6 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-    def on_ramp_step_changed(self):
-        """Save shared ramp step to value_storage and sync with hardware driver channels."""
-        step = self.ramp_step_box.value()
-        self.stored_settings["ramp_step"] = step
-        self.save_storage()
-        try:
-            self.station.smu.ch1.ramp_step(step)
-            self.station.smu.ch2.ramp_step(step)
-        except Exception:
-            pass
 
     def on_timing_params_changed(self):
         self.stored_settings["exposure_time"] = self.exposure_box.value()
@@ -1748,53 +2565,92 @@ class MainWindow(QtWidgets.QMainWindow):
         # Timing / Sweep settings
         self.exposure_box.setEnabled(enabled)
         self.settling_box.setEnabled(enabled)
-        self.ramp_step_box.setEnabled(enabled)
         self.sweep_mode_combo.setEnabled(enabled)
         self.serpentine_box.setEnabled(enabled)
 
     # --- Sweep Measurement Control ---
     def begin_sweep(self):
-        if self.is_running:
-            return
-
         if self.is_paused:
             # Resume sweep
             self.is_paused = False
             self.pause_btn.setText("⏸ Interrupt")
             self.pause_btn.setEnabled(True)
             self.begin_btn.setEnabled(False)
+            self.save_btn.setEnabled(False)
             self.status_lbl.setText("Status: Sweeping...")
             self.sweep_worker.resume()
             return
+
+        if self.is_running:
+            return
+
+        # Pause the status worker first to avoid any race conditions during monochromator/camera queries
+        self.live_status_worker.pause()
+        self.station.live_status_paused = True
+
+        # Clear the SMU VISA session to discard any unread response or dirty buffer from active status workers
+        smu = getattr(self.station, "smu", None)
+        if smu is not None and not smu.simulated:
+            try:
+                smu.visa_handle.clear()
+                smu.write('*CLS')
+            except Exception:
+                pass
 
         # Prepare parameters and validate
         self.update_coordinates_from_ui()
         c1_pts_actual = len(self.c1_coords)
         c2_pts_actual = len(self.c2_coords)
 
-        # Allocate data containers
-        self.data_spectra = np.zeros((c2_pts_actual, c1_pts_actual, 512))
-        self.data_current_ch1 = np.zeros((c2_pts_actual, c1_pts_actual))
-        self.data_current_ch2 = np.zeros((c2_pts_actual, c1_pts_actual))
-        self.data_measured_mask = np.zeros((c2_pts_actual, c1_pts_actual), dtype=bool)
-
-        # Initialize heatmap images with zero arrays of the correct size
-        # so pyqtgraph can resolve their size when setRect is called
-        self.gatemap_img.setImage(np.zeros((c2_pts_actual, c1_pts_actual)))
-        self.vslice_img.setImage(np.zeros((c2_pts_actual, 512)))
-        self.hslice_img.setImage(np.zeros((512, c1_pts_actual)))
-        self.t2_heatmap_img.setImage(np.zeros((c2_pts_actual, c1_pts_actual)))
-        self.t3_heatmap_img.setImage(np.zeros((c1_pts_actual, c2_pts_actual)))
-
+        # Determine number of pixels and wavelengths dynamically from camera
+        num_pixels = 512 # fallback
+        wavelengths = None
+        
         # Dynamically retrieve monochromator wavelength to calibrate Energy axis
         try:
             mono_wl = self.station.monochromator.wavelength()
         except Exception:
             mono_wl = 500.0 # fallback
 
-        # Calculate energy axis and sorting index
-        pixels = np.arange(512)
-        wavelengths = mono_wl + (pixels - 256) * 0.05
+        try:
+            wls = self.station.camera.remote_lf.get_wavelengths_cache()
+            if wls is not None and len(wls) > 0:
+                wavelengths = np.array(wls)
+                num_pixels = len(wavelengths)
+        except Exception as e:
+            print(f"Could not get wavelengths cache: {e}")
+            
+        if wavelengths is None:
+            try:
+                res = self.station.camera.remote_lf.get_spectrum()
+                if res is not None and len(res) >= 2 and len(res[0]) >= 1:
+                    num_pixels = len(res[0][0])
+                    if len(res[1]) > 0:
+                        wavelengths = np.array(res[1])
+            except Exception as e:
+                print(f"Could not fetch test spectrum for pixel count: {e}")
+                
+        if wavelengths is None:
+            # Fallback to manual calibration around center wavelength
+            pixels_arr = np.arange(num_pixels)
+            wavelengths = mono_wl + (pixels_arr - num_pixels // 2) * 0.05
+
+        self.data_spectra = np.zeros((c2_pts_actual, c1_pts_actual, num_pixels))
+        self.data_current_ch1 = np.zeros((c2_pts_actual, c1_pts_actual))
+        self.data_current_ch2 = np.zeros((c2_pts_actual, c1_pts_actual))
+        self.data_measured_volt_ch1 = np.zeros((c2_pts_actual, c1_pts_actual))
+        self.data_measured_volt_ch2 = np.zeros((c2_pts_actual, c1_pts_actual))
+        self.data_measured_b = np.zeros((c2_pts_actual, c1_pts_actual))
+        self.data_measured_mask = np.zeros((c2_pts_actual, c1_pts_actual), dtype=bool)
+
+        # Initialize heatmap images with zero arrays of the correct size
+        # so pyqtgraph can resolve their size when setRect is called
+        self.gatemap_img.setImage(np.zeros((c2_pts_actual, c1_pts_actual)))
+        self.vslice_img.setImage(np.zeros((c2_pts_actual, num_pixels)))
+        self.hslice_img.setImage(np.zeros((c1_pts_actual, num_pixels)))
+        self.t2_heatmap_img.setImage(np.zeros((c2_pts_actual, c1_pts_actual)))
+        self.t3_heatmap_img.setImage(np.zeros((c1_pts_actual, c2_pts_actual)))
+
         # Convert nm to eV
         energy_raw = 1239.84193 / wavelengths
         self.energy_sort_idx = np.argsort(energy_raw)
@@ -1818,14 +2674,127 @@ class MainWindow(QtWidgets.QMainWindow):
             'sweep_mode': self.sweep_mode_combo.currentText(),
             'serpentine': self.serpentine_box.isChecked(),
             'exposure_time': self.exposure_box.value(),
-            'settling_time': self.settling_box.value()
+            'settling_time': self.settling_box.value(),
+            'num_pixels': num_pixels
         }
+
+        # Calculate total expected duration
+        try:
+            magnet = getattr(self.station, "magnet", None)
+            curr_b = magnet.output_field() if magnet is not None else 0.0
+        except Exception:
+            curr_b = 0.0
+
+        try:
+            smu = getattr(self.station, "smu", None)
+            prev_v1 = 0.0
+            prev_v2 = 0.0
+            if smu is not None and not smu.simulated:
+                max_retries = 3
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        prev_v1 = smu.ch1.volt()
+                        break
+                    except Exception as ex:
+                        if attempt == max_retries:
+                            raise ex
+                        try:
+                            smu.visa_handle.clear()
+                        except Exception:
+                            pass
+                        time.sleep(0.1)
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        prev_v2 = smu.ch2.volt()
+                        break
+                    except Exception as ex:
+                        if attempt == max_retries:
+                            raise ex
+                        try:
+                            smu.visa_handle.clear()
+                        except Exception:
+                            pass
+                        time.sleep(0.1)
+        except Exception:
+            prev_v1 = 0.0
+            prev_v2 = 0.0
+
+        v_points = []
+        is_c2_outer = (self.sweep_mode_combo.currentText() == "Hold C2, sweep C1")
+        serpentine = self.serpentine_box.isChecked()
+
+        if is_c2_outer:
+            outer_arr = self.c2_coords
+            inner_arr = self.c1_coords
+        else:
+            outer_arr = self.c1_coords
+            inner_arr = self.c2_coords
+
+        a = self.coeff_a.value()
+        b = self.coeff_b.value()
+        c = self.coeff_c.value()
+        d = self.coeff_d.value()
+
+        for idx_outer, val_outer in enumerate(outer_arr):
+            if serpentine and (idx_outer % 2 == 1):
+                inner_indices = list(range(len(inner_arr) - 1, -1, -1))
+            else:
+                inner_indices = list(range(len(inner_arr)))
+            for idx_inner in inner_indices:
+                val_inner = inner_arr[idx_inner]
+                if is_c2_outer:
+                    c2_val = val_outer
+                    c1_val = val_inner
+                else:
+                    c1_val = val_outer
+                    c2_val = val_inner
+                v1_target, v2_target = transform_c_to_v(c1_val, c2_val, a, b, c, d)
+                v_points.append((v1_target, v2_target))
+
+        num_spectra = 1
+        storage_path = os.path.join(parent_dir, "value_storage")
+        if os.path.exists(storage_path):
+            try:
+                with open(storage_path, "r") as f_vs:
+                    vs = json.load(f_vs)
+                single_data = vs.get("single_spectra", {})
+                num_spectra = int(single_data.get("num_spectra", vs.get("num_spectra", 1)))
+            except Exception:
+                num_spectra = 1
+
+        self.sweep_total_duration = calculate_expected_duration(
+            v_points=v_points,
+            b_points=[curr_b] * len(v_points),
+            exposure_time=self.exposure_box.value(),
+            settling_time=self.settling_box.value(),
+            num_spectra=num_spectra,
+            sweep_rate_b=0.5 / 60.0,
+            initial_b=curr_b,
+            initial_v1=prev_v1,
+            initial_v2=prev_v2,
+            ramp_rate_v1=self.ch1_ramp_rate.value(),
+            ramp_rate_v2=self.ch2_ramp_rate.value()
+        )
+        self.sweep_v_points = v_points
+        self.sweep_b_points = [curr_b] * len(v_points)
+        self.sweep_num_spectra = num_spectra
+        self.sweep_rate_b = 0.5 / 60.0
+        self.sweep_initial_v1 = prev_v1
+        self.sweep_initial_v2 = prev_v2
+        self.sweep_initial_b = curr_b
+        self.sweep_start_time = time.time()
+        self.total_paused_time = 0.0
+        self.pause_start_time = None
+
+        self.lbl_expected_end.setText("Expected End: (waiting for measurements)")
 
         self.is_running = True
         self.is_paused = False
+        self._autosaved_this_run = False
         
         self.begin_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
+        self.pause_btn.setText("⏸ Interrupt")
         self.reset_btn.setEnabled(True)
         self.save_btn.setEnabled(False)
         self.progress_bar.setValue(0)
@@ -1835,6 +2804,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sweep_worker.point_measured.connect(self.on_point_measured)
         self.sweep_worker.progress_updated.connect(self.on_progress_updated)
         self.sweep_worker.status_updated.connect(self.status_lbl.setText)
+        self.sweep_worker.voltage_updated.connect(self.on_sweep_voltage_updated)
         self.sweep_worker.finished.connect(self.on_sweep_finished)
         self.sweep_worker.error_occurred.connect(self.on_sweep_error)
         self.sweep_worker.start()
@@ -1855,31 +2825,49 @@ class MainWindow(QtWidgets.QMainWindow):
             self.is_paused = False
             self.pause_btn.setText("⏸ Interrupt")
             self.begin_btn.setEnabled(False)
+            self.save_btn.setEnabled(False)
             self.status_lbl.setText("Status: Sweeping...")
+            if getattr(self, "pause_start_time", None) is not None:
+                self.total_paused_time += time.time() - self.pause_start_time
+                self.pause_start_time = None
             self.sweep_worker.resume()
         else:
             self.is_paused = True
             self.pause_btn.setText("▶ Resume")
             self.begin_btn.setEnabled(True)
+            self.save_btn.setEnabled(True if np.any(self.data_measured_mask) else False)
             self.status_lbl.setText("Status: Paused (Interrupt)")
+            self.pause_start_time = time.time()
             self.sweep_worker.pause()
 
     def reset_sweep(self):
+        was_running = self.is_running
+        if self.is_running:
+            self.trigger_autosave(was_interrupted=True)
         if self.sweep_worker and self.sweep_worker.isRunning():
             self.sweep_worker.stop()
             self.sweep_worker.wait()
+        if hasattr(self, 'live_status_worker') and self.live_status_worker:
+            self.live_status_worker.resume()
+        self.station.live_status_paused = False
         
         self.is_running = False
         self.is_paused = False
+        self.sweep_start_time = None
+        self.sweep_total_duration = 0.0
+        self.total_paused_time = 0.0
+        self.pause_start_time = None
         self.begin_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
+        self.pause_btn.setText("⏸ Interrupt")
         self.save_btn.setEnabled(True if np.any(self.data_measured_mask) else False)
         self.set_inputs_enabled(True)
         
         self.progress_bar.setValue(0)
+        self.lbl_expected_end.setText("Expected End: --:--:--")
         self.status_lbl.setText("Status: Reset complete")
 
-    def on_point_measured(self, i, j, c1, c2, v1, v2, spectrum, curr_ch1, curr_ch2):
+    def on_point_measured(self, i, j, c1, c2, v1, v2, spectrum, curr_ch1, curr_ch2, meas_v1, meas_v2, meas_b):
         # Sort spectrum to align with increasing energy values
         sorted_spectrum = spectrum[self.energy_sort_idx]
         
@@ -1887,32 +2875,123 @@ class MainWindow(QtWidgets.QMainWindow):
         self.data_spectra[j, i, :] = sorted_spectrum
         self.data_current_ch1[j, i] = curr_ch1
         self.data_current_ch2[j, i] = curr_ch2
+        self.data_measured_volt_ch1[j, i] = meas_v1
+        self.data_measured_volt_ch2[j, i] = meas_v2
+        self.data_measured_b[j, i] = meas_b
         self.data_measured_mask[j, i] = True
 
         # Redraw plots
         self.update_heatmaps_and_slices()
+        
+        # Force refreshing current slices based on active crosshairs during sweep
+        self.on_crosshair_moved()
+        self.on_tab2_crosshair_moved()
+        self.on_tab3_crosshair_moved()
+
+        # Update panel labels with current sweep values
+        self._last_polled_b = meas_b
+        self.lbl_current_b.setText(f"B = {meas_b:.4f} T")
+        self.lbl_target_vc1.setText(f"V1 = {meas_v1:.4f} V")
+        self.lbl_target_vc2.setText(f"V2 = {meas_v2:.4f} V")
 
     def on_progress_updated(self, current, total):
         pct = int(100 * current / total)
         self.progress_bar.setValue(pct)
+        
+        if getattr(self, "sweep_start_time", None) is not None:
+            if current < 3:
+                self.lbl_expected_end.setText("Expected End: (waiting for measurements)")
+                return
+
+            current_pause_overhead = 0.0
+            if self.is_paused and getattr(self, "pause_start_time", None) is not None:
+                current_pause_overhead = time.time() - self.pause_start_time
+                
+            total_elapsed_paused = self.total_paused_time + current_pause_overhead
+            active_elapsed_time = time.time() - self.sweep_start_time - total_elapsed_paused
+
+            # Get remaining points
+            remaining_v = self.sweep_v_points[current:]
+            remaining_b = self.sweep_b_points[current:]
+
+            if current > 0 and current <= len(self.sweep_v_points):
+                last_v1, last_v2 = self.sweep_v_points[current - 1]
+                last_b = self.sweep_b_points[current - 1]
+            else:
+                last_v1, last_v2 = self.sweep_initial_v1, self.sweep_initial_v2
+                last_b = self.sweep_initial_b
+
+            predicted_remaining = calculate_expected_duration(
+                v_points=remaining_v,
+                b_points=remaining_b,
+                exposure_time=self.exposure_box.value(),
+                settling_time=self.settling_box.value(),
+                num_spectra=self.sweep_num_spectra,
+                sweep_rate_b=self.sweep_rate_b,
+                initial_b=last_b,
+                initial_v1=last_v1,
+                initial_v2=last_v2,
+                ramp_rate_v1=self.ch1_ramp_rate.value(),
+                ramp_rate_v2=self.ch2_ramp_rate.value()
+            )
+
+            predicted_elapsed = self.sweep_total_duration - predicted_remaining
+            if predicted_elapsed > 0 and active_elapsed_time > 0:
+                scale_factor = active_elapsed_time / predicted_elapsed
+                scale_factor = max(0.5, min(2.0, scale_factor))
+            else:
+                scale_factor = 1.0
+
+            dynamic_remaining = predicted_remaining * scale_factor
+            expected_end = time.time() + dynamic_remaining
+            
+            time_str = time.strftime("%H:%M:%S", time.localtime(expected_end))
+            self.lbl_expected_end.setText(f"Expected End: {time_str}")
+        else:
+            self.lbl_expected_end.setText("Expected End: --:--:--")
+
+    def on_sweep_voltage_updated(self, v1, v2):
+        self.ch1_setpoint.setValue(v1)
+        self.ch2_setpoint.setValue(v2)
 
     def on_sweep_finished(self):
+        self.trigger_autosave(was_interrupted=False)
         self.is_running = False
         self.begin_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self.save_btn.setEnabled(True)
         self.set_inputs_enabled(True)
         self.status_lbl.setText("Status: Sweep Finished (Data ready to save)")
+        if hasattr(self, 'live_status_worker') and self.live_status_worker:
+            self.live_status_worker.resume()
+        self.station.live_status_paused = False
         QtWidgets.QMessageBox.information(self, "Sweep Complete", "Electrostatic gate sweep finished successfully!")
 
     def on_sweep_error(self, err_msg):
+        self.trigger_autosave(was_interrupted=True)
         self.is_running = False
         self.begin_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self.save_btn.setEnabled(True if np.any(self.data_measured_mask) else False)
         self.set_inputs_enabled(True)
         self.status_lbl.setText("Status: Error occurred")
+        if hasattr(self, 'live_status_worker') and self.live_status_worker:
+            self.live_status_worker.resume()
+        self.station.live_status_paused = False
         QtWidgets.QMessageBox.critical(self, "Sweep Error", f"Measurement aborted due to error:\n{err_msg}")
+
+    def prompt_save_on_interrupt(self):
+        if not np.any(self.data_measured_mask):
+            return
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Save Interrupted Sweep",
+            "The sweep was interrupted. Would you like to save the swept data?",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.Yes
+        )
+        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+            self.save_sweep_data()
 
     # --- Plot Sizing & Coordinates Setup ---
     def reset_plot_scaling(self):
@@ -1937,18 +3016,15 @@ class MainWindow(QtWidgets.QMainWindow):
             y_start1 = self.c2_coords[0] - 0.5
             c2_min = y_start1
             c2_max = y_start1 + 1.0
-        # Update viewbox bounds for gate map
-        self.gatemap_win.getViewBox().update_bounds(c1_min, c1_max, c2_min, c2_max)
         # Determine energy axis limits for slice and spectrum plots
         energy_min = min(self.energy_axis[0], self.energy_axis[-1])
         energy_max = max(self.energy_axis[0], self.energy_axis[-1])
-        # Update viewbox bounds for other plots based on their axes
-        # Vertical Slice: X=Energy, Y=C2
-        self.vslice_win.getViewBox().update_bounds(energy_min, energy_max, c2_min, c2_max)
-        # Horizontal Slice: X=C1, Y=Energy
-        self.hslice_win.getViewBox().update_bounds(c1_min, c1_max, energy_min, energy_max)
-        # Spectrum: X=Energy, Y=Uncapped
-        self.spectrum_win.getViewBox().update_bounds(energy_min, energy_max, None, None)
+
+        # Set limits for plots (matching Vector Map style)
+        self.gatemap_win.setLimits(xMin=c1_min, xMax=c1_max, yMin=c2_min, yMax=c2_max)
+        self.vslice_win.setLimits(xMin=energy_min, xMax=energy_max, yMin=c2_min, yMax=c2_max)
+        self.hslice_win.setLimits(xMin=energy_min, xMax=energy_max, yMin=c1_min, yMax=c1_max)
+        self.spectrum_win.setLimits(xMin=energy_min, xMax=energy_max)
 
         rect1 = QtCore.QRectF(x_start1, y_start1, width1, height1)
         if self.gatemap_img.image is not None:
@@ -1957,18 +3033,14 @@ class MainWindow(QtWidgets.QMainWindow):
         vb1 = self.gatemap_win.getViewBox()
         vb1.invertX(self.c1_coords[0] > self.c1_coords[-1])
         vb1.invertY(self.c2_coords[0] > self.c2_coords[-1])
-        vb1.setRange(xRange=(c1_min, c1_max), yRange=(c2_min, c2_max), padding=0)
+        self.gatemap_win.setRange(xRange=(c1_min, c1_max), yRange=(c2_min, c2_max), padding=0)
 
         # Tab 1: Vertical Slice (Y axis is C2, X axis is Energy)
         width_vslice = self.energy_axis[-1] - self.energy_axis[0]
         x_start_vslice = self.energy_axis[0]
-        energy_min = min(self.energy_axis[0], self.energy_axis[-1])
-        energy_max = max(self.energy_axis[0], self.energy_axis[-1])
         if len(self.energy_axis) <= 1 or width_vslice == 0:
             width_vslice = 1.0
             x_start_vslice = self.energy_axis[0] - 0.5
-            energy_min = x_start_vslice
-            energy_max = x_start_vslice + 1.0
 
         height_vslice = self.c2_coords[-1] - self.c2_coords[0]
         y_start_vslice = self.c2_coords[0]
@@ -1982,9 +3054,9 @@ class MainWindow(QtWidgets.QMainWindow):
         
         vb_vslice = self.vslice_win.getViewBox()
         vb_vslice.invertY(self.c2_coords[0] > self.c2_coords[-1])
-        vb_vslice.setRange(xRange=(energy_min, energy_max), yRange=(c2_min, c2_max), padding=0)
+        self.vslice_win.setRange(xRange=(energy_min, energy_max), yRange=(c2_min, c2_max), padding=0)
 
-        # Tab 1: Horizontal Slice (X axis is C1, Y axis is Energy)
+        # Tab 1: Horizontal Slice (X axis is Energy, Y axis is C1)
         width_hslice = self.c1_coords[-1] - self.c1_coords[0]
         x_start_hslice = self.c1_coords[0]
         if len(self.c1_coords) <= 1 or width_hslice == 0:
@@ -1997,26 +3069,29 @@ class MainWindow(QtWidgets.QMainWindow):
             height_hslice = 1.0
             y_start_hslice = self.energy_axis[0] - 0.5
 
-        rect_hslice = QtCore.QRectF(x_start_hslice, y_start_hslice, width_hslice, height_hslice)
+        rect_hslice = QtCore.QRectF(y_start_hslice, x_start_hslice, height_hslice, width_hslice)
         if self.hslice_img.image is not None:
             self.hslice_img.setRect(rect_hslice)
         
         vb_hslice = self.hslice_win.getViewBox()
-        vb_hslice.invertX(self.c1_coords[0] > self.c1_coords[-1])
-        vb_hslice.setRange(xRange=(c1_min, c1_max), yRange=(energy_min, energy_max), padding=0)
+        vb_hslice.invertY(self.c1_coords[0] > self.c1_coords[-1])
+        self.hslice_win.setRange(xRange=(energy_min, energy_max), yRange=(c1_min, c1_max), padding=0)
 
         # Tab 1: Spectrum plot Energy range
-        self.spectrum_win.getViewBox().setRange(xRange=(energy_min, energy_max), padding=0)
+        self.spectrum_win.setRange(xRange=(energy_min, energy_max), padding=0)
         
         # Block region signals during scaling reset to avoid cascading updates/crashes
         self.spectrum_v_region.blockSignals(True)
         self.spectrum_h_region.blockSignals(True)
 
-        # Center the vertical region lines dynamically inside the active energy range (30% to 70% of the span)
+        # Center the vertical region lines dynamically inside the active energy range (30% to 70% of the span) if needed
         e_range = energy_max - energy_min
-        self.spectrum_v_region.setRegion((energy_min + 0.3 * e_range, energy_min + 0.7 * e_range))
+        curr_v_reg = self.spectrum_v_region.getRegion()
+        v_reg_min, v_reg_max = curr_v_reg
+        if v_reg_min < energy_min or v_reg_max > energy_max or v_reg_min >= v_reg_max or (v_reg_min == 0.0 and v_reg_max == 1.0):
+            self.spectrum_v_region.setRegion((energy_min + 0.3 * e_range, energy_min + 0.7 * e_range))
 
-        # Center the horizontal region lines dynamically inside the active counts range (30% to 70% of the span)
+        # Center the horizontal region lines dynamically inside the active counts range (30% to 70% of the span) if needed
         if np.any(self.data_measured_mask):
             measured_spectra = self.data_spectra[self.data_measured_mask]
             y_min = np.min(measured_spectra)
@@ -2028,8 +3103,12 @@ class MainWindow(QtWidgets.QMainWindow):
         y_range = y_max - y_min
         if y_range <= 0:
             y_range = 1.0
-        self.spectrum_h_region.setRegion((y_min + 0.3 * y_range, y_min + 0.7 * y_range))
-        self.spectrum_win.getViewBox().setRange(yRange=(y_min - 0.1 * y_range, y_max + 0.1 * y_range), padding=0)
+
+        curr_h_reg = self.spectrum_h_region.getRegion()
+        h_reg_min, h_reg_max = curr_h_reg
+        if h_reg_min < 0 or h_reg_max <= h_reg_min or (h_reg_min == 0.0 and h_reg_max == 1.0):
+            self.spectrum_h_region.setRegion((y_min + 0.3 * y_range, y_min + 0.7 * y_range))
+        self.spectrum_win.setRange(yRange=(y_min - 0.1 * y_range, y_max + 0.1 * y_range), padding=0)
 
         self.spectrum_v_region.blockSignals(False)
         self.spectrum_h_region.blockSignals(False)
@@ -2137,6 +3216,166 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t3_hslice_win.getAxis('bottom').setTicks([ticks_c1])
         self.t3_vslice_win.getAxis('bottom').setTicks([ticks_c2])
 
+    def scale_plots(self):
+        """Scale all plots: zoom completely out on coordinates, auto-range 1D plots, and set colorbar levels to full data range."""
+        # 1. Reset all viewbox ranges to coordinate limits (c1, c2, energy) by calling reset_plot_scaling
+        self.reset_plot_scaling()
+
+        # 2. Scale interactive colorbars to full data range (min to max of the active slice/current data)
+        # Ensure gradients are ordered normally (yellow green blue)
+        self.vslice_colorbar.gradient.loadPreset('viridis')
+        self.hslice_colorbar.gradient.loadPreset('viridis')
+        self.t2_colorbar.gradient.loadPreset('viridis')
+        self.t3_colorbar.gradient.loadPreset('viridis')
+
+        if self.vslice_img.image is not None and self.vslice_img.image.size > 0:
+            vslice_data = self.vslice_img.image
+            min_v, max_v = np.min(vslice_data), np.max(vslice_data)
+            if min_v == max_v:
+                max_v += 1.0
+            self.vslice_colorbar.setLevels(min_v, max_v)
+
+        if self.hslice_img.image is not None and self.hslice_img.image.size > 0:
+            hslice_data = self.hslice_img.image
+            min_h, max_h = np.min(hslice_data), np.max(hslice_data)
+            if min_h == max_h:
+                max_h += 1.0
+            self.hslice_colorbar.setLevels(min_h, max_h)
+
+        if np.any(self.data_measured_mask):
+            c1_meas = self.data_current_ch1[self.data_measured_mask]
+            if len(c1_meas) > 0:
+                min_c1, max_c1 = np.min(c1_meas), np.max(c1_meas)
+                if min_c1 == max_c1:
+                    max_c1 += 1e-12
+                self.t2_colorbar.setLevels(min_c1, max_c1)
+
+        if np.any(self.data_measured_mask):
+            c2_meas = self.data_current_ch2[self.data_measured_mask]
+            if len(c2_meas) > 0:
+                min_c2, max_c2 = np.min(c2_meas), np.max(c2_meas)
+                if min_c2 == max_c2:
+                    max_c2 += 1e-12
+                self.t3_colorbar.setLevels(min_c2, max_c2)
+
+        # 3. Reset Y-axis for 1D slice curves and spectrum curve using manual scaling helper
+        def manually_scale_y(plot_win, curve):
+            y_data = curve.yData
+            if y_data is not None and len(y_data) > 0:
+                y_min = np.min(y_data)
+                y_max = np.max(y_data)
+                y_range = y_max - y_min
+                if y_range <= 0:
+                    y_range = 1.0
+                plot_win.getViewBox().setRange(yRange=(y_min - 0.05 * y_range, y_max + 0.05 * y_range), padding=0)
+
+        manually_scale_y(self.t2_hslice_win, self.t2_hslice_curve)
+        manually_scale_y(self.t2_vslice_win, self.t2_vslice_curve)
+        manually_scale_y(self.t3_hslice_win, self.t3_hslice_curve)
+        manually_scale_y(self.t3_vslice_win, self.t3_vslice_curve)
+        manually_scale_y(self.spectrum_win, self.spectrum_curve)
+
+    def toggle_view_control_popup(self):
+        if self.view_control_popup.isVisible():
+            self.view_control_popup.hide()
+        else:
+            tab_idx = self.right_panel.currentIndex()
+            self.view_control_popup.update_grid_layout(tab_idx)
+            pos = self.btn_view_control.mapToGlobal(QtCore.QPoint(self.btn_view_control.width() - self.view_control_popup.width(), self.btn_view_control.height()))
+            self.view_control_popup.move(pos)
+            self.view_control_popup.show()
+            self.view_control_popup.raise_()
+
+    def on_tab_changed(self, tab_idx):
+        if self.view_control_popup.isVisible():
+            self.view_control_popup.update_grid_layout(tab_idx)
+
+    def perform_autoscale(self):
+        popup = self.view_control_popup
+        mode = popup.get_axis_mode()
+        if mode == "None":
+            return
+            
+        tab_idx = self.right_panel.currentIndex()
+        targets = []
+        if tab_idx == 0:
+            if popup.btn_grid_A.isChecked(): targets.append(self.gatemap_win)
+            if popup.btn_grid_B.isChecked(): targets.append(self.vslice_win)
+            if popup.btn_grid_C.isChecked(): targets.append(self.hslice_win)
+            if popup.btn_grid_D.isChecked(): targets.append(self.spectrum_win)
+        elif tab_idx == 1:
+            if popup.btn_grid_AC.isChecked(): targets.append(self.t2_heatmap_win)
+            if popup.btn_grid_B.isChecked(): targets.append(self.t2_hslice_win)
+            if popup.btn_grid_D.isChecked(): targets.append(self.t2_vslice_win)
+        elif tab_idx == 2:
+            if popup.btn_grid_AC.isChecked(): targets.append(self.t3_heatmap_win)
+            if popup.btn_grid_B.isChecked(): targets.append(self.t3_hslice_win)
+            if popup.btn_grid_D.isChecked(): targets.append(self.t3_vslice_win)
+            
+        for plot in targets:
+            vb = plot.getViewBox()
+            if mode == "X":
+                vb.enableAutoRange(axis=pg.ViewBox.XAxis, enable=True)
+                if tab_idx != 0:
+                    vb.autoRange(axis=pg.ViewBox.XAxis)
+            elif mode == "Y":
+                vb.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
+                if tab_idx != 0:
+                    vb.autoRange(axis=pg.ViewBox.YAxis)
+            elif mode == "Both":
+                vb.enableAutoRange(enable=True)
+                if tab_idx != 0:
+                    vb.autoRange()
+
+    def get_processed_spectra(self):
+        raw_spectra = self.data_spectra
+        if raw_spectra is None or raw_spectra.size == 0:
+            return raw_spectra
+            
+        option = "Signal"
+        if hasattr(self, "view_control_popup"):
+            option = self.view_control_popup.get_source_option()
+            
+        if option == "Signal":
+            return raw_spectra
+            
+        single_win = getattr(self, "single_spectra_window", None)
+        if single_win is None:
+            return raw_spectra
+            
+        bg_x = getattr(single_win, "bg_x", None)
+        bg_y = getattr(single_win, "bg_y", None)
+        ref_x = getattr(single_win, "ref_x", None)
+        ref_y = getattr(single_win, "ref_y", None)
+        
+        sweep_wavelengths = 1239.84193 / self.energy_axis
+        
+        def get_interp_spectrum(spec_x, spec_y):
+            if spec_x is None or spec_y is None or len(spec_x) == 0:
+                return np.zeros_like(sweep_wavelengths)
+            x_arr = np.asarray(spec_x)
+            y_arr = np.asarray(spec_y)
+            sort_idx = np.argsort(x_arr)
+            return np.interp(sweep_wavelengths, x_arr[sort_idx], y_arr[sort_idx])
+            
+        bg_interp = get_interp_spectrum(bg_x, bg_y)
+        ref_interp = get_interp_spectrum(ref_x, ref_y)
+        
+        if option == "Signal - BG":
+            return raw_spectra - bg_interp
+        elif option == "(S-R)/(R-B)":
+            denom = ref_interp - bg_interp
+            denom = np.where(denom == 0.0, 1e-9, denom)
+            return (raw_spectra - ref_interp) / denom
+            
+        return raw_spectra
+
+    def on_plot_source_changed(self):
+        if not np.any(self.data_measured_mask):
+            return
+        self.update_heatmaps_and_slices()
+        self.on_crosshair_moved()
+
     # --- Live Rendering updates ---
     def update_heatmaps_and_slices(self):
         """Calculates integrated counts and currents to update heatmaps and slices."""
@@ -2151,7 +3390,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         if len(idx_range) > 0:
             # Clip/clamp the intensity spectra within the horizontal region limits and integrate
-            sub_spectra = self.data_spectra[:, :, idx_range]
+            sub_spectra = self.get_processed_spectra()[:, :, idx_range]
             clamped_spectra = np.clip(sub_spectra, h_min, h_max) - h_min
             integrated_map = np.sum(clamped_spectra, axis=2)
         else:
@@ -2166,23 +3405,20 @@ class MainWindow(QtWidgets.QMainWindow):
             min_val, max_val = np.min(measured_values), np.max(measured_values)
             if min_val == max_val:
                 max_val += 1
-            self.gatemap_colorbar.setLevels((min_val, max_val))
+            self.gatemap_colorbar.setLevels(min_val, max_val)
 
         # Update Tab 2 and Tab 3 current heatmaps
         self.t2_heatmap_img.setImage(self.data_current_ch1)
         if np.any(self.data_measured_mask):
             c1_meas = self.data_current_ch1[self.data_measured_mask]
-            self.t2_colorbar.setLevels((np.min(c1_meas), np.max(c1_meas)))
+            self.t2_colorbar.setLevels(np.min(c1_meas), np.max(c1_meas))
 
         self.t3_heatmap_img.setImage(self.data_current_ch2)
         if np.any(self.data_measured_mask):
             c2_meas = self.data_current_ch2[self.data_measured_mask]
-            self.t3_colorbar.setLevels((np.min(c2_meas), np.max(c2_meas)))
+            self.t3_colorbar.setLevels(np.min(c2_meas), np.max(c2_meas))
 
-        # Force refreshing current slices based on active crosshairs
-        self.on_crosshair_moved()
-        self.on_tab2_crosshair_moved()
-        self.on_tab3_crosshair_moved()
+
 
     def on_integration_region_changed(self):
         """Called dynamically as the shaded spectral region is dragged."""
@@ -2210,8 +3446,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vslice_cross_v.setValue(energy_val)
         self.vslice_cross_h.setValue(c2_val)
         
-        self.hslice_cross_v.setValue(c1_val)
-        self.hslice_cross_h.setValue(energy_val)
+        self.hslice_cross_v.setValue(energy_val)
+        self.hslice_cross_h.setValue(c1_val)
 
         # Unblock signals
         self.cross1_v.blockSignals(False)
@@ -2248,9 +3484,9 @@ class MainWindow(QtWidgets.QMainWindow):
         """Called when crosshairs in hslice_win (bottom left) are dragged."""
         if not np.any(self.data_measured_mask):
             return
-        c1_val = self.hslice_cross_v.value()
+        energy_val = self.hslice_cross_v.value()
         c2_val = self.cross1_h.value()
-        energy_val = self.hslice_cross_h.value()
+        c1_val = self.hslice_cross_h.value()
         
         self.update_crosshair_values(c1_val, c2_val, energy_val)
         self.refresh_slice_plots(c1_val, c2_val)
@@ -2265,8 +3501,10 @@ class MainWindow(QtWidgets.QMainWindow):
         idx_c1 = np.argmin(np.abs(self.c1_coords - c1_val))
         idx_c2 = np.argmin(np.abs(self.c2_coords - c2_val))
 
+        processed_spectra = self.get_processed_spectra()
+
         # 1. Update 1D Spectrum at crosshair intersection
-        spectrum = self.data_spectra[idx_c2, idx_c1, :]
+        spectrum = processed_spectra[idx_c2, idx_c1, :]
         self.spectrum_curve.setData(self.energy_axis, spectrum)
         
         # Manually scale the Y-axis to fit only the spectrum curve if autoRange is still enabled
@@ -2280,12 +3518,22 @@ class MainWindow(QtWidgets.QMainWindow):
             vb_spec.setRange(yRange=(y_min - 0.1 * y_range, y_max + 0.1 * y_range), padding=0)
 
         # 2. Update Vertical Slice (all C2 coordinates at fixed C1)
-        vslice_data = self.data_spectra[:, idx_c1, :]
+        vslice_data = processed_spectra[:, idx_c1, :]
         self.vslice_img.setImage(vslice_data)
+        if vslice_data.size > 0:
+            min_v, max_v = np.min(vslice_data), np.max(vslice_data)
+            if min_v == max_v:
+                max_v += 1
+            self.vslice_colorbar.setLevels(min_v, max_v)
 
         # 3. Update Horizontal Slice (all C1 coordinates at fixed C2)
-        hslice_data = self.data_spectra[idx_c2, :, :].T
+        hslice_data = processed_spectra[idx_c2, :, :]
         self.hslice_img.setImage(hslice_data)
+        if hslice_data.size > 0:
+            min_h, max_h = np.min(hslice_data), np.max(hslice_data)
+            if min_h == max_h:
+                max_h += 1
+            self.hslice_colorbar.setLevels(min_h, max_h)
 
     def on_tab2_crosshair_moved(self):
         """Update Tab 2 slices when its crosshair is dragged."""
@@ -2328,10 +3576,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t3_vslice_curve.setData(self.c2_coords, curr_vs_c2)
 
     # --- HDF5 Data Storage Saving ---
-    def save_sweep_data(self):
+    def save_sweep_data(self, file_path=None):
         """Save the measured dataset (spectra and currents) to a structured HDF5 file."""
+        if isinstance(file_path, bool):
+            file_path = None
         if not np.any(self.data_measured_mask):
-            QtWidgets.QMessageBox.warning(self, "No Data", "There is no sweep data to save.")
+            if file_path is None:
+                QtWidgets.QMessageBox.warning(self, "No Data", "There is no sweep data to save.")
             return
 
         try:
@@ -2341,14 +3592,16 @@ class MainWindow(QtWidgets.QMainWindow):
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             default_filename = f"gate_sweep_{timestamp}.h5"
 
-            filename, _ = QtWidgets.QFileDialog.getSaveFileName(
-                self, "Save Measurement Data",
-                os.path.join(data_dir, default_filename),
-                "HDF5 files (*.h5);;All files (*.*)"
-            )
-
-            if not filename:
-                return
+            if file_path is None:
+                filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+                    self, "Save Measurement Data",
+                    os.path.join(data_dir, default_filename),
+                    "HDF5 files (*.h5);;All files (*.*)"
+                )
+                if not filename:
+                    return
+            else:
+                filename = file_path
 
             with h5py.File(filename, "w") as f:
                 # Save coordinates and grid geometry
@@ -2362,13 +3615,60 @@ class MainWindow(QtWidgets.QMainWindow):
                 f.create_dataset("spectra", data=self.data_spectra)
                 f.create_dataset("current_ch1", data=self.data_current_ch1)
                 f.create_dataset("current_ch2", data=self.data_current_ch2)
+                f.create_dataset("measured_volt_ch1", data=self.data_measured_volt_ch1)
+                f.create_dataset("measured_volt_ch2", data=self.data_measured_volt_ch2)
+                if self.data_measured_b is not None and self.data_measured_b.size > 0:
+                    f.create_dataset("measured_b", data=self.data_measured_b)
                 f.create_dataset("measured_mask", data=self.data_measured_mask)
+
+                # Save background and reference if available
+                single_win = getattr(self, "single_spectra_window", None)
+                if single_win is not None:
+                    if getattr(single_win, "bg_x", None) is not None and getattr(single_win, "bg_y", None) is not None:
+                        bg_grp = f.create_group("background")
+                        bg_grp.create_dataset("wavelength", data=single_win.bg_x)
+                        bg_grp.create_dataset("intensity", data=single_win.bg_y)
+                        bg_raw = getattr(single_win, "bg_y_raw", None)
+                        if bg_raw is None:
+                            bg_raw = np.array([single_win.bg_y])
+                        bg_grp.create_dataset("raw_intensities", data=bg_raw)
+                    if getattr(single_win, "ref_x", None) is not None and getattr(single_win, "ref_y", None) is not None:
+                        ref_grp = f.create_group("reference")
+                        ref_grp.create_dataset("wavelength", data=single_win.ref_x)
+                        ref_grp.create_dataset("intensity", data=single_win.ref_y)
+                        ref_raw = getattr(single_win, "ref_y_raw", None)
+                        if ref_raw is None:
+                            ref_raw = np.array([single_win.ref_y])
+                        ref_grp.create_dataset("raw_intensities", data=ref_raw)
 
                 # Save coefficients and metadata
                 f.attrs["coeff_a"] = self.coeff_a.value()
                 f.attrs["coeff_b"] = self.coeff_b.value()
                 f.attrs["coeff_c"] = self.coeff_c.value()
                 f.attrs["coeff_d"] = self.coeff_d.value()
+                # Store full value_storage JSON as a dataset for full state recovery
+                try:
+                    storage_path = os.path.join(parent_dir, "value_storage")
+                    if os.path.exists(storage_path):
+                        with open(storage_path, "r") as f_vs:
+                            vs_data = json.load(f_vs)
+                        
+                        # Create metadata group/folder
+                        meta_grp = f.create_group("metadata")
+                        meta_grp.create_dataset("value_storage", data=json.dumps(vs_data), dtype=h5py.string_dtype(encoding="utf-8"))
+                        
+                        # Add exposure time, grating, and central wavelength as separate datasets
+                        shared = vs_data.get("shared", {})
+                        single_spec = vs_data.get("single_spectra", {})
+                        exposure_time = shared.get("exposure_time", 0.0)
+                        grating = single_spec.get("grating", "")
+                        central_wavelength = single_spec.get("wavelength", 0.0)
+                        
+                        meta_grp.create_dataset("exposure_time", data=exposure_time)
+                        meta_grp.create_dataset("grating", data=grating, dtype=h5py.string_dtype(encoding="utf-8"))
+                        meta_grp.create_dataset("central_wavelength", data=central_wavelength)
+                except Exception as e:
+                    print(f"Failed to embed value_storage in HDF5: {e}")
                 f.attrs["c1_name"] = self.c1_name_edit.text()
                 f.attrs["c2_name"] = self.c2_name_edit.text()
                 f.attrs["exposure_time"] = self.exposure_box.value()
@@ -2376,12 +3676,39 @@ class MainWindow(QtWidgets.QMainWindow):
                 f.attrs["timestamp"] = timestamp
 
             self.status_lbl.setText(f"Status: Saved {os.path.basename(filename)}")
-            QtWidgets.QMessageBox.information(self, "Success", f"Data saved successfully to:\n{filename}")
+            if file_path is None:
+                QtWidgets.QMessageBox.information(self, "Success", f"Data saved successfully to:\n{filename}")
+            else:
+                print(f"Auto-saved data to {filename}")
+            self.save_storage()
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Save Error", f"Could not save dataset:\n{e}")
+            if file_path is None:
+                QtWidgets.QMessageBox.critical(self, "Save Error", f"Could not save dataset:\n{e}")
+            else:
+                print(f"Auto-save failed: {e}")
+
+    def trigger_autosave(self, was_interrupted=False):
+        if getattr(self, "_autosaved_this_run", False):
+            return
+        if not np.any(self.data_measured_mask):
+            return
+        autosave_dir = os.path.join(parent_dir, "data", "autosave")
+        os.makedirs(autosave_dir, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        suffix = "_interrupted" if was_interrupted else ""
+        filename = f"autosave_gate_sweep_{timestamp}{suffix}.h5"
+        file_path = os.path.join(autosave_dir, filename)
+        try:
+            self.save_sweep_data(file_path=file_path)
+            self._autosaved_this_run = True
+        except Exception as e:
+            print(f"Auto-save trigger failed: {e}")
 
     def closeEvent(self, event):
         """Cleanup thread objects on exit to avoid dangling process exceptions."""
+        if hasattr(self, 'live_status_worker') and self.live_status_worker and self.live_status_worker.isRunning():
+            self.live_status_worker.stop()
+            self.live_status_worker.wait()
         if self.sweep_worker and self.sweep_worker.isRunning():
             self.sweep_worker.stop()
             self.sweep_worker.wait()
@@ -2391,15 +3718,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
 if __name__ == '__main__':
     print("Initializing physical station for sweep GUI...")
-    simulated_devices = {
-        'smu': False,          # Connect to the physical Keysight SMU
-        'monochromator': True, 
-        'rotator1': True,      
-        'rotator2': True,      
-        'camera': True,        
-        'piezo150': True,      
-        'piezo300': True       
-    }
     station = initialize_station(simulated=False, simulated_devices=simulated_devices)
     
     app = QtWidgets.QApplication(sys.argv)

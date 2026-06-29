@@ -111,3 +111,72 @@ class EnhancedViewBox(pg.ViewBox):
         self.setXRange(new_x0, new_x1, padding=0)
         self.setYRange(new_y0, new_y1, padding=0)
         ev.accept()
+
+
+def calculate_expected_duration(
+    v_points,  # List of (v1, v2) tuples in sequence
+    b_points,  # List of B-field values in sequence
+    exposure_time,
+    settling_time,
+    num_spectra,
+    sweep_rate_b,  # T/s
+    initial_b,
+    initial_v1=0.0,
+    initial_v2=0.0,
+    ramp_rate_v1=None,  # V/s or A/s
+    ramp_rate_v2=None,  # V/s or A/s
+    max_step_v1=0.1,
+    delay_v1=0.05,
+    max_step_v2=0.1,
+    delay_v2=0.05
+):
+    """
+    Calculate the total expected duration of a 2D measurement sweep.
+    Includes settling delay, multi-exposure acquisition times, camera readout/comm overheads,
+    and simulated voltage/field travel times.
+    """
+    total_points = len(v_points)
+    
+    # 1. Measurement time per point (settling + exposure + CCD readout + TCP/IP latency)
+    ccd_readout_overhead = 2.05
+    comm_overhead = 0.05
+    point_meas_time = settling_time + (num_spectra * (exposure_time + ccd_readout_overhead)) + comm_overhead
+    total_meas_time = total_points * point_meas_time
+
+    # 2. Voltage ramping time
+    def get_ramp_time_v1(diff):
+        if abs(diff) < 1e-6:
+            return 0.04  # visa query read overhead even for no voltage change
+        if ramp_rate_v1 is not None and ramp_rate_v1 > 0:
+            return 0.04 + abs(diff) / ramp_rate_v1
+        else:
+            steps = max(1, int(abs(diff) / max_step_v1))
+            return 0.04 + steps * (delay_v1 + 0.015) + 0.015
+
+    def get_ramp_time_v2(diff):
+        if abs(diff) < 1e-6:
+            return 0.04  # visa query read overhead even for no voltage change
+        if ramp_rate_v2 is not None and ramp_rate_v2 > 0:
+            return 0.04 + abs(diff) / ramp_rate_v2
+        else:
+            steps = max(1, int(abs(diff) / max_step_v2))
+            return 0.04 + steps * (delay_v2 + 0.015) + 0.015
+
+    total_volt_ramp_time = 0.0
+    prev_v1 = initial_v1
+    prev_v2 = initial_v2
+    for v1, v2 in v_points:
+        total_volt_ramp_time += get_ramp_time_v1(v1 - prev_v1)
+        total_volt_ramp_time += get_ramp_time_v2(v2 - prev_v2)
+        prev_v1 = v1
+        prev_v2 = v2
+
+    # 3. B-field travel time
+    total_b_ramp_time = 0.0
+    prev_b = initial_b
+    for b in b_points:
+        if abs(b - prev_b) > 1e-6:
+            total_b_ramp_time += abs(b - prev_b) / sweep_rate_b
+            prev_b = b
+
+    return total_meas_time + total_volt_ramp_time + total_b_ramp_time
