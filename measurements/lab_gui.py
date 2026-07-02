@@ -116,9 +116,12 @@ class LabMainWindow(QtWidgets.QMainWindow):
         location = "G15-Pylon"
         if hasattr(self.station, "camera") and self.station.camera is not None:
             spec_type = getattr(self.station.camera, "spectrometer_type", "lightfieldG15")
-            if spec_type == "wingspecG15":
+            if spec_type in ["wingspecG15", "winspecG15"]:
                 spec_name = "WinSpec G15"
                 location = "phd-exile-phys"
+            elif spec_type in ["winspecG11", "wingspecG11"]:
+                spec_name = "WinSpec G11"
+                location = "bluefors-pc"
             elif spec_type == "lightfieldG11":
                 spec_name = "Lightfield G11"
                 location = "10.236.10.143"
@@ -127,6 +130,126 @@ class LabMainWindow(QtWidgets.QMainWindow):
             "color: #10b981; font-weight: bold; font-family: Consolas, monospace;"
         )
         status_bar.addPermanentWidget(lf_label)
+
+        # Apply global stylesheet matching Single Spectra theme
+        self.apply_theme()
+
+    def apply_theme(self):
+        """Premium light theme styling matching Single Spectra applied globally to the main dashboard window, tab bar, and unstyled tabs."""
+        global_qss = """
+        QMainWindow, QWidget {
+            background-color: #ffffff;
+            color: #000000;
+        }
+        QTabWidget::pane {
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            background-color: #ffffff;
+            padding: 5px;
+        }
+        QTabBar::tab {
+            background-color: #f5f5f5;
+            color: #555555;
+            border: 1px solid #cccccc;
+            border-right-color: none;
+            border-top-left-radius: 0px;
+            border-bottom-left-radius: 0px;
+            padding: 12px 16px;
+            margin-bottom: 2px;
+            font-weight: bold;
+            font-size: 12px;
+        }
+        QTabBar::tab:selected {
+            background-color: #ffffff;
+            color: #000000;
+            border-right-color: transparent;
+            font-weight: bold;
+        }
+        QTabBar::tab:hover {
+            background-color: #eeeeee;
+            color: #000000;
+        }
+        QGroupBox {
+            background-color: #ffffff;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            margin-top: 2.5ex;
+            color: #000000;
+            font-weight: bold;
+            font-size: 13px;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            subcontrol-position: top left;
+            left: 10px;
+            padding: 0 5px;
+            background-color: transparent;
+        }
+        QLabel {
+            color: #000000;
+            font-size: 12px;
+            background-color: transparent;
+        }
+        QPushButton {
+            background-color: #ffffff;
+            color: #000000;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            padding: 8px 16px;
+            font-weight: bold;
+            font-size: 12px;
+        }
+        QPushButton:hover {
+            background-color: #eeeeee;
+            border-color: #999999;
+        }
+        QPushButton:pressed {
+            background-color: #dddddd;
+        }
+        QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
+            background-color: #ffffff;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            color: #000000;
+            padding: 5px;
+            font-family: Consolas, monospace;
+            font-size: 12px;
+        }
+        QComboBox::drop-down {
+            border: none;
+        }
+        QProgressBar {
+            background-color: #eeeeee;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            text-align: center;
+            color: #000000;
+            font-weight: bold;
+            height: 18px;
+        }
+        QProgressBar::chunk {
+            background-color: #333333;
+            border-radius: 0px;
+        }
+        QCheckBox {
+            background-color: transparent;
+        }
+        QScrollBar:vertical {
+            border: none;
+            background: #f5f5f5;
+            width: 10px;
+            margin: 0px;
+        }
+        QScrollBar::handle:vertical {
+            background: #cccccc;
+            min-height: 20px;
+            border-radius: 0px;
+        }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            height: 0px;
+        }
+        """
+        self.setStyleSheet(global_qss)
 
     def on_tab_changed(self, index):
         # Automatically close any open View Control popups
@@ -243,6 +366,16 @@ class LabMainWindow(QtWidgets.QMainWindow):
             else:
                 if not getattr(scalar_worker, "_is_paused", False):
                     scalar_worker.pause()
+
+        # Dashboard Polling Timer (active when index == 5 and no measurement is running)
+        if hasattr(self, 'position_tab') and self.position_tab:
+            should_run = (not meas_running) and (current_idx == 5)
+            if should_run:
+                if not self.position_tab.polling_timer.isActive():
+                    self.position_tab.polling_timer.start(1000)
+            else:
+                if self.position_tab.polling_timer.isActive():
+                    self.position_tab.polling_timer.stop()
 
     # Ensure clean shutdown when the outer window is closed
     def closeEvent(self, event):

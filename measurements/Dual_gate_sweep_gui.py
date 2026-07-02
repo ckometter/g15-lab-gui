@@ -160,27 +160,49 @@ class SingleRampWorker(QtCore.QThread):
     Lightweight background worker to ramp a single channel to a voltage or current setpoint
     without freezing the main GUI thread.
     """
+    progress = QtCore.pyqtSignal(str, float, float)
     finished = QtCore.pyqtSignal()
     error = QtCore.pyqtSignal(str)
 
-    def __init__(self, channel, target_val, param_name="volt", parent=None):
+    def __init__(self, channel, target_val, param_name="volt", ch_name="Channel 1", parent=None):
         super().__init__(parent)
         self.channel = channel
         self.target_val = target_val
         self.param_name = param_name
+        self.ch_name = ch_name
 
     def stop(self):
         self.channel.ramp_stop_requested = True
 
     def run(self):
         max_retries = 3
+        
+        def progress_callback(val):
+            curr_val = 0.0
+            volt_val = val
+            try:
+                if self.param_name == "curr":
+                    curr_val = val
+                    try:
+                        volt_val = self.channel.volt()
+                    except Exception:
+                        volt_val = 0.0
+                else:
+                    try:
+                        curr_val = self.channel.measure_curr()
+                    except Exception:
+                        curr_val = 0.0
+            except Exception:
+                pass
+            self.progress.emit(self.ch_name, volt_val, curr_val)
+            
         for attempt in range(1, max_retries + 1):
             try:
                 self.channel.ramp_stop_requested = False
                 if self.param_name == "curr":
-                    self.channel.set_r.curr(self.target_val)
+                    self.channel.set_r.curr(self.target_val, callback=progress_callback)
                 else:
-                    self.channel.set_r.volt(self.target_val)
+                    self.channel.set_r.volt(self.target_val, callback=progress_callback)
                 break
             except Exception as e:
                 if attempt == max_retries:
@@ -780,53 +802,63 @@ class LiveStatusWorker(QtCore.QThread):
                 v2_val = 0.0
                 smu = getattr(self.station, 'smu', None)
                 if smu is not None:
-                    if getattr(smu, "simulated", False):
-                        try:
-                            v1_val = smu.ch1.volt()
-                        except Exception:
-                            pass
-                        try:
-                            v2_val = smu.ch2.volt()
-                        except Exception:
-                            pass
+                    ch1_ramping = getattr(smu.ch1, "ramping", False)
+                    ch2_ramping = getattr(smu.ch2, "ramping", False)
+                    if ch1_ramping or ch2_ramping:
+                        v1_val = smu.ch1.volt.get_latest()
+                        if v1_val is None:
+                            v1_val = 0.0
+                        v2_val = smu.ch2.volt.get_latest()
+                        if v2_val is None:
+                            v2_val = 0.0
                     else:
-                        old_timeout = None
-                        try:
-                            if hasattr(smu, "_lock"):
-                                with smu._lock:
-                                    old_timeout = smu.timeout()
-                                    smu.timeout(0.5)
-                            else:
-                                old_timeout = smu.timeout()
-                                smu.timeout(0.5)
-                        except Exception:
+                        if getattr(smu, "simulated", False):
+                            try:
+                                v1_val = smu.ch1.volt()
+                            except Exception:
+                                pass
+                            try:
+                                v2_val = smu.ch2.volt()
+                            except Exception:
+                                pass
+                        else:
                             old_timeout = None
-
-                        try:
-                            v1_val = smu.ch1.volt()
-                        except Exception:
-                            try:
-                                smu.visa_handle.clear()
-                            except Exception:
-                                pass
-                        
-                        try:
-                            v2_val = smu.ch2.volt()
-                        except Exception:
-                            try:
-                                smu.visa_handle.clear()
-                            except Exception:
-                                pass
-
-                        if old_timeout is not None:
                             try:
                                 if hasattr(smu, "_lock"):
                                     with smu._lock:
-                                        smu.timeout(old_timeout)
+                                        old_timeout = smu.timeout()
+                                        smu.timeout(0.5)
                                 else:
-                                    smu.timeout(old_timeout)
+                                    old_timeout = smu.timeout()
+                                    smu.timeout(0.5)
                             except Exception:
-                                pass
+                                old_timeout = None
+
+                            try:
+                                v1_val = smu.ch1.volt()
+                            except Exception:
+                                try:
+                                    smu.visa_handle.clear()
+                                except Exception:
+                                    pass
+                            
+                            try:
+                                v2_val = smu.ch2.volt()
+                            except Exception:
+                                try:
+                                    smu.visa_handle.clear()
+                                except Exception:
+                                    pass
+
+                            if old_timeout is not None:
+                                try:
+                                    if hasattr(smu, "_lock"):
+                                        with smu._lock:
+                                            smu.timeout(old_timeout)
+                                    else:
+                                        smu.timeout(old_timeout)
+                                except Exception:
+                                    pass
                 
                 self.status_updated.emit(b_val, v1_val, v2_val)
             except Exception:
@@ -847,6 +879,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Application State
         self.is_running = False
         self.is_paused = False
+        self.reset_slice_levels = True
         self.sweep_worker = None
         self.ramp_worker = None
         self.single_spectra_window = None
@@ -965,24 +998,21 @@ class MainWindow(QtWidgets.QMainWindow):
         # Make the intensity plot (vb) wider so that the curves are clearly visible
         hist.layout.setColumnFixedWidth(0, 12)  # Gradient colorbar
         hist.layout.setColumnFixedWidth(1, 45)  # ViewBox (intensity histogram plot)
-        hist.layout.setColumnFixedWidth(2, 35)  # Axis (numbers scale)
         
         hist.gradient.setMinimumWidth(0)
         hist.gradient.setMaximumWidth(12)
         hist.vb.setMinimumWidth(0)
         hist.vb.setMaximumWidth(45)
-        hist.axis.setMinimumWidth(0)
-        hist.axis.setMaximumWidth(35)
         
-        hist.setMinimumWidth(92)
-        hist.setMaximumWidth(100)
+        # Allow the axis and the overall widget to grow dynamically to fit any text length
+        hist.setMinimumWidth(80)
         
         if not interactive:
             hist.region.setMovable(False)
             for line in hist.region.lines:
                 line.setMovable(False)
             hist.gradient.setEnabled(False)
-            hist.vb.setMouseEnabled(x=False, y=False)
+            hist.vb.setMouseEnabled(x=False, y=True)
             
         # Adjust plot title span to span all 6 columns (0 to 5) so it doesn't force Column 1 to be too wide
         pi = plot_win.getPlotItem()
@@ -1309,7 +1339,7 @@ class MainWindow(QtWidgets.QMainWindow):
         smu_row.setSpacing(10)
 
         # Channel 1 Box
-        ch1_box = QtWidgets.QGroupBox("[ Keysight Channel 1 ]")
+        ch1_box = QtWidgets.QGroupBox("Keysight Channel 1")
         ch1_layout = QtWidgets.QVBoxLayout(ch1_box)
         ch1_layout.setSpacing(8)
 
@@ -1361,8 +1391,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ch1_compliance.setSingleStep(0.001)
         self.ch1_compliance.setKeyboardTracking(False)
         self.ch1_compliance.editingFinished.connect(self.on_compliance_changed)
-        grid1.addWidget(self.ch1_compliance, 3, 1)
-        
         ch1_layout.addLayout(grid1)
 
         # 6. Last Reading Subbox
@@ -1378,15 +1406,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ch1_live_curr_lbl.setStyleSheet("color: #a6adc8; font-size: 11px;")
         ch1_read_layout.addWidget(self.ch1_live_curr_lbl)
         
+        # Read and Stop buttons side-by-side
+        btn_row1 = QtWidgets.QHBoxLayout()
+        btn_row1.setSpacing(6)
+        btn_row1.setContentsMargins(0, 0, 0, 0)
+        
         self.ch1_read_btn = QtWidgets.QPushButton("Read Channel One")
         self.ch1_read_btn.clicked.connect(self.read_channel_one)
-        ch1_read_layout.addWidget(self.ch1_read_btn)
+        btn_row1.addWidget(self.ch1_read_btn)
+        
+        self.ch1_stop_btn = QtWidgets.QPushButton("Stop Ramp")
+        self.ch1_stop_btn.setEnabled(False)
+        self.ch1_stop_btn.clicked.connect(self.on_ch1_stop_clicked)
+        btn_row1.addWidget(self.ch1_stop_btn)
+        
+        ch1_read_layout.addLayout(btn_row1)
         
         ch1_layout.addWidget(ch1_read_box)
         smu_row.addWidget(ch1_box)
 
         # Channel 2 Box
-        ch2_box = QtWidgets.QGroupBox("[ Keysight Channel 2 ]")
+        ch2_box = QtWidgets.QGroupBox("Keysight Channel 2")
         ch2_layout = QtWidgets.QVBoxLayout(ch2_box)
         ch2_layout.setSpacing(8)
 
@@ -1438,8 +1478,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ch2_compliance.setSingleStep(0.001)
         self.ch2_compliance.setKeyboardTracking(False)
         self.ch2_compliance.editingFinished.connect(self.on_compliance_changed)
-        grid2.addWidget(self.ch2_compliance, 3, 1)
-        
         ch2_layout.addLayout(grid2)
 
         # 6. Last Reading Subbox
@@ -1455,9 +1493,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ch2_live_curr_lbl.setStyleSheet("color: #a6adc8; font-size: 11px;")
         ch2_read_layout.addWidget(self.ch2_live_curr_lbl)
         
+        # Read and Stop buttons side-by-side
+        btn_row2 = QtWidgets.QHBoxLayout()
+        btn_row2.setSpacing(6)
+        btn_row2.setContentsMargins(0, 0, 0, 0)
+        
         self.ch2_read_btn = QtWidgets.QPushButton("Read Channel Two")
         self.ch2_read_btn.clicked.connect(self.read_channel_two)
-        ch2_read_layout.addWidget(self.ch2_read_btn)
+        btn_row2.addWidget(self.ch2_read_btn)
+        
+        self.ch2_stop_btn = QtWidgets.QPushButton("Stop Ramp")
+        self.ch2_stop_btn.setEnabled(False)
+        self.ch2_stop_btn.clicked.connect(self.on_ch2_stop_clicked)
+        btn_row2.addWidget(self.ch2_stop_btn)
+        
+        ch2_read_layout.addLayout(btn_row2)
         
         ch2_layout.addWidget(ch2_read_box)
         smu_row.addWidget(ch2_box)
@@ -1471,7 +1521,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Control 1
         # Load name from storage if available, else default to "Virtual Gate 1"
         c1_default_name = self.stored_settings.get("c1_name", "Virtual Gate 1")
-        self.ctrl_c1_box = QtWidgets.QGroupBox(f"[ {c1_default_name} ]")
+        self.ctrl_c1_box = QtWidgets.QGroupBox(f"{c1_default_name}")
         ctrl_c1_layout = QtWidgets.QVBoxLayout(self.ctrl_c1_box)
         
         c1_grid = QtWidgets.QGridLayout()
@@ -1511,7 +1561,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Control 2
         # Load name from storage if available, else default to "Virtual Gate 2"
         c2_default_name = self.stored_settings.get("c2_name", "Virtual Gate 2")
-        self.ctrl_c2_box = QtWidgets.QGroupBox(f"[ {c2_default_name} ]")
+        self.ctrl_c2_box = QtWidgets.QGroupBox(f"{c2_default_name}")
         ctrl_c2_layout = QtWidgets.QVBoxLayout(self.ctrl_c2_box)
         
         c2_grid = QtWidgets.QGridLayout()
@@ -1558,7 +1608,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.update_step_calculations()
 
         # --- ROW 3: Gate Variables (full width) ---
-        gate_box = QtWidgets.QGroupBox("[ Gate Variables ]")
+        gate_box = QtWidgets.QGroupBox("Gate Variable")
         gate_layout = QtWidgets.QVBoxLayout(gate_box)
         gate_layout.setSpacing(10)
 
@@ -1655,7 +1705,8 @@ class MainWindow(QtWidgets.QMainWindow):
         bottom_row.setSpacing(10)
 
         # Other Settings Box
-        other_box = QtWidgets.QGroupBox("[ Other ]")
+        other_box = QtWidgets.QGroupBox("Other")
+        other_box.setFixedWidth(200)
         other_layout = QtWidgets.QVBoxLayout(other_box)
         other_layout.setSpacing(6)
         
@@ -1683,7 +1734,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.exposure_box.editingFinished.connect(self.on_timing_params_changed)
         timing_ramp_grid.addWidget(self.exposure_box, 0, 1)
 
-        timing_ramp_grid.addWidget(QtWidgets.QLabel("Settling (s):"), 1, 0)
+        timing_ramp_grid.addWidget(QtWidgets.QLabel("Settlingtime (s):"), 1, 0)
         self.settling_box = QtWidgets.QDoubleSpinBox()
         self.settling_box.setRange(0.0, 10.0)
         self.settling_box.setDecimals(3)
@@ -1696,7 +1747,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         other_layout.addLayout(timing_ramp_grid)
 
-        bottom_row.addWidget(other_box)
+        bottom_row.addWidget(other_box, 0)
 
         # Enable scientific notation entry on numeric spin boxes
         for spin in (
@@ -1720,7 +1771,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.enable_scientific_input(spin)
 
         # Measurement Control Box
-        meas_box = QtWidgets.QGroupBox("[ Measurement Control ]")
+        meas_box = QtWidgets.QGroupBox("Measurement Control")
         meas_layout = QtWidgets.QVBoxLayout(meas_box)
         meas_layout.setSpacing(6)
         
@@ -1740,36 +1791,36 @@ class MainWindow(QtWidgets.QMainWindow):
         meas_layout.addWidget(self.reset_btn)
 
         self.save_btn = QtWidgets.QPushButton("💾 Save Dataset")
-        self.save_btn.setStyleSheet("background-color: #3b82f6; color: white; font-weight: bold; border: 1px solid #3b82f6;")
+        self.save_btn.setStyleSheet("background-color: #555555; color: white; font-weight: bold; border-radius: 0px;")
         self.save_btn.setEnabled(False)
         self.save_btn.clicked.connect(self.save_sweep_data)
         meas_layout.addWidget(self.save_btn)
-
-        self.status_lbl = QtWidgets.QLabel("Status: Idle")
-        self.status_lbl.setStyleSheet("color: #4f46e5; font-style: italic; font-weight: bold;")
-        meas_layout.addWidget(self.status_lbl)
-
-        self.lbl_current_b = QtWidgets.QLabel("B = --‑‑ T")
-        self.lbl_current_b.setStyleSheet("color: #1e293b; font-weight: bold;")
-        meas_layout.addWidget(self.lbl_current_b)
-
-        self.lbl_target_vc1 = QtWidgets.QLabel("Vc1 = --‑‑ V")
-        self.lbl_target_vc1.setStyleSheet("color: #1e293b; font-weight: bold;")
-        meas_layout.addWidget(self.lbl_target_vc1)
-
-        self.lbl_target_vc2 = QtWidgets.QLabel("Vc2 = --‑‑ V")
-        self.lbl_target_vc2.setStyleSheet("color: #1e293b; font-weight: bold;")
-        meas_layout.addWidget(self.lbl_target_vc2)
-
-        self.lbl_expected_end = QtWidgets.QLabel("Expected End: --:--:--")
-        self.lbl_expected_end.setStyleSheet("color: #1e293b; font-weight: bold;")
-        meas_layout.addWidget(self.lbl_expected_end)
 
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setValue(0)
         meas_layout.addWidget(self.progress_bar)
 
-        bottom_row.addWidget(meas_box)
+        self.lbl_expected_end = QtWidgets.QLabel("Expected End: --:--:--")
+        self.lbl_expected_end.setStyleSheet("color: #000000; font-weight: bold;")
+        meas_layout.addWidget(self.lbl_expected_end)
+
+        self.status_lbl = QtWidgets.QLabel("Status: Idle")
+        self.status_lbl.setStyleSheet("color: #000000; font-style: italic; font-weight: bold;")
+        meas_layout.addWidget(self.status_lbl)
+
+        self.lbl_target_vc1 = QtWidgets.QLabel("V1 = --‑‑ V")
+        self.lbl_target_vc1.setStyleSheet("color: #000000; font-weight: bold;")
+        meas_layout.addWidget(self.lbl_target_vc1)
+
+        self.lbl_target_vc2 = QtWidgets.QLabel("V2 = --‑‑ V")
+        self.lbl_target_vc2.setStyleSheet("color: #000000; font-weight: bold;")
+        meas_layout.addWidget(self.lbl_target_vc2)
+
+        self.lbl_current_b = QtWidgets.QLabel("B = --‑‑ T")
+        self.lbl_current_b.setStyleSheet("color: #000000; font-weight: bold;")
+        meas_layout.addWidget(self.lbl_current_b)
+
+        bottom_row.addWidget(meas_box, 1)
         left_layout.addLayout(bottom_row)
 
         # --- RIGHT TAB PANEL SECTIONS ---
@@ -2116,99 +2167,111 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(right_layout, 2)
 
     def apply_theme(self):
-        """Premium light theme styling (white backgrounds, dark text, clean borders)"""
+        """Premium light theme styling matching Single Spectra (rectangular, strict monochromatic white/grey/black, no blue tint)"""
         qss = """
         QMainWindow, QWidget {
             background-color: #ffffff;
-            color: #1e293b;
-            font-family: "Segoe UI", Arial;
-            font-size: 13px;
+            color: #000000;
         }
         QGroupBox {
-            background-color: #f8fafc;
-            border: 1px solid #cbd5e1;
-            border-radius: 8px;
-            margin-top: 14px;
+            background-color: #ffffff;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            margin-top: 2.5ex;
+            color: #000000;
             font-weight: bold;
-            color: #4f46e5;
+            font-size: 13px;
         }
         QGroupBox::title {
             subcontrol-origin: margin;
             subcontrol-position: top left;
             left: 10px;
-            padding: 2px 4px;
+            padding: 0 5px;
+            background-color: transparent;
         }
-        QDoubleSpinBox, QSpinBox, QComboBox, QLineEdit {
-            background-color: #ffffff;
-            color: #1e293b;
-            border: 1px solid #cbd5e1;
-            border-radius: 4px;
-            padding: 4px;
-        }
-        QDoubleSpinBox:focus, QSpinBox:focus, QComboBox:focus {
-            border: 1px solid #6366f1;
+        QLabel {
+            color: #000000;
+            font-size: 12px;
+            background-color: transparent;
         }
         QPushButton {
-            background-color: #f1f5f9;
-            color: #1e293b;
-            border: 1px solid #cbd5e1;
-            border-radius: 6px;
-            padding: 6px;
+            background-color: #ffffff;
+            color: #000000;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            padding: 8px 16px;
             font-weight: bold;
+            font-size: 12px;
         }
         QPushButton:hover {
-            background-color: #e2e8f0;
-            border-color: #94a3b8;
+            background-color: #eeeeee;
+            border-color: #999999;
         }
         QPushButton:pressed {
-            background-color: #cbd5e1;
+            background-color: #dddddd;
         }
-        QTabWidget::pane {
-            border: 1px solid #cbd5e1;
-            border-radius: 8px;
+        QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
             background-color: #ffffff;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            color: #000000;
             padding: 5px;
+            font-family: Consolas, monospace;
+            font-size: 12px;
         }
-        QTabBar::tab {
-            background-color: #f1f5f9;
-            color: #475569;
-            border: 1px solid #cbd5e1;
-            border-bottom-color: none;
-            border-top-left-radius: 6px;
-            border-top-right-radius: 6px;
-            padding: 8px 16px;
-            margin-right: 2px;
-        }
-        QTabBar::tab:selected {
-            background-color: #ffffff;
-            color: #4f46e5;
-            border-color: #cbd5e1;
-            font-weight: bold;
-        }
-        QTabBar::tab:hover {
-            background-color: #e2e8f0;
-            color: #1e293b;
-        }
-        QScrollBar:vertical {
+        QComboBox::drop-down {
             border: none;
-            background: #f1f5f9;
-            width: 10px;
-            margin: 0px;
         }
-        QScrollBar::handle:vertical {
-            background: #cbd5e1;
-            min-height: 20px;
-            border-radius: 5px;
+        QProgressBar {
+            background-color: #eeeeee;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            text-align: center;
+            color: #000000;
+            font-weight: bold;
+            height: 18px;
         }
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-            height: 0px;
+        QProgressBar::chunk {
+            background-color: #333333;
+            border-radius: 0px;
+        }
+        QCheckBox {
+            background-color: transparent;
         }
         """
         self.setStyleSheet(qss)
 
+        # Apply unified styling (white background and slate axes) to all PlotWidgets
+        import pyqtgraph as pg
+        for attr_name in dir(self):
+            attr = getattr(self, attr_name, None)
+            if isinstance(attr, pg.PlotWidget):
+                attr.setBackground('w')
+                attr.getAxis('left').setPen(pg.mkPen('#334155'))
+                attr.getAxis('bottom').setPen(pg.mkPen('#334155'))
+                attr.getAxis('left').setTextPen(pg.mkPen('#334155'))
+                attr.getAxis('bottom').setTextPen(pg.mkPen('#334155'))
+
+    def pause_status_polling(self):
+        """Temporarily pause the live status worker and wait to ensure no active VISA query is running."""
+        was_paused = getattr(self.station, "live_status_paused", False)
+        self.station.live_status_paused = True
+        if hasattr(self, "live_status_worker") and self.live_status_worker:
+            self.live_status_worker.pause()
+        time.sleep(0.06) # Wait 60ms to let any active query finish
+        return was_paused
+
+    def resume_status_polling(self, was_paused):
+        """Restore the live status worker state."""
+        if not was_paused:
+            self.station.live_status_paused = False
+            if hasattr(self, "live_status_worker") and self.live_status_worker:
+                self.live_status_worker.resume()
+
     # --- Live Parameter Readout ---
     # --- Live Parameter Readout (On Demand) ---
     def read_channel_one(self):
+        was_paused = self.pause_status_polling()
         try:
             smu = self.station.smu
             v = smu.ch1.volt()
@@ -2240,8 +2303,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             else:
                 QtWidgets.QMessageBox.warning(self, "Read Error", f"Failed to read Channel 1:\n{e}")
+        finally:
+            self.resume_status_polling(was_paused)
 
     def read_channel_two(self):
+        was_paused = self.pause_status_polling()
         try:
             smu = self.station.smu
             v = smu.ch2.volt()
@@ -2273,6 +2339,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             else:
                 QtWidgets.QMessageBox.warning(self, "Read Error", f"Failed to read Channel 2:\n{e}")
+        finally:
+            self.resume_status_polling(was_paused)
 
     def on_live_status_updated(self, b_val, v1_val, v2_val):
         self._last_polled_b = b_val
@@ -2336,8 +2404,8 @@ class MainWindow(QtWidgets.QMainWindow):
         c2_name = self.c2_name_edit.text().strip() or "Vc2"
 
         # Update group box titles
-        self.ctrl_c1_box.setTitle(f"[ {c1_name} ]")
-        self.ctrl_c2_box.setTitle(f"[ {c2_name} ]")
+        self.ctrl_c1_box.setTitle(f"{c1_name}")
+        self.ctrl_c2_box.setTitle(f"{c2_name}")
 
         # Update formulas labels
         self.v1_c1_label.setText(f" * {c1_name}  + ")
@@ -2392,8 +2460,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_lbl.setText(f"Status: Ramping {ch_name} to {target} {unit}...")
         self.set_inputs_enabled(False)
         self.pause_btn.setEnabled(True)
+        if ch_name == "Channel 1":
+            self.ch1_stop_btn.setEnabled(True)
+        else:
+            self.ch2_stop_btn.setEnabled(True)
         
-        self.ramp_worker = SingleRampWorker(channel, target, param_name)
+        self.ramp_worker = SingleRampWorker(channel, target, param_name, ch_name)
+        self.ramp_worker.progress.connect(self.on_ramp_progress)
         self.ramp_worker.finished.connect(self.on_ramp_finished)
         self.ramp_worker.error.connect(self.on_ramp_error)
         self.ramp_worker.start()
@@ -2408,6 +2481,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status_lbl.setText("Status: Ramping complete.")
         self.set_inputs_enabled(True)
         self.pause_btn.setEnabled(False)
+        self.ch1_stop_btn.setEnabled(False)
+        self.ch2_stop_btn.setEnabled(False)
 
     def on_ramp_error(self, err_msg):
         self.station.live_status_paused = False
@@ -2416,33 +2491,70 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_lbl.setText(f"Status: Ramping error")
         self.set_inputs_enabled(True)
         self.pause_btn.setEnabled(False)
+        self.ch1_stop_btn.setEnabled(False)
+        self.ch2_stop_btn.setEnabled(False)
         QtWidgets.QMessageBox.critical(self, "Ramping Error", f"Error ramping channel:\n{err_msg}")
 
+    def on_ramp_progress(self, ch_name, volt_val, curr_val):
+        def fmt(curr):
+            if abs(curr) < 1e-6:
+                return f"{curr*1e9:.2f} nA"
+            elif abs(curr) < 1e-3:
+                return f"{curr*1e6:.2f} uA"
+            else:
+                return f"{curr*1e3:.2f} mA"
+
+        if ch_name == "Channel 1":
+            self.ch1_live_volt_lbl.setText(f"Voltage: {volt_val:.4f} V")
+            self.ch1_live_curr_lbl.setText(f"Current: {fmt(curr_val)}")
+        else:
+            self.ch2_live_volt_lbl.setText(f"Voltage: {volt_val:.4f} V")
+            self.ch2_live_curr_lbl.setText(f"Current: {fmt(curr_val)}")
+
+    def on_ch1_stop_clicked(self):
+        if self.ramp_worker and self.ramp_worker.isRunning() and self.ramp_worker.ch_name == "Channel 1":
+            self.ramp_worker.stop()
+            self.status_lbl.setText("Status: Interrupting Channel 1 ramp...")
+            self.ch1_stop_btn.setEnabled(False)
+
+    def on_ch2_stop_clicked(self):
+        if self.ramp_worker and self.ramp_worker.isRunning() and self.ramp_worker.ch_name == "Channel 2":
+            self.ramp_worker.stop()
+            self.status_lbl.setText("Status: Interrupting Channel 2 ramp...")
+            self.ch2_stop_btn.setEnabled(False)
+
     def toggle_ch1_output(self, enabled):
+        was_paused = self.pause_status_polling()
         try:
             self.station.smu.ch1.output(enabled)
             self.ch1_out_btn.setText(f"Ch1 Output: {'ON' if enabled else 'OFF'}")
             self.ch1_out_btn.setStyleSheet(f"background-color: {'#10b981' if enabled else '#f1f5f9'}; color: {'white' if enabled else '#475569'}; border: 1px solid {'#10b981' if enabled else '#cbd5e1'}; font-weight: bold;")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Hardware Error", f"Failed to toggle Ch1 Output:\n{e}")
+        finally:
+            self.resume_status_polling(was_paused)
 
     def toggle_ch2_output(self, enabled):
+        was_paused = self.pause_status_polling()
         try:
             self.station.smu.ch2.output(enabled)
             self.ch2_out_btn.setText(f"Ch2 Output: {'ON' if enabled else 'OFF'}")
             self.ch2_out_btn.setStyleSheet(f"background-color: {'#10b981' if enabled else '#f1f5f9'}; color: {'white' if enabled else '#475569'}; border: 1px solid {'#10b981' if enabled else '#cbd5e1'}; font-weight: bold;")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Hardware Error", f"Failed to toggle Ch2 Output:\n{e}")
+        finally:
+            self.resume_status_polling(was_paused)
 
     def on_compliance_changed(self):
+        was_paused = self.pause_status_polling()
         try:
             # Channel 1
             if self.ch1_mode.currentText() == "CURR":
                 self.station.smu.ch1.volt_limit(self.ch1_compliance.value())
             else:
                 self.station.smu.ch1.curr_limit(self.ch1_compliance.value())
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Error setting Ch1 compliance: {e}")
 
         try:
             # Channel 2
@@ -2450,18 +2562,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.station.smu.ch2.volt_limit(self.ch2_compliance.value())
             else:
                 self.station.smu.ch2.curr_limit(self.ch2_compliance.value())
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Error setting Ch2 compliance: {e}")
 
         self.save_storage()
+        self.resume_status_polling(was_paused)
 
     def on_mode_changed(self):
         # Update physical instrument modes
+        was_paused = self.pause_status_polling()
         try:
             self.station.smu.ch1.source_mode(self.ch1_mode.currentText())
             self.station.smu.ch2.source_mode(self.ch2_mode.currentText())
         except Exception:
             pass
+        finally:
+            self.resume_status_polling(was_paused)
 
         # Update Channel 1 GUI labels, ranges, and steps
         if self.ch1_mode.currentText() == "CURR":
@@ -2511,20 +2627,26 @@ class MainWindow(QtWidgets.QMainWindow):
         rate = self.ch1_ramp_rate.value()
         self.stored_settings["ramprate1"] = rate
         self.save_storage()
+        was_paused = self.pause_status_polling()
         try:
             self.station.smu.ch1.ramp_rate(rate)
         except Exception:
             pass
+        finally:
+            self.resume_status_polling(was_paused)
 
     def on_ch2_ramping_params_changed(self):
         """Save Channel 2 settings to value_storage and sync with hardware driver."""
         rate = self.ch2_ramp_rate.value()
         self.stored_settings["ramprate2"] = rate
         self.save_storage()
+        was_paused = self.pause_status_polling()
         try:
             self.station.smu.ch2.ramp_rate(rate)
         except Exception:
             pass
+        finally:
+            self.resume_status_polling(was_paused)
 
 
     def on_timing_params_changed(self):
@@ -2583,6 +2705,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if self.is_running:
             return
+
+        self.reset_slice_levels = True
 
         # Pause the status worker first to avoid any race conditions during monochromator/camera queries
         self.live_status_worker.pause()
@@ -2995,6 +3119,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # --- Plot Sizing & Coordinates Setup ---
     def reset_plot_scaling(self):
+        self.reset_slice_levels = True
         """Set initial geometric sizes and labels for heatmap plots."""
         # Tab 1: Gate Map (integrated spectra)
         width1 = self.c1_coords[-1] - self.c1_coords[0]
@@ -3217,6 +3342,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t3_vslice_win.getAxis('bottom').setTicks([ticks_c2])
 
     def scale_plots(self):
+        self.reset_slice_levels = True
         """Scale all plots: zoom completely out on coordinates, auto-range 1D plots, and set colorbar levels to full data range."""
         # 1. Reset all viewbox ranges to coordinate limits (c1, c2, energy) by calling reset_plot_scaling
         self.reset_plot_scaling()
@@ -3519,8 +3645,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 2. Update Vertical Slice (all C2 coordinates at fixed C1)
         vslice_data = processed_spectra[:, idx_c1, :]
-        self.vslice_img.setImage(vslice_data)
-        if vslice_data.size > 0:
+        auto_levels = getattr(self, "reset_slice_levels", True)
+        self.vslice_img.setImage(vslice_data, autoLevels=auto_levels)
+        if auto_levels and vslice_data.size > 0:
             min_v, max_v = np.min(vslice_data), np.max(vslice_data)
             if min_v == max_v:
                 max_v += 1
@@ -3528,12 +3655,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 3. Update Horizontal Slice (all C1 coordinates at fixed C2)
         hslice_data = processed_spectra[idx_c2, :, :]
-        self.hslice_img.setImage(hslice_data)
-        if hslice_data.size > 0:
+        self.hslice_img.setImage(hslice_data, autoLevels=auto_levels)
+        if auto_levels and hslice_data.size > 0:
             min_h, max_h = np.min(hslice_data), np.max(hslice_data)
             if min_h == max_h:
                 max_h += 1
             self.hslice_colorbar.setLevels(min_h, max_h)
+            
+        self.reset_slice_levels = False
 
     def on_tab2_crosshair_moved(self):
         """Update Tab 2 slices when its crosshair is dragged."""

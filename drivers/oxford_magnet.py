@@ -25,7 +25,7 @@ class OxfordMagnet(VisaInstrument):
     MIDPOINT_B = 8  # Tesla
     SWITCH_HEATER_FITTED = False
     SLEEPTIME = 0.1
-    TIMEOUT = 3000
+    TIMEOUT = 10000
 
     def __init__(self, name, address, visalib='default', output_handle=None, **kwargs):
         self._lock = threading.RLock()
@@ -147,8 +147,14 @@ class OxfordMagnet(VisaInstrument):
             return "0.0"
         with self._lock:
             time.sleep(self.SLEEPTIME)
-            self.visa_handle.clear()
-            res = self.visa_handle.query(cmd)
+            try:
+                res = self.visa_handle.query(cmd)
+            except Exception as e:
+                try:
+                    self.visa_handle.clear()
+                except Exception:
+                    pass
+                raise e
             if res.startswith('?'):
                 raise RuntimeError('Error raised by magnet: ' + res)
             return res
@@ -158,9 +164,15 @@ class OxfordMagnet(VisaInstrument):
             return
         with self._lock:
             time.sleep(self.SLEEPTIME)
-            self.visa_handle.clear()
-            self.visa_handle.write(cmd)
-            res = self.visa_handle.read()
+            try:
+                self.visa_handle.write(cmd)
+                res = self.visa_handle.read()
+            except Exception as e:
+                try:
+                    self.visa_handle.clear()
+                except Exception:
+                    pass
+                raise e
             if res.startswith('?'):
                 raise RuntimeError('Error raised by magnet: ' + res)
 

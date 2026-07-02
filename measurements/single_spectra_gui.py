@@ -220,7 +220,7 @@ class StatusWorker(QtCore.QThread):
         proxy = None
         try:
             raw_proxy = Pyro4.Proxy(self.uri)
-            if self.spectrometer_type == 'wingspecG15':
+            if self.spectrometer_type in ['wingspecG15', 'winspecG11', 'wingspecG11', 'winspecG15']:
                 from drivers.remote_client import PyroProxyWrapper
                 proxy = PyroProxyWrapper(raw_proxy)
             else:
@@ -344,12 +344,15 @@ class ViewControlPopup(QtWidgets.QFrame):
         
         # 2. Axis Selection Buttons
         layout.addWidget(QtWidgets.QLabel("Autoscale Axis:"))
-        # Grid layout: X and Y stacked on left, Both spanning both rows on right
-        axis_grid = QtWidgets.QGridLayout()
-        axis_grid.setSpacing(2)
+        axis_layout = QtWidgets.QHBoxLayout()
+        axis_layout.setSpacing(4)
 
         self.btn_group = QtWidgets.QButtonGroup(self)
         self.btn_group.setExclusive(True)
+
+        self.btn_axis_both = QtWidgets.QToolButton()
+        self.btn_axis_both.setText("✥")
+        self.btn_axis_both.setToolTip("Autoscale both axes")
 
         self.btn_axis_x = QtWidgets.QToolButton()
         self.btn_axis_x.setText("↔")
@@ -358,10 +361,6 @@ class ViewControlPopup(QtWidgets.QFrame):
         self.btn_axis_y = QtWidgets.QToolButton()
         self.btn_axis_y.setText("↕")
         self.btn_axis_y.setToolTip("Autoscale Y axis only")
-
-        self.btn_axis_both = QtWidgets.QToolButton()
-        self.btn_axis_both.setText("✥")
-        self.btn_axis_both.setToolTip("Autoscale both axes")
 
         axis_btn_style = """
             QToolButton {
@@ -384,18 +383,17 @@ class ViewControlPopup(QtWidgets.QFrame):
             }
         """
 
-        for btn in (self.btn_axis_x, self.btn_axis_y, self.btn_axis_both):
+        for btn in (self.btn_axis_both, self.btn_axis_x, self.btn_axis_y):
             btn.setCheckable(True)
             btn.setStyleSheet(axis_btn_style)
             self.btn_group.addButton(btn)
 
-        # Arrange buttons: X above Y on left, Both on right spanning both rows
-        axis_grid.addWidget(self.btn_axis_x, 0, 0)
-        axis_grid.addWidget(self.btn_axis_y, 1, 0)
-        axis_grid.addWidget(self.btn_axis_both, 0, 1, 2, 1)  # rowSpan=2
+        axis_layout.addWidget(self.btn_axis_both)
+        axis_layout.addWidget(self.btn_axis_x)
+        axis_layout.addWidget(self.btn_axis_y)
 
         self.btn_axis_both.setChecked(True)
-        layout.addLayout(axis_grid)
+        layout.addLayout(axis_layout)
         
         # 4. Autoscale Now Button
         self.btn_scale_now = QtWidgets.QPushButton("Autoscale Now")
@@ -460,6 +458,10 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         self.is_running = False
         self.is_paused = False
 
+        # Last known states for removed UI widgets
+        self.last_known_shutter = ""
+        self.last_known_ccd_status = ""
+
         # Load initial value_storage settings
         self.load_value_storage()
         
@@ -501,7 +503,7 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
             if uri is not None:
                 raw_poll_proxy = Pyro4.Proxy(uri)
                 raw_poll_proxy._pyroTimeout = 2.0
-                if spec_type == 'wingspecG15':
+                if spec_type in ['wingspecG15', 'winspecG11', 'wingspecG11', 'winspecG15']:
                     from drivers.remote_client import PyroProxyWrapper
                     self.live_poll_proxy = PyroProxyWrapper(raw_poll_proxy)
                 else:
@@ -575,6 +577,8 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
 
         self.target_temp_box.blockSignals(True)
         self.target_temp_box.setValue(self.stored_target_temp)
+        if not self.target_temp_title_lbl.isEnabled():
+            self.target_temp_box.lineEdit().setText("")
         self.target_temp_box.blockSignals(False)
 
         # Restore stored values for UI elements (num spectra, average, accumulation)
@@ -717,32 +721,41 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         top_row_layout.addWidget(spec_box)
 
         # Box 2: Camera Settings
-        cam_box = QtWidgets.QGroupBox("Camera Settings")
-        cam_layout = QtWidgets.QFormLayout(cam_box)
+        self.cam_box = QtWidgets.QGroupBox("Camera Settings")
+        self.cam_box.setEnabled(False)  # Disabled initially until status is polled
+        cam_layout = QtWidgets.QFormLayout(self.cam_box)
         cam_layout.setSpacing(8)
         
-        self.ccd_status_lbl = QtWidgets.QLabel("Unknown")
-        cam_layout.addRow(QtWidgets.QLabel("CCD Status:"), self.ccd_status_lbl)
-        
         # Target Temperature input field
+        self.target_temp_title_lbl = QtWidgets.QLabel("CCD Temperature (°C):")
+        self.target_temp_title_lbl.setEnabled(False)
         self.target_temp_box = QtWidgets.QDoubleSpinBox()
         self.target_temp_box.setRange(-140.0, 20.0)
         self.target_temp_box.setDecimals(1)
         self.target_temp_box.setSingleStep(5.0)
         self.target_temp_box.setValue(self.stored_target_temp)
+        self.target_temp_box.setEnabled(False)
+        self.target_temp_box.lineEdit().setText("")
         self.target_temp_box.editingFinished.connect(self.on_target_temperature_changed)
-        cam_layout.addRow(QtWidgets.QLabel("CCD Temperature (°C):"), self.target_temp_box)
+        cam_layout.addRow(self.target_temp_title_lbl, self.target_temp_box)
         
         # Current Temperature label
-        self.ccd_temp_lbl = QtWidgets.QLabel("Unknown")
-        cam_layout.addRow(QtWidgets.QLabel("Current Temperature:"), self.ccd_temp_lbl)
+        self.ccd_temp_title_lbl = QtWidgets.QLabel("Current Temperature:")
+        self.ccd_temp_title_lbl.setEnabled(False)
+        self.ccd_temp_lbl = QtWidgets.QLabel("")
+        self.ccd_temp_lbl.setEnabled(False)
+        cam_layout.addRow(self.ccd_temp_title_lbl, self.ccd_temp_lbl)
         
-        self.shutter_combo = QtWidgets.QComboBox()
-        self.shutter_combo.addItems(["Normal", "Always Closed", "Always Open"])
-        self.shutter_combo.currentTextChanged.connect(self.on_shutter_changed)
-        cam_layout.addRow(QtWidgets.QLabel("Shutter:"), self.shutter_combo)
-        
-        top_row_layout.addWidget(cam_box)
+        top_row_layout.addWidget(self.cam_box)
+
+        # Check if spectrometer is G11/G15 to determine visibility of temperature controls
+        spec_type = "lightfieldG15"
+        if hasattr(self, "station") and hasattr(self.station, "camera") and self.station.camera is not None:
+            spec_type = getattr(self.station.camera, "spectrometer_type", "lightfieldG15")
+        if "g11" in spec_type.lower():
+            self.cam_box.setVisible(False)
+        else:
+            self.cam_box.setVisible(True)
 
         # Box 3: Exposure Settings
         exp_box = QtWidgets.QGroupBox("Exposure Settings")
@@ -950,9 +963,12 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
             location = "G15-Pylon"
             if hasattr(self, "station") and hasattr(self.station, "camera") and self.station.camera is not None:
                 spec_type = getattr(self.station.camera, "spectrometer_type", "lightfieldG15")
-                if spec_type == "wingspecG15":
+                if spec_type in ["wingspecG15", "winspecG15"]:
                     spec_name = "WinSpec"
                     location = "phd-exile-phys"
+                elif spec_type in ["winspecG11", "wingspecG11"]:
+                    spec_name = "WinSpec (G11)"
+                    location = "bluefors-pc"
                 elif spec_type == "lightfieldG11":
                     spec_name = "NIRvana (G11)"
                     location = "10.236.10.143"
@@ -965,7 +981,7 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         if hasattr(self, "station") and hasattr(self.station, "camera") and self.station.camera is not None:
             spec_type = getattr(self.station.camera, "spectrometer_type", "lightfieldG15")
         
-        if spec_type not in ["lightfieldG15", "wingspecG15"]:
+        if spec_type not in ["lightfieldG15", "wingspecG15", "winspecG11", "wingspecG11", "winspecG15"]:
             self.run_btn.setEnabled(False)
             self.run_btn.setToolTip(f"Run (continuous preview) is not supported by {spec_type}.")
             
@@ -979,9 +995,6 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
             self.energy_box.setToolTip(f"Energy control is not supported by {spec_type}.")
             self.target_temp_box.setEnabled(False)
             self.target_temp_box.setToolTip(f"Temperature control is not supported by {spec_type}.")
-            if hasattr(self, 'shutter_combo'):
-                self.shutter_combo.setEnabled(False)
-                self.shutter_combo.setToolTip(f"Shutter control is not supported by {spec_type}.")
 
     # --- Device Event Callbacks ---
     def sync_wl_to_energy(self, wl):
@@ -1074,13 +1087,7 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.status_lbl.setText(f"Error: Failed to set target temperature ({e})")
 
-    def on_shutter_changed(self):
-        idx = self.shutter_combo.currentIndex() + 1
-        try:
-            self.station.camera.remote_lf.set_shutter_control(idx)
-            self.status_lbl.setText(f"Status: Shutter control set to {self.shutter_combo.currentText()}")
-        except Exception as e:
-            self.status_lbl.setText(f"Error: Failed to set shutter control ({e})")
+
 
     # --- Periodic Device Polling ---
     # --- Slots for instrument signal bridge ---
@@ -1139,57 +1146,84 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         self.status_lbl.setText(f"Status: Target temperature updated to {val:.1f} °C (remote)")
 
     def on_shutter_signal(self, val):
-        self.shutter_combo.blockSignals(True)
-        idx = int(val) - 1
-        if 0 <= idx < self.shutter_combo.count():
-            self.shutter_combo.setCurrentIndex(idx)
-        self.shutter_combo.blockSignals(False)
-        self.status_lbl.setText(f"Status: Shutter updated to {self.shutter_combo.currentText()} (remote)")
+        try:
+            idx = int(val)
+            shutter_map = {1: "Normal", 2: "Always Closed", 3: "Always Open"}
+            self.last_known_shutter = shutter_map.get(idx, f"UNKNOWN ({val})")
+            self.status_lbl.setText(f"Status: Shutter updated to {self.last_known_shutter} (remote)")
+        except Exception:
+            pass
 
     def on_status_polled(self, data):
         if not data.get('success', False):
             # Check connection issue
             err = data.get('error', '')
             print(f"Background status poll error: {err}")
-            self.ccd_temp_lbl.setText("*")
-            self.ccd_status_lbl.setText("DISCONNECTED")
+            
+            self.cam_box.setEnabled(False)
+            
+            self.target_temp_title_lbl.setEnabled(False)
+            self.target_temp_box.setEnabled(False)
+            self.target_temp_box.lineEdit().setText("")
+            
+            self.ccd_temp_title_lbl.setEnabled(False)
+            self.ccd_temp_lbl.setEnabled(False)
+            self.ccd_temp_lbl.setText("")
+            
+            self.last_known_ccd_status = ""
+            self.last_known_shutter = ""
+            
             self.gain_lbl.setText("*")
             return
 
         # 1. Update Actual Temperature
         temp = data.get('temp')
         try:
-            if temp is not None:
+            if temp is not None and temp != "*":
+                self.cam_box.setEnabled(True)
                 if isinstance(temp, (int, float)):
                     temp_text = f"{temp:.1f} °C"
                 else:
                     temp_text = str(temp)
+                self.ccd_temp_title_lbl.setEnabled(True)
+                self.ccd_temp_lbl.setEnabled(True)
                 if self.ccd_temp_lbl.text() != temp_text:
                     self.ccd_temp_lbl.setText(temp_text)
             else:
-                if self.ccd_temp_lbl.text() != "*":
-                    self.ccd_temp_lbl.setText("*")
+                self.cam_box.setEnabled(False)
+                self.ccd_temp_title_lbl.setEnabled(False)
+                self.ccd_temp_lbl.setEnabled(False)
+                self.ccd_temp_lbl.setText("")
         except Exception:
             pass
             
         # 2. Update Target Temperature
         target_temp = data.get('target_temp')
         try:
-            if target_temp is not None:
+            if target_temp is not None and target_temp != "*":
+                spec_type = getattr(self.station.camera, "spectrometer_type", "lightfieldG15")
+                supports_hardware_cfg = (spec_type in ["lightfieldG15", "wingspecG15", "winspecG11", "wingspecG11", "winspecG15"])
+                ui_enabled = self.acquire_btn.setEnabled(True) or self.acquire_btn.isEnabled()
+                ui_enabled = self.acquire_btn.isEnabled() and supports_hardware_cfg
+                
+                self.target_temp_title_lbl.setEnabled(True)
+                self.target_temp_box.setEnabled(ui_enabled)
                 if isinstance(target_temp, (int, float)) and not self.target_temp_box.hasFocus():
                     if abs(self.target_temp_box.value() - target_temp) > 0.1:
                         self.target_temp_box.blockSignals(True)
                         self.target_temp_box.setValue(target_temp)
                         self.target_temp_box.blockSignals(False)
+            else:
+                self.target_temp_title_lbl.setEnabled(False)
+                self.target_temp_box.setEnabled(False)
+                self.target_temp_box.lineEdit().setText("")
         except Exception:
             pass
-
-
 
         # 4. Update Temperature Status
         status = data.get('status')
         try:
-            if status is not None:
+            if status is not None and status != "*":
                 status_map = {
                     1: "LOCKED",
                     2: "COOLING",
@@ -1197,14 +1231,11 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
                     4: "OFF"
                 }
                 if isinstance(status, int):
-                    status_str = status_map.get(status, f"UNKNOWN ({status})")
+                    self.last_known_ccd_status = status_map.get(status, f"UNKNOWN ({status})")
                 else:
-                    status_str = str(status)
-                if self.ccd_status_lbl.text() != status_str:
-                    self.ccd_status_lbl.setText(status_str)
+                    self.last_known_ccd_status = str(status)
             else:
-                if self.ccd_status_lbl.text() != "*":
-                    self.ccd_status_lbl.setText("*")
+                self.last_known_ccd_status = ""
         except Exception:
             pass
 
@@ -1269,13 +1300,12 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         # 9. Update Shutter Mode
         shutter = data.get('shutter')
         try:
-            if shutter is not None:
-                idx = int(shutter) - 1
-                if 0 <= idx < self.shutter_combo.count():
-                    if self.shutter_combo.currentIndex() != idx:
-                        self.shutter_combo.blockSignals(True)
-                        self.shutter_combo.setCurrentIndex(idx)
-                        self.shutter_combo.blockSignals(False)
+            if shutter is not None and shutter != "*":
+                idx = int(shutter)
+                shutter_map = {1: "Normal", 2: "Always Closed", 3: "Always Open"}
+                self.last_known_shutter = shutter_map.get(idx, f"UNKNOWN ({shutter})")
+            else:
+                self.last_known_shutter = ""
         except Exception:
             pass
 
@@ -1311,7 +1341,7 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         
         camera = self.station.camera
         spec_type = getattr(camera, "spectrometer_type", "lightfieldG15")
-        if spec_type != 'wingspecG15':
+        if spec_type not in ['wingspecG15', 'winspecG11', 'wingspecG11', 'winspecG15']:
             self.live_poll_timer.start()
 
         num_spectra = self.num_spectra_box.value()
@@ -1405,7 +1435,7 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
                 if uri is not None:
                     raw_poll_proxy = Pyro4.Proxy(uri)
                     raw_poll_proxy._pyroTimeout = 2.0
-                    if spec_type == 'wingspecG15':
+                    if spec_type in ['wingspecG15', 'winspecG11', 'wingspecG11', 'winspecG15']:
                         from drivers.remote_client import PyroProxyWrapper
                         self.live_poll_proxy = PyroProxyWrapper(raw_poll_proxy)
                     else:
@@ -1611,9 +1641,9 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
                 metadata["center_wavelength_nm"] = self.wl_box.value()
                 metadata["grating"] = self.grating_combo.currentText()
                 metadata["exposure_time_s"] = self.exposure_box.value()
-                metadata["shutter"] = self.shutter_combo.currentText()
+                metadata["shutter"] = getattr(self, 'last_known_shutter', '')
                 metadata["ccd_temperature_C"] = self.ccd_temp_lbl.text()
-                metadata["ccd_status"] = self.ccd_status_lbl.text()
+                metadata["ccd_status"] = getattr(self, 'last_known_ccd_status', '')
                 metadata["gain"] = self.gain_lbl.text()
                 metadata["timestamp"] = time.strftime('%Y-%m-%d %H:%M:%S')
             except Exception:
@@ -1699,9 +1729,9 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
                     h5f.attrs['center_wavelength_nm'] = self.wl_box.value()
                     h5f.attrs['grating'] = self.grating_combo.currentText()
                     h5f.attrs['exposure_time_s'] = self.exposure_box.value()
-                    h5f.attrs['shutter'] = self.shutter_combo.currentText()
+                    h5f.attrs['shutter'] = getattr(self, 'last_known_shutter', '')
                     h5f.attrs['ccd_temperature_C'] = self.ccd_temp_lbl.text()
-                    h5f.attrs['ccd_status'] = self.ccd_status_lbl.text()
+                    h5f.attrs['ccd_status'] = getattr(self, 'last_known_ccd_status', '')
                     h5f.attrs['gain'] = self.gain_lbl.text()
                     h5f.attrs['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
                     # Store full value_storage JSON as a dataset for full state recovery
@@ -1740,9 +1770,9 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
             metadata_lines.append(f"# Monochromator Center Wavelength (nm): {self.wl_box.value()}")
             metadata_lines.append(f"# Grating: {self.grating_combo.currentText()}")
             metadata_lines.append(f"# Exposure Time (s): {self.exposure_box.value()}")
-            metadata_lines.append(f"# Shutter: {self.shutter_combo.currentText()}")
+            metadata_lines.append(f"# Shutter: {getattr(self, 'last_known_shutter', '')}")
             metadata_lines.append(f"# CCD Temperature: {self.ccd_temp_lbl.text()}")
-            metadata_lines.append(f"# CCD Status: {self.ccd_status_lbl.text()}")
+            metadata_lines.append(f"# CCD Status: {getattr(self, 'last_known_ccd_status', '')}")
             metadata_lines.append(f"# Preamplifier Gain: {self.gain_lbl.text()}")
         except Exception:
             pass
@@ -1823,7 +1853,7 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         spec_type = "lightfieldG15"
         if hasattr(self, "station") and hasattr(self.station, "camera") and self.station.camera is not None:
             spec_type = getattr(self.station.camera, "spectrometer_type", "lightfieldG15")
-        supports_hardware_cfg = (spec_type in ["lightfieldG15", "wingspecG15"])
+        supports_hardware_cfg = (spec_type in ["lightfieldG15", "wingspecG15", "winspecG11", "wingspecG11", "winspecG15"])
         
         self.grating_combo.setEnabled(enabled and supports_hardware_cfg)
         self.wl_box.setEnabled(enabled and supports_hardware_cfg)
@@ -1832,9 +1862,9 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         self.num_spectra_box.setEnabled(enabled)
         self.average_combo.setEnabled(enabled)
         self.accum_combo.setEnabled(enabled)
-        self.target_temp_box.setEnabled(enabled and supports_hardware_cfg)
-        if hasattr(self, 'shutter_combo'):
-            self.shutter_combo.setEnabled(enabled and supports_hardware_cfg)
+        has_temp = self.target_temp_title_lbl.isEnabled()
+        self.target_temp_box.setEnabled(enabled and supports_hardware_cfg and has_temp)
+
         # Update save button state based on data availability
         if enabled:
             self.update_save_button_state()
@@ -2032,18 +2062,18 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
 
     # --- Modern Visual Styling ---
     def apply_qss_theme(self):
-        # Clean white/light theme
+        # Clean white/light theme (rectangular, strict monochromatic white/grey/black, no blue tint)
         style = """
         QMainWindow, QWidget {
             background-color: #ffffff;
-            color: #1e293b;
+            color: #000000;
         }
         QGroupBox {
-            background-color: #f8fafc;
-            border: 1px solid #cbd5e1;
-            border-radius: 8px;
+            background-color: #ffffff;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
             margin-top: 2.5ex;
-            color: #2563eb;
+            color: #000000;
             font-weight: bold;
             font-size: 13px;
         }
@@ -2055,87 +2085,88 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
             background-color: transparent;
         }
         QLabel {
-            color: #334155;
+            color: #000000;
             font-size: 12px;
             background-color: transparent;
         }
         QPushButton {
-            background-color: #e2e8f0;
-            color: #1e293b;
-            border: 1px solid #94a3b8;
-            border-radius: 6px;
+            background-color: #ffffff;
+            color: #000000;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
             padding: 8px 16px;
             font-weight: bold;
             font-size: 12px;
         }
         QPushButton:hover {
-            background-color: #cbd5e1;
-            border-color: #64748b;
+            background-color: #eeeeee;
+            border-color: #999999;
         }
         QPushButton:pressed {
-            background-color: #94a3b8;
+            background-color: #dddddd;
         }
         QPushButton#acquireBtn {
-            background-color: #2563eb;
+            background-color: #000000;
             color: #ffffff;
-            border-color: #1d4ed8;
+            border-color: #000000;
         }
         QPushButton#acquireBtn:hover {
-            background-color: #1d4ed8;
+            background-color: #333333;
         }
         QPushButton#saveBtn {
-            background-color: #0ea5e9;
+            background-color: #555555;
             color: #ffffff;
-            border-color: #0284c7;
+            border-color: #444444;
         }
         QPushButton#saveBtn:hover {
-            background-color: #0284c7;
+            background-color: #333333;
         }
         QPushButton#bgBtn, QPushButton#refBtn {
-            background-color: #6366f1;
+            background-color: #777777;
             color: #ffffff;
-            border-color: #4f46e5;
+            border-color: #666666;
         }
         QPushButton#bgBtn:hover, QPushButton#refBtn:hover {
-            background-color: #4f46e5;
+            background-color: #555555;
         }
         QPushButton#runBtn:checked {
-            background-color: #059669;
+            background-color: #222222;
             color: #ffffff;
-            border-color: #047857;
+            border-color: #000000;
         }
         QPushButton#runBtn:checked:hover {
-            background-color: #047857;
+            background-color: #000000;
         }
         QPushButton#interruptBtn {
-            background-color: #dc2626;
+            background-color: #444444;
             color: #ffffff;
-            border-color: #b91c1c;
+            border-color: #333333;
         }
         QPushButton#interruptBtn:hover {
-            background-color: #b91c1c;
+            background-color: #222222;
         }
         QPushButton#scaleBtn {
-            background-color: #f1f5f9;
-            color: #1e293b;
-            border-color: #cbd5e1;
+            background-color: #ffffff;
+            color: #000000;
+            border-color: #cccccc;
+            border-radius: 0px;
             padding: 4px 10px;
             font-size: 11px;
         }
         QPushButton#scaleBtn:hover {
-            background-color: #e2e8f0;
-            border-color: #94a3b8;
+            background-color: #eeeeee;
+            border-color: #999999;
         }
         QPushButton:disabled {
-            background-color: #f1f5f9;
-            color: #94a3b8;
-            border-color: #e2e8f0;
+            background-color: #f9f9f9;
+            color: #aaaaaa;
+            border-color: #eeeeee;
         }
         QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
             background-color: #ffffff;
-            border: 1px solid #94a3b8;
-            border-radius: 5px;
-            color: #1e293b;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            color: #000000;
             padding: 5px;
             font-family: Consolas, monospace;
             font-size: 12px;
@@ -2144,17 +2175,17 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
             border: none;
         }
         QProgressBar {
-            background-color: #e2e8f0;
-            border: 1px solid #cbd5e1;
-            border-radius: 6px;
+            background-color: #eeeeee;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
             text-align: center;
-            color: #1e293b;
+            color: #000000;
             font-weight: bold;
             height: 18px;
         }
         QProgressBar::chunk {
-            background-color: #2563eb;
-            border-radius: 5px;
+            background-color: #333333;
+            border-radius: 0px;
         }
         QCheckBox {
             background-color: transparent;

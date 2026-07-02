@@ -75,19 +75,20 @@ class MagnetRampWorker(QtCore.QThread):
 # Reuse button style from Dual_gate_sweep_gui (assuming it's defined elsewhere or replicate basic style)
 button_style = """
 QPushButton {
-    background-color: #f8fafc;
-    border: 1px solid #cbd5e1;
+    background-color: #ffffff;
+    border: 1px solid #cccccc;
     font-weight: bold;
-    border-radius: 4px;
-    min-width: 40px;
-    min-height: 40px;
-    color: #1e293b;
+    border-radius: 0px;
+    min-width: 30px;
+    min-height: 30px;
+    padding: 0px;
+    color: #000000;
 }
 QPushButton:hover {
-    background-color: #f1f5f9;
+    background-color: #eeeeee;
 }
 QPushButton:pressed {
-    background-color: #e2e8f0;
+    background-color: #cccccc;
 }
 """
 
@@ -212,8 +213,8 @@ class PositionTab(QtWidgets.QWidget):
         cross_widget = QtWidgets.QWidget()
         cross_widget.setFixedSize(160, 160)
         cross_layout = QtWidgets.QGridLayout(cross_widget)
-        cross_layout.setContentsMargins(0, 0, 0, 0)
-        cross_layout.setSpacing(5)
+        cross_layout.setContentsMargins(10, 10, 10, 10)
+        cross_layout.setSpacing(10)
         
         self.btn_up = QtWidgets.QPushButton("Y ↑")
         self.btn_down = QtWidgets.QPushButton("Y ↓")
@@ -221,7 +222,7 @@ class PositionTab(QtWidgets.QWidget):
         self.btn_right = QtWidgets.QPushButton("X →")
         for btn in (self.btn_up, self.btn_down, self.btn_left, self.btn_right):
             btn.setStyleSheet(button_style)
-            btn.setFixedSize(50, 50)
+            btn.setFixedSize(40, 40)
             btn.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         cross_layout.addWidget(self.btn_up, 0, 1)
         cross_layout.addWidget(self.btn_left, 1, 0)
@@ -234,7 +235,7 @@ class PositionTab(QtWidgets.QWidget):
         self.btn_z_down = QtWidgets.QPushButton("Z ↓")
         for btn in (self.btn_z_up, self.btn_z_down):
             btn.setStyleSheet(button_style)
-            btn.setFixedSize(80, 30)
+            btn.setFixedSize(65, 30)
             btn.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         z_stepper_layout.addWidget(self.btn_z_up)
         z_stepper_layout.addWidget(self.btn_z_down)
@@ -253,9 +254,9 @@ class PositionTab(QtWidgets.QWidget):
         
         # Headers/Titles
         freq_title = QtWidgets.QLabel("Step Frequency")
-        freq_title.setStyleSheet("font-weight: bold; color: #475569;")
+        freq_title.setStyleSheet("font-weight: bold; color: #000000;")
         amp_title = QtWidgets.QLabel("Step Amplitude")
-        amp_title.setStyleSheet("font-weight: bold; color: #475569;")
+        amp_title.setStyleSheet("font-weight: bold; color: #000000;")
         
         self.stepper_params_layout.addWidget(freq_title, 0, 0, 1, 3)
         self.stepper_params_layout.addWidget(amp_title, 0, 3, 1, 3)
@@ -309,8 +310,8 @@ class PositionTab(QtWidgets.QWidget):
         scanner_cross_widget = QtWidgets.QWidget()
         scanner_cross_widget.setFixedSize(160, 160)
         scanner_top_layout = QtWidgets.QGridLayout(scanner_cross_widget)
-        scanner_top_layout.setContentsMargins(0, 0, 0, 0)
-        scanner_top_layout.setSpacing(5)
+        scanner_top_layout.setContentsMargins(10, 10, 10, 10)
+        scanner_top_layout.setSpacing(10)
         
         self.s_btn_up = QtWidgets.QPushButton("Y ↑")
         self.s_btn_down = QtWidgets.QPushButton("Y ↓")
@@ -318,7 +319,7 @@ class PositionTab(QtWidgets.QWidget):
         self.s_btn_right = QtWidgets.QPushButton("X →")
         for btn in (self.s_btn_up, self.s_btn_down, self.s_btn_left, self.s_btn_right):
             btn.setStyleSheet(button_style)
-            btn.setFixedSize(50, 50)
+            btn.setFixedSize(40, 40)
             btn.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         scanner_top_layout.addWidget(self.s_btn_up, 0, 1)
         scanner_top_layout.addWidget(self.s_btn_left, 1, 0)
@@ -380,17 +381,17 @@ class PositionTab(QtWidgets.QWidget):
         
         # Magnet field display
         self.magnet_live_field_lbl = QtWidgets.QLabel("B = -- T")
-        self.magnet_live_field_lbl.setStyleSheet("color: #1e293b; font-weight: bold;")
+        self.magnet_live_field_lbl.setStyleSheet("color: #000000; font-weight: bold;")
         magnet_group_layout.addWidget(self.magnet_live_field_lbl)
         
         # Status Label and Stop Button
         self.magnet_status_lbl = QtWidgets.QLabel("Status: Idle")
-        self.magnet_status_lbl.setStyleSheet("color: #475569; font-weight: bold; font-size: 11px;")
+        self.magnet_status_lbl.setStyleSheet("color: #000000; font-weight: bold; font-size: 11px;")
         magnet_group_layout.addWidget(self.magnet_status_lbl)
         
         self.magnet_stop_btn = QtWidgets.QPushButton("Stop Ramp")
         self.magnet_stop_btn.setEnabled(False)
-        self.magnet_stop_btn.setStyleSheet("background-color: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; font-weight: bold; min-height: 25px; border-radius: 4px;")
+        self.magnet_stop_btn.setStyleSheet("background-color: #000000; color: #ffffff; border: 1px solid #000000; font-weight: bold; min-height: 25px; border-radius: 0px;")
         self.magnet_stop_btn.clicked.connect(self.on_magnet_stop_clicked)
         magnet_group_layout.addWidget(self.magnet_stop_btn)
         

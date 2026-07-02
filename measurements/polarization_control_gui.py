@@ -383,13 +383,13 @@ class PolarizationControlWindow(QtWidgets.QMainWindow):
         # --- Excitation Card (Left) ---
         exc_card = QtWidgets.QFrame()
         exc_card.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
-        exc_card.setStyleSheet("QFrame { background-color: #f8fafc; border: 1px solid #cbd5e1; border-radius: 12px; }")
+        exc_card.setStyleSheet("QFrame { background-color: #ffffff; border: 1px solid #cccccc; border-radius: 0px; }")
         exc_layout = QtWidgets.QVBoxLayout(exc_card)
         exc_layout.setContentsMargins(20, 20, 20, 20)
         exc_layout.setSpacing(15)
 
         exc_title = QtWidgets.QLabel("Excitation Waveplate (Rotator 1)")
-        exc_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #4f46e5; border: none;")
+        exc_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #000000; border: none;")
         exc_layout.addWidget(exc_title, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
 
         # Visual Dial (Supports mouse drag manual tuning)
@@ -400,7 +400,7 @@ class PolarizationControlWindow(QtWidgets.QMainWindow):
 
         # Readout text
         self.lbl_exc_angle = QtWidgets.QLabel("0.00°")
-        self.lbl_exc_angle.setStyleSheet("font-family: Consolas, monospace; font-size: 28px; font-weight: bold; color: #1e293b; border: none;")
+        self.lbl_exc_angle.setStyleSheet("font-family: Consolas, monospace; font-size: 28px; font-weight: bold; color: #000000; border: none;")
         self.lbl_exc_angle.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         exc_layout.addWidget(self.lbl_exc_angle)
 
@@ -412,18 +412,19 @@ class PolarizationControlWindow(QtWidgets.QMainWindow):
         # Vertical and Horizontal Buttons
         h_layout = QtWidgets.QHBoxLayout()
         self.btn_exc_vertical = QtWidgets.QPushButton("Vertical (90.0°)")
-        self.btn_exc_vertical.setStyleSheet("background-color: #10b981; color: white; font-weight: bold; border-radius: 6px; padding: 8px;")
+        self.btn_exc_vertical.setStyleSheet("background-color: #000000; color: white; font-weight: bold; border-radius: 0px; padding: 8px;")
         self.btn_exc_vertical.clicked.connect(self.move_exc_vertical)
-        self.btn_exc_horizontal = QtWidgets.QPushButton("Horizontal (0.0°)")
-        self.btn_exc_horizontal.setStyleSheet("background-color: #ef4444; color: white; font-weight: bold; border-radius: 6px; padding: 8px;")
-        self.btn_exc_horizontal.clicked.connect(self.move_exc_horizontal)
         h_layout.addWidget(self.btn_exc_vertical)
+
+        self.btn_exc_horizontal = QtWidgets.QPushButton("Horizontal (0.0°)")
+        self.btn_exc_horizontal.setStyleSheet("background-color: #555555; color: white; font-weight: bold; border-radius: 0px; padding: 8px;")
+        self.btn_exc_horizontal.clicked.connect(self.move_exc_horizontal)
         h_layout.addWidget(self.btn_exc_horizontal)
         exc_grid.addLayout(h_layout, 0, 0, 1, 3)
 
         # Manual Angle input
         lbl_m = QtWidgets.QLabel("Manual Angle:")
-        lbl_m.setStyleSheet("border: none; font-weight: bold;")
+        lbl_m.setStyleSheet("border: none; font-weight: bold; color: #000000;")
         exc_grid.addWidget(lbl_m, 1, 0)
         self.exc_manual_spin = QtWidgets.QDoubleSpinBox()
         self.exc_manual_spin.setRange(-10000.0, 10000.0)
@@ -432,13 +433,13 @@ class PolarizationControlWindow(QtWidgets.QMainWindow):
         self.exc_manual_spin.editingFinished.connect(self.move_exc_manual)
         exc_grid.addWidget(self.exc_manual_spin, 1, 1)
         self.btn_exc_go_manual = QtWidgets.QPushButton("Go")
-        self.btn_exc_go_manual.setStyleSheet("background-color: #6366f1; color: white; font-weight: bold; border-radius: 4px; padding: 4px 12px;")
+        self.btn_exc_go_manual.setStyleSheet("background-color: #000000; color: white; font-weight: bold; border-radius: 0px; padding: 4px 12px;")
         self.btn_exc_go_manual.clicked.connect(self.move_exc_manual)
         exc_grid.addWidget(self.btn_exc_go_manual, 1, 2)
 
         # Relative Angle input
         lbl_rel = QtWidgets.QLabel("Relative Angle:")
-        lbl_rel.setStyleSheet("border: none; font-weight: bold;")
+        lbl_rel.setStyleSheet("border: none; font-weight: bold; color: #000000;")
         exc_grid.addWidget(lbl_rel, 2, 0)
         self.exc_relative_spin = QtWidgets.QDoubleSpinBox()
         self.exc_relative_spin.setRange(-360.0, 360.0)
@@ -446,15 +447,15 @@ class PolarizationControlWindow(QtWidgets.QMainWindow):
         self.exc_relative_spin.setValue(0.0)
         exc_grid.addWidget(self.exc_relative_spin, 2, 1)
         self.btn_exc_go_relative = QtWidgets.QPushButton("Go")
-        self.btn_exc_go_relative.setStyleSheet("background-color: #f97316; color: white; font-weight: bold; border-radius: 4px; padding: 4px 12px;")
+        self.btn_exc_go_relative.setStyleSheet("background-color: #555555; color: white; font-weight: bold; border-radius: 0px; padding: 4px 12px;")
         self.btn_exc_go_relative.clicked.connect(self.move_exc_relative)
         exc_grid.addWidget(self.btn_exc_go_relative, 2, 2)
 
         lbl_recal = QtWidgets.QLabel("Recalibrate stage:")
-        lbl_recal.setStyleSheet("border: none; font-weight: bold;")
+        lbl_recal.setStyleSheet("border: none; font-weight: bold; color: #000000;")
         exc_grid.addWidget(lbl_recal, 3, 0)
         self.btn_exc_home = QtWidgets.QPushButton("Home Stage (0.0°)")
-        self.btn_exc_home.setStyleSheet("background-color: #f1f5f9; color: #1e293b; font-weight: bold; border-radius: 4px; padding: 4px;")
+        self.btn_exc_home.setStyleSheet("background-color: #ffffff; color: #000000; font-weight: bold; border-radius: 0px; padding: 4px; border: 1px solid #cccccc;")
         self.btn_exc_home.clicked.connect(self.home_exc)
         exc_grid.addWidget(self.btn_exc_home, 3, 1, 1, 2)
 
@@ -465,13 +466,13 @@ class PolarizationControlWindow(QtWidgets.QMainWindow):
         # --- Collection Card (Right) ---
         coll_card = QtWidgets.QFrame()
         coll_card.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
-        coll_card.setStyleSheet("QFrame { background-color: #f8fafc; border: 1px solid #cbd5e1; border-radius: 12px; }")
+        coll_card.setStyleSheet("QFrame { background-color: #ffffff; border: 1px solid #cccccc; border-radius: 0px; }")
         coll_layout = QtWidgets.QVBoxLayout(coll_card)
         coll_layout.setContentsMargins(20, 20, 20, 20)
         coll_layout.setSpacing(15)
 
         coll_title = QtWidgets.QLabel("Collection Waveplate (Rotator 2)")
-        coll_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #4f46e5; border: none;")
+        coll_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #000000; border: none;")
         coll_layout.addWidget(coll_title, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
 
         # Visual Dial (Supports mouse drag manual tuning)
@@ -482,7 +483,7 @@ class PolarizationControlWindow(QtWidgets.QMainWindow):
 
         # Readout text
         self.lbl_coll_angle = QtWidgets.QLabel("0.00°")
-        self.lbl_coll_angle.setStyleSheet("font-family: Consolas, monospace; font-size: 28px; font-weight: bold; color: #1e293b; border: none;")
+        self.lbl_coll_angle.setStyleSheet("font-family: Consolas, monospace; font-size: 28px; font-weight: bold; color: #000000; border: none;")
         self.lbl_coll_angle.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         coll_layout.addWidget(self.lbl_coll_angle)
 
@@ -492,20 +493,21 @@ class PolarizationControlWindow(QtWidgets.QMainWindow):
         coll_grid.setColumnStretch(1, 1)
 
         # Vertical and Horizontal Buttons
-        h_layout_coll = QtWidgets.QHBoxLayout()
+        h_layout2 = QtWidgets.QHBoxLayout()
         self.btn_coll_vertical = QtWidgets.QPushButton("Vertical (90.0°)")
-        self.btn_coll_vertical.setStyleSheet("background-color: #10b981; color: white; font-weight: bold; border-radius: 6px; padding: 8px;")
+        self.btn_coll_vertical.setStyleSheet("background-color: #000000; color: white; font-weight: bold; border-radius: 0px; padding: 8px;")
         self.btn_coll_vertical.clicked.connect(self.move_coll_vertical)
+        h_layout2.addWidget(self.btn_coll_vertical)
+
         self.btn_coll_horizontal = QtWidgets.QPushButton("Horizontal (0.0°)")
-        self.btn_coll_horizontal.setStyleSheet("background-color: #ef4444; color: white; font-weight: bold; border-radius: 6px; padding: 8px;")
+        self.btn_coll_horizontal.setStyleSheet("background-color: #555555; color: white; font-weight: bold; border-radius: 0px; padding: 8px;")
         self.btn_coll_horizontal.clicked.connect(self.move_coll_horizontal)
-        h_layout_coll.addWidget(self.btn_coll_vertical)
-        h_layout_coll.addWidget(self.btn_coll_horizontal)
-        coll_grid.addLayout(h_layout_coll, 0, 0, 1, 3)
+        h_layout2.addWidget(self.btn_coll_horizontal)
+        coll_grid.addLayout(h_layout2, 0, 0, 1, 3)
 
         # Manual Angle input
         lbl_cm = QtWidgets.QLabel("Manual Angle:")
-        lbl_cm.setStyleSheet("border: none; font-weight: bold;")
+        lbl_cm.setStyleSheet("border: none; font-weight: bold; color: #000000;")
         coll_grid.addWidget(lbl_cm, 1, 0)
         self.coll_manual_spin = QtWidgets.QDoubleSpinBox()
         self.coll_manual_spin.setRange(-10000.0, 10000.0)
@@ -514,13 +516,13 @@ class PolarizationControlWindow(QtWidgets.QMainWindow):
         self.coll_manual_spin.editingFinished.connect(self.move_coll_manual)
         coll_grid.addWidget(self.coll_manual_spin, 1, 1)
         self.btn_coll_go_manual = QtWidgets.QPushButton("Go")
-        self.btn_coll_go_manual.setStyleSheet("background-color: #6366f1; color: white; font-weight: bold; border-radius: 4px; padding: 4px 12px;")
+        self.btn_coll_go_manual.setStyleSheet("background-color: #000000; color: white; font-weight: bold; border-radius: 0px; padding: 4px 12px;")
         self.btn_coll_go_manual.clicked.connect(self.move_coll_manual)
         coll_grid.addWidget(self.btn_coll_go_manual, 1, 2)
 
         # Relative Angle input
         lbl_crel = QtWidgets.QLabel("Relative Angle:")
-        lbl_crel.setStyleSheet("border: none; font-weight: bold;")
+        lbl_crel.setStyleSheet("border: none; font-weight: bold; color: #000000;")
         coll_grid.addWidget(lbl_crel, 2, 0)
         self.coll_relative_spin = QtWidgets.QDoubleSpinBox()
         self.coll_relative_spin.setRange(-360.0, 360.0)
@@ -528,15 +530,15 @@ class PolarizationControlWindow(QtWidgets.QMainWindow):
         self.coll_relative_spin.setValue(0.0)
         coll_grid.addWidget(self.coll_relative_spin, 2, 1)
         self.btn_coll_go_relative = QtWidgets.QPushButton("Go")
-        self.btn_coll_go_relative.setStyleSheet("background-color: #f97316; color: white; font-weight: bold; border-radius: 4px; padding: 4px 12px;")
+        self.btn_coll_go_relative.setStyleSheet("background-color: #555555; color: white; font-weight: bold; border-radius: 0px; padding: 4px 12px;")
         self.btn_coll_go_relative.clicked.connect(self.move_coll_relative)
         coll_grid.addWidget(self.btn_coll_go_relative, 2, 2)
 
         lbl_crecal = QtWidgets.QLabel("Recalibrate stage:")
-        lbl_crecal.setStyleSheet("border: none; font-weight: bold;")
+        lbl_crecal.setStyleSheet("border: none; font-weight: bold; color: #000000;")
         coll_grid.addWidget(lbl_crecal, 3, 0)
         self.btn_coll_home = QtWidgets.QPushButton("Home Stage (0.0°)")
-        self.btn_coll_home.setStyleSheet("background-color: #f1f5f9; color: #1e293b; font-weight: bold; border-radius: 4px; padding: 4px;")
+        self.btn_coll_home.setStyleSheet("background-color: #ffffff; color: #000000; font-weight: bold; border-radius: 0px; padding: 4px; border: 1px solid #cccccc;")
         self.btn_coll_home.clicked.connect(self.home_coll)
         coll_grid.addWidget(self.btn_coll_home, 3, 1, 1, 2)
 
@@ -546,13 +548,13 @@ class PolarizationControlWindow(QtWidgets.QMainWindow):
         # --- Rotator 3 Card (Right) ---
         rot3_card = QtWidgets.QFrame()
         rot3_card.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
-        rot3_card.setStyleSheet("QFrame { background-color: #f8fafc; border: 1px solid #cbd5e1; border-radius: 12px; }")
+        rot3_card.setStyleSheet("QFrame { background-color: #ffffff; border: 1px solid #cccccc; border-radius: 0px; }")
         rot3_layout = QtWidgets.QVBoxLayout(rot3_card)
         rot3_layout.setContentsMargins(20, 20, 20, 20)
         rot3_layout.setSpacing(15)
 
         rot3_title = QtWidgets.QLabel("Rotator 3 (Rotator 3)")
-        rot3_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #4f46e5; border: none;")
+        rot3_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #000000; border: none;")
         rot3_layout.addWidget(rot3_title, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
 
         # Visual Dial (Supports mouse drag manual tuning)
@@ -563,7 +565,7 @@ class PolarizationControlWindow(QtWidgets.QMainWindow):
 
         # Readout text
         self.lbl_rot3_angle = QtWidgets.QLabel("0.00°")
-        self.lbl_rot3_angle.setStyleSheet("font-family: Consolas, monospace; font-size: 28px; font-weight: bold; color: #1e293b; border: none;")
+        self.lbl_rot3_angle.setStyleSheet("font-family: Consolas, monospace; font-size: 28px; font-weight: bold; color: #000000; border: none;")
         self.lbl_rot3_angle.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         rot3_layout.addWidget(self.lbl_rot3_angle)
 
@@ -575,18 +577,22 @@ class PolarizationControlWindow(QtWidgets.QMainWindow):
         # Vertical and Horizontal Buttons
         h_layout_rot3 = QtWidgets.QHBoxLayout()
         self.btn_rot3_vertical = QtWidgets.QPushButton("Vertical (90.0°)")
-        self.btn_rot3_vertical.setStyleSheet("background-color: #10b981; color: white; font-weight: bold; border-radius: 6px; padding: 8px;")
-        self.btn_rot3_vertical.clicked.connect(self.move_rot3_vertical)
-        self.btn_rot3_horizontal = QtWidgets.QPushButton("Horizontal (0.0°)")
-        self.btn_rot3_horizontal.setStyleSheet("background-color: #ef4444; color: white; font-weight: bold; border-radius: 6px; padding: 8px;")
-        self.btn_rot3_horizontal.clicked.connect(self.move_rot3_horizontal)
+        self.btn_rot3_vertical.setStyleSheet("background-color: #000000; color: white; font-weight: bold; border-radius: 0px; padding: 8px;")
         h_layout_rot3.addWidget(self.btn_rot3_vertical)
-        h_layout_rot3.addWidget(self.btn_rot3_horizontal)
-        rot3_grid.addLayout(h_layout_rot3, 0, 0, 1, 3)
+        self.btn_rot3_horizontal = QtWidgets.QPushButton("Horizontal (0.0°)")
+        self.btn_rot3_horizontal.setStyleSheet("background-color: #555555; color: white; font-weight: bold; border-radius: 0px; padding: 8px;")
+        self.btn_rot3_horizontal.clicked.connect(self.move_rot3_horizontal)
+        h_layout3 = QtWidgets.QHBoxLayout()
+        self.btn_rot3_vertical = QtWidgets.QPushButton("Vertical (90.0°)")
+        self.btn_rot3_vertical.setStyleSheet("background-color: #000000; color: white; font-weight: bold; border-radius: 0px; padding: 8px;")
+        self.btn_rot3_vertical.clicked.connect(self.move_rot3_vertical)
+        h_layout3.addWidget(self.btn_rot3_vertical)
+        h_layout3.addWidget(self.btn_rot3_horizontal)
+        rot3_grid.addLayout(h_layout3, 0, 0, 1, 3)
 
         # Manual Angle input
         lbl_r3m = QtWidgets.QLabel("Manual Angle:")
-        lbl_r3m.setStyleSheet("border: none; font-weight: bold;")
+        lbl_r3m.setStyleSheet("border: none; font-weight: bold; color: #000000;")
         rot3_grid.addWidget(lbl_r3m, 1, 0)
         self.rot3_manual_spin = QtWidgets.QDoubleSpinBox()
         self.rot3_manual_spin.setRange(-10000.0, 10000.0)
@@ -595,13 +601,13 @@ class PolarizationControlWindow(QtWidgets.QMainWindow):
         self.rot3_manual_spin.editingFinished.connect(self.move_rot3_manual)
         rot3_grid.addWidget(self.rot3_manual_spin, 1, 1)
         self.btn_rot3_go_manual = QtWidgets.QPushButton("Go")
-        self.btn_rot3_go_manual.setStyleSheet("background-color: #6366f1; color: white; font-weight: bold; border-radius: 4px; padding: 4px 12px;")
+        self.btn_rot3_go_manual.setStyleSheet("background-color: #000000; color: white; font-weight: bold; border-radius: 0px; padding: 4px 12px;")
         self.btn_rot3_go_manual.clicked.connect(self.move_rot3_manual)
         rot3_grid.addWidget(self.btn_rot3_go_manual, 1, 2)
 
         # Relative Angle input
         lbl_r3rel = QtWidgets.QLabel("Relative Angle:")
-        lbl_r3rel.setStyleSheet("border: none; font-weight: bold;")
+        lbl_r3rel.setStyleSheet("border: none; font-weight: bold; color: #000000;")
         rot3_grid.addWidget(lbl_r3rel, 2, 0)
         self.rot3_relative_spin = QtWidgets.QDoubleSpinBox()
         self.rot3_relative_spin.setRange(-360.0, 360.0)
@@ -609,15 +615,15 @@ class PolarizationControlWindow(QtWidgets.QMainWindow):
         self.rot3_relative_spin.setValue(0.0)
         rot3_grid.addWidget(self.rot3_relative_spin, 2, 1)
         self.btn_rot3_go_relative = QtWidgets.QPushButton("Go")
-        self.btn_rot3_go_relative.setStyleSheet("background-color: #f97316; color: white; font-weight: bold; border-radius: 4px; padding: 4px 12px;")
+        self.btn_rot3_go_relative.setStyleSheet("background-color: #555555; color: white; font-weight: bold; border-radius: 0px; padding: 4px 12px;")
         self.btn_rot3_go_relative.clicked.connect(self.move_rot3_relative)
         rot3_grid.addWidget(self.btn_rot3_go_relative, 2, 2)
 
         lbl_r3recal = QtWidgets.QLabel("Recalibrate stage:")
-        lbl_r3recal.setStyleSheet("border: none; font-weight: bold;")
+        lbl_r3recal.setStyleSheet("border: none; font-weight: bold; color: #000000;")
         rot3_grid.addWidget(lbl_r3recal, 3, 0)
         self.btn_rot3_home = QtWidgets.QPushButton("Home Stage (0.0°)")
-        self.btn_rot3_home.setStyleSheet("background-color: #f1f5f9; color: #1e293b; font-weight: bold; border-radius: 4px; padding: 4px;")
+        self.btn_rot3_home.setStyleSheet("background-color: #ffffff; color: #000000; font-weight: bold; border-radius: 0px; padding: 4px; border: 1px solid #cccccc;")
         self.btn_rot3_home.clicked.connect(self.home_rot3)
         rot3_grid.addWidget(self.btn_rot3_home, 3, 1, 1, 2)
 
@@ -628,7 +634,7 @@ class PolarizationControlWindow(QtWidgets.QMainWindow):
 
         # Bottom status readout
         self.lbl_status = QtWidgets.QLabel("Status: Idle")
-        self.lbl_status.setStyleSheet("font-weight: bold; color: #4f46e5; italic; border: none; font-size: 13px;")
+        self.lbl_status.setStyleSheet("font-weight: bold; color: #000000; italic; border: none; font-size: 13px;")
         main_layout.addWidget(self.lbl_status)
 
         self.update_dials()
@@ -844,30 +850,76 @@ class PolarizationControlWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.warning(self, "Hardware Error", f"An error occurred during move:\n{err}")
 
     def apply_theme(self):
+        """Premium light theme styling matching Single Spectra (rectangular, strict monochromatic white/grey/black, no blue tint)"""
         qss = """
         QMainWindow, QWidget {
             background-color: #ffffff;
-            color: #1e293b;
-            font-family: "Segoe UI", Arial;
+            color: #000000;
+        }
+        QGroupBox {
+            background-color: #ffffff;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            margin-top: 2.5ex;
+            color: #000000;
+            font-weight: bold;
             font-size: 13px;
         }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            subcontrol-position: top left;
+            left: 10px;
+            padding: 0 5px;
+            background-color: transparent;
+        }
+        QLabel {
+            color: #000000;
+            font-size: 12px;
+            background-color: transparent;
+        }
         QPushButton {
-            background-color: #f1f5f9;
-            color: #1e293b;
-            border: 1px solid #cbd5e1;
-            border-radius: 6px;
-            padding: 5px;
+            background-color: #ffffff;
+            color: #000000;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            padding: 8px 16px;
             font-weight: bold;
+            font-size: 12px;
         }
         QPushButton:hover {
-            background-color: #e2e8f0;
+            background-color: #eeeeee;
+            border-color: #999999;
         }
-        QDoubleSpinBox {
+        QPushButton:pressed {
+            background-color: #dddddd;
+        }
+        QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
             background-color: #ffffff;
-            color: #1e293b;
-            border: 1px solid #cbd5e1;
-            border-radius: 4px;
-            padding: 4px;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            color: #000000;
+            padding: 5px;
+            font-family: Consolas, monospace;
+            font-size: 12px;
+        }
+        QComboBox::drop-down {
+            border: none;
+        }
+        QProgressBar {
+            background-color: #eeeeee;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            text-align: center;
+            color: #000000;
+            font-weight: bold;
+            height: 18px;
+        }
+        QProgressBar::chunk {
+            background-color: #333333;
+            border-radius: 0px;
+        }
+        QCheckBox {
+            background-color: transparent;
         }
         """
         self.setStyleSheet(qss)

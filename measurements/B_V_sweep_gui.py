@@ -76,14 +76,15 @@ class CollapsibleSection(QtWidgets.QWidget):
                 text-align: left;
                 font-weight: bold;
                 font-size: 13px;
-                color: #4f46e5;
-                background-color: #f1f5f9;
-                border: 1px solid #cbd5e1;
-                border-radius: 6px;
+                color: #000000;
+                background-color: #ffffff;
+                border: 1px solid #cccccc;
+                border-radius: 0px;
                 padding: 8px 12px;
             }
             QPushButton:hover {
-                background-color: #e2e8f0;
+                background-color: #eeeeee;
+                border-color: #999999;
             }
         """)
         layout.addWidget(self.header)
@@ -92,9 +93,9 @@ class CollapsibleSection(QtWidgets.QWidget):
         self.content.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
         self.content.setStyleSheet("""
             QFrame {
-                background-color: #f8fafc;
-                border: 1px solid #cbd5e1;
-                border-radius: 6px;
+                background-color: #ffffff;
+                border: 1px solid #cccccc;
+                border-radius: 0px;
                 padding: 10px;
             }
         """)
@@ -353,27 +354,13 @@ class BVSweepWorker(QtCore.QThread):
                     self.field_updated.emit(magnet.output_field())
                 return True
 
-            def _ramp_smu(chan, target, max_step=0.1, delay=0.05):
-                """Gradually ramp an SMU channel to `target` volts.
-                Uses small steps to avoid timeout on large changes.
-                """
+            def _ramp_smu(chan, target):
+                """Ramp SMU channel using driver's software ramp."""
                 chan.ramp_stop_requested = False
                 try:
-                    current = chan.measure_volt() if chan.output() else 0.0
-                except Exception:
-                    current = 0.0
-                diff = target - current
-                if abs(diff) < 1e-6:
-                    return
-                steps = max(1, int(abs(diff) / max_step))
-                for i in range(1, steps + 1):
-                    if getattr(chan, "ramp_stop_requested", False):
-                        break
-                    intermediate = current + diff * i / steps
-                    chan.set_r.volt(intermediate)
-                    time.sleep(delay)
-                if not getattr(chan, "ramp_stop_requested", False):
                     chan.set_r.volt(target)
+                except Exception as e:
+                    print(f"BVSweepWorker: Error in _ramp_smu: {e}")
 
             def _cleanup_on_abort():
                 """Safely ramp down instruments on user abort/reset."""
@@ -476,66 +463,22 @@ class BVSweepWorker(QtCore.QThread):
                     # Ramp physical voltages
                     self.voltage_updated.emit(v1, v2)
                     # Gradually ramp voltages to avoid timeout on large steps
-                    def _ramp(chan, target, max_step=0.1, delay=0.05):
+                    # Gradually ramp voltages using driver's software ramp
+                    def _ramp(chan, target):
                         chan.ramp_stop_requested = False
-                        
                         max_retries = 3
-                        current = 0.0
-                        
-                        # Query current voltage with retries
-                        if chan.output():
-                            for attempt in range(1, max_retries + 1):
-                                try:
-                                    current = chan.measure_volt()
-                                    break
-                                except Exception as ex:
-                                    if attempt == max_retries:
-                                        raise ex
-                                    try:
-                                        chan.parent.visa_handle.clear()
-                                    except Exception:
-                                        pass
-                                    time.sleep(0.1)
-                                    
-                        diff = target - current
-                        if abs(diff) < 1e-6:
-                            return
-                        steps = max(1, int(abs(diff) / max_step))
-                        for i in range(1, steps + 1):
-                            if getattr(chan, "ramp_stop_requested", False):
+                        for attempt in range(1, max_retries + 1):
+                            try:
+                                chan.set_r.volt(target)
                                 break
-                            intermediate = current + diff * i / steps
-                            
-                            # Set intermediate voltage with retries
-                            for attempt in range(1, max_retries + 1):
+                            except Exception as ex:
+                                if attempt == max_retries:
+                                    raise ex
                                 try:
-                                    chan.set_r.volt(intermediate)
-                                    break
-                                except Exception as ex:
-                                    if attempt == max_retries:
-                                        raise ex
-                                    try:
-                                        chan.parent.visa_handle.clear()
-                                    except Exception:
-                                        pass
-                                    time.sleep(0.1)
-                                    
-                            time.sleep(delay)
-                        
-                        if not getattr(chan, "ramp_stop_requested", False):
-                            # Set final voltage with retries
-                            for attempt in range(1, max_retries + 1):
-                                try:
-                                    chan.set_r.volt(target)
-                                    break
-                                except Exception as ex:
-                                    if attempt == max_retries:
-                                        raise ex
-                                    try:
-                                        chan.parent.visa_handle.clear()
-                                    except Exception:
-                                        pass
-                                    time.sleep(0.1)
+                                    chan.parent.visa_handle.clear()
+                                except Exception:
+                                    pass
+                                time.sleep(0.1)
                     _ramp(smu.ch1, v1)
                     _ramp(smu.ch2, v2)
 
@@ -909,6 +852,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         # Application states
         self.is_running = False
         self.is_paused = False
+        self.reset_slice_levels = True
         self.sweep_worker = None
         self.was_aborted = False
         self.had_error = False
@@ -974,8 +918,8 @@ class BVSweepWindow(QtWidgets.QMainWindow):
             "coeff_d": 1.0
         }
         self.stored_settings = defaults.copy()
-        self.stored_settings["c1_name"] = "Vc1"
-        self.stored_settings["c2_name"] = "Vc2"
+        self.stored_settings["c1_name"] = "V1"
+        self.stored_settings["c2_name"] = "V2"
         if os.path.exists(storage_path):
             try:
                 with open(storage_path, "r") as f:
@@ -984,8 +928,8 @@ class BVSweepWindow(QtWidgets.QMainWindow):
                 bv_data = raw_data.get("bv_sweep", {})
                 self.stored_settings["settling_time"] = shared_data.get("settling_time", raw_data.get("settling_time", defaults["settling_time"]))
                 self.stored_settings["exposure_time"] = shared_data.get("exposure_time", raw_data.get("exposure_time", defaults["exposure_time"]))
-                self.stored_settings["c1_name"] = shared_data.get("c1_name", "Vc1")
-                self.stored_settings["c2_name"] = shared_data.get("c2_name", "Vc2")
+                self.stored_settings["c1_name"] = shared_data.get("c1_name", "V1")
+                self.stored_settings["c2_name"] = shared_data.get("c2_name", "V2")
                 for key in defaults:
                     if key not in ("settling_time", "exposure_time"):
                         if key in ("coeff_a", "coeff_b", "coeff_c", "coeff_d"):
@@ -1020,8 +964,8 @@ class BVSweepWindow(QtWidgets.QMainWindow):
             
             current_data["shared"]["settling_time"] = self.settling_box.value()
             current_data["shared"]["exposure_time"] = self.exposure_box.value()
-            current_data["shared"]["c1_name"] = self.stored_settings.get("c1_name", "Vc1")
-            current_data["shared"]["c2_name"] = self.stored_settings.get("c2_name", "Vc2")
+            current_data["shared"]["c1_name"] = self.stored_settings.get("c1_name", "V1")
+            current_data["shared"]["c2_name"] = self.stored_settings.get("c2_name", "V2")
             current_data["shared"]["coeff_a"] = self.stored_settings.get("coeff_a", 1.0)
             current_data["shared"]["coeff_b"] = self.stored_settings.get("coeff_b", 0.0)
             current_data["shared"]["coeff_c"] = self.stored_settings.get("coeff_c", 0.0)
@@ -1314,7 +1258,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.v_step_lbl.setStyleSheet("font-weight: bold; color: #475569;")
         grid.addWidget(self.v_step_lbl, 3, 1)
 
-        self.lbl_v_fixed = QtWidgets.QLabel("Vc2 Fixed (V):")
+        self.lbl_v_fixed = QtWidgets.QLabel("V2 Fixed (V):")
         grid.addWidget(self.lbl_v_fixed, 4, 0)
         self.v_fixed = QtWidgets.QDoubleSpinBox()
         self.v_fixed.setRange(-210.0, 210.0)
@@ -1343,7 +1287,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.coeff_a.setValue(self.stored_settings.get("coeff_a", 1.0))
         self.coeff_a.editingFinished.connect(self.on_sweep_range_changed)
         f1_layout.addWidget(self.coeff_a)
-        self.lbl_vc1_eq_mid = QtWidgets.QLabel(" * Vc1_swept + ")
+        self.lbl_vc1_eq_mid = QtWidgets.QLabel(" * V1_swept + ")
         f1_layout.addWidget(self.lbl_vc1_eq_mid)
         self.coeff_b = QtWidgets.QDoubleSpinBox()
         self.coeff_b.setRange(-100.0, 100.0)
@@ -1351,7 +1295,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.coeff_b.setValue(self.stored_settings.get("coeff_b", 0.0))
         self.coeff_b.editingFinished.connect(self.on_sweep_range_changed)
         f1_layout.addWidget(self.coeff_b)
-        self.lbl_vc1_eq_end = QtWidgets.QLabel(" * Vc2_fixed")
+        self.lbl_vc1_eq_end = QtWidgets.QLabel(" * V2_fixed")
         f1_layout.addWidget(self.lbl_vc1_eq_end)
         grid.addLayout(f1_layout, 6, 0, 1, 2)
 
@@ -1364,7 +1308,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.coeff_c.setValue(self.stored_settings.get("coeff_c", 0.0))
         self.coeff_c.editingFinished.connect(self.on_sweep_range_changed)
         f2_layout.addWidget(self.coeff_c)
-        self.lbl_vc2_eq_mid = QtWidgets.QLabel(" * Vc1_swept + ")
+        self.lbl_vc2_eq_mid = QtWidgets.QLabel(" * V1_swept + ")
         f2_layout.addWidget(self.lbl_vc2_eq_mid)
         self.coeff_d = QtWidgets.QDoubleSpinBox()
         self.coeff_d.setRange(-100.0, 100.0)
@@ -1372,7 +1316,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.coeff_d.setValue(self.stored_settings.get("coeff_d", 1.0))
         self.coeff_d.editingFinished.connect(self.on_sweep_range_changed)
         f2_layout.addWidget(self.coeff_d)
-        self.lbl_vc2_eq_end = QtWidgets.QLabel(" * Vc2_fixed")
+        self.lbl_vc2_eq_end = QtWidgets.QLabel(" * V2_fixed")
         f2_layout.addWidget(self.lbl_vc2_eq_end)
         grid.addLayout(f2_layout, 7, 0, 1, 2)
 
@@ -1438,7 +1382,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         layout.addWidget(sec)
 
     def setup_bottom_status_panel(self, layout):
-        panel = QtWidgets.QGroupBox("[ Measurement Controls ]")
+        panel = QtWidgets.QGroupBox("Measurement Controls")
         vbox = QtWidgets.QVBoxLayout(panel)
         vbox.setSpacing(6)
 
@@ -1463,7 +1407,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         btn_layout2.addWidget(self.btn_reset)
 
         self.btn_save = QtWidgets.QPushButton("💾 Save Dataset")
-        self.btn_save.setStyleSheet("background-color: #3b82f6; color: white; font-weight: bold;")
+        self.btn_save.setStyleSheet("background-color: #555555; color: white; font-weight: bold; border-radius: 0px;")
         self.btn_save.setEnabled(False)
         self.btn_save.clicked.connect(self.save_sweep_data)
         btn_layout2.addWidget(self.btn_save)
@@ -1475,24 +1419,24 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         vbox.addWidget(self.progress_bar)
 
         self.lbl_expected_end = QtWidgets.QLabel("Expected End: --:--:--")
-        self.lbl_expected_end.setStyleSheet("font-family: Consolas, monospace; font-size: 13px; font-weight: bold; color: #1e293b;")
+        self.lbl_expected_end.setStyleSheet("font-family: Consolas, monospace; font-size: 13px; font-weight: bold; color: #000000;")
         vbox.addWidget(self.lbl_expected_end)
 
         self.lbl_status = QtWidgets.QLabel("Status: Idle")
-        self.lbl_status.setStyleSheet("color: #4f46e5; font-style: italic; font-weight: bold;")
+        self.lbl_status.setStyleSheet("color: #000000; font-style: italic; font-weight: bold;")
         vbox.addWidget(self.lbl_status)
 
-        self.lbl_current_b = QtWidgets.QLabel("B = --‑‑ T")
-        self.lbl_current_b.setStyleSheet("color: #1e293b; font-weight: bold;")
-        vbox.addWidget(self.lbl_current_b)
-
-        self.lbl_target_vc1 = QtWidgets.QLabel("Vc1 = --‑‑ V")
-        self.lbl_target_vc1.setStyleSheet("color: #1e293b; font-weight: bold;")
+        self.lbl_target_vc1 = QtWidgets.QLabel("V1 = --‑‑ V")
+        self.lbl_target_vc1.setStyleSheet("color: #000000; font-weight: bold;")
         vbox.addWidget(self.lbl_target_vc1)
 
-        self.lbl_target_vc2 = QtWidgets.QLabel("Vc2 = --‑‑ V")
-        self.lbl_target_vc2.setStyleSheet("color: #1e293b; font-weight: bold;")
+        self.lbl_target_vc2 = QtWidgets.QLabel("V2 = --‑‑ V")
+        self.lbl_target_vc2.setStyleSheet("color: #000000; font-weight: bold;")
         vbox.addWidget(self.lbl_target_vc2)
+
+        self.lbl_current_b = QtWidgets.QLabel("B = --‑‑ T")
+        self.lbl_current_b.setStyleSheet("color: #000000; font-weight: bold;")
+        vbox.addWidget(self.lbl_current_b)
 
         layout.addWidget(panel)
 
@@ -1531,8 +1475,8 @@ class BVSweepWindow(QtWidgets.QMainWindow):
 
     def update_variable_names(self):
         b_name = self.b_coord_name.text().strip() or "B"
-        c1_name = self.stored_settings.get("c1_name", "Vc1")
-        c2_name = self.stored_settings.get("c2_name", "Vc2")
+        c1_name = self.stored_settings.get("c1_name", "V1")
+        c2_name = self.stored_settings.get("c2_name", "V2")
 
         # Dynamic formula labels
         if hasattr(self, 'lbl_v_fixed'):
@@ -1551,7 +1495,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
             self.lbl_vc2_eq_end.setText(f" * {c2_name}_fixed")
 
         # Format axes label strings
-        c1_label = f"Vc1 ({c1_name})" if c1_name.lower() != "vc1" else "Vc1"
+        c1_label = f"V1 ({c1_name})" if c1_name.lower() != "v1" else "V1"
 
         # Update axes in plots
         if hasattr(self, 'gatemap_win'):
@@ -1621,7 +1565,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.gatemap_img.setOpts(axisOrder='row-major')
         self.gatemap_win.addItem(self.gatemap_img)
         self.gatemap_win.setLabel('left', 'Magnetic Field', units='T')
-        self.gatemap_win.setLabel('bottom', 'Voltage (Vc1)', units='V')
+        self.gatemap_win.setLabel('bottom', 'Voltage (V1)', units='V')
 
         self.gatemap_colorbar = self.setup_histogram_lut(self.gatemap_win, self.gatemap_img, interactive=False)
 
@@ -1682,7 +1626,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.hslice_img = pg.ImageItem()
         self.hslice_img.setOpts(axisOrder='row-major')
         self.hslice_win.addItem(self.hslice_img)
-        self.hslice_win.setLabel('left', 'Voltage (Vc1)', units='V')
+        self.hslice_win.setLabel('left', 'Voltage (V1)', units='V')
         self.hslice_win.setLabel('bottom', 'Energy', units='eV')
         self.hslice_colorbar = self.setup_histogram_lut(self.hslice_win, self.hslice_img, interactive=True)
 
@@ -1748,7 +1692,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.t2_heatmap_img.setOpts(axisOrder='row-major')
         self.t2_heatmap_win.addItem(self.t2_heatmap_img)
         self.t2_heatmap_win.setLabel('left', 'Magnetic Field', units='T')
-        self.t2_heatmap_win.setLabel('bottom', 'Voltage (Vc1)', units='V')
+        self.t2_heatmap_win.setLabel('bottom', 'Voltage (V1)', units='V')
         self.t2_colorbar = self.setup_histogram_lut(self.t2_heatmap_win, self.t2_heatmap_img, interactive=True)
 
         self.cross2_v = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen('#ea580c', width=2))
@@ -1786,7 +1730,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.t2_hslice_win.getViewBox().enableAutoRange(axis='y', enable=True)
         self.t2_hslice_curve = self.t2_hslice_win.plot(pen=pg.mkPen('#2563eb', width=2))
         self.t2_hslice_win.setLabel('left', 'Current', units='A')
-        self.t2_hslice_win.setLabel('bottom', 'Voltage (Vc1)', units='V')
+        self.t2_hslice_win.setLabel('bottom', 'Voltage (V1)', units='V')
         self.t2_hslice_win.showGrid(x=True, y=True, alpha=0.3)
         right_layout.addWidget(self.t2_hslice_win)
 
@@ -1813,7 +1757,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.t3_heatmap_img.setOpts(axisOrder='row-major')
         self.t3_heatmap_win.addItem(self.t3_heatmap_img)
         self.t3_heatmap_win.setLabel('left', 'Magnetic Field', units='T')
-        self.t3_heatmap_win.setLabel('bottom', 'Voltage (Vc1)', units='V')
+        self.t3_heatmap_win.setLabel('bottom', 'Voltage (V1)', units='V')
         self.t3_colorbar = self.setup_histogram_lut(self.t3_heatmap_win, self.t3_heatmap_img, interactive=True)
 
         self.cross3_v = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen('#16a34a', width=2))
@@ -1851,7 +1795,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.t3_hslice_win.getViewBox().enableAutoRange(axis='y', enable=True)
         self.t3_hslice_curve = self.t3_hslice_win.plot(pen=pg.mkPen('#2563eb', width=2))
         self.t3_hslice_win.setLabel('left', 'Current', units='A')
-        self.t3_hslice_win.setLabel('bottom', 'Voltage (Vc1)', units='V')
+        self.t3_hslice_win.setLabel('bottom', 'Voltage (V1)', units='V')
         self.t3_hslice_win.showGrid(x=True, y=True, alpha=0.3)
         right_layout.addWidget(self.t3_hslice_win)
 
@@ -1883,23 +1827,19 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         hist.layout.setSpacing(2)
         hist.layout.setColumnFixedWidth(0, 12)
         hist.layout.setColumnFixedWidth(1, 45)
-        hist.layout.setColumnFixedWidth(2, 35)
         
         hist.gradient.setMinimumWidth(0)
         hist.gradient.setMaximumWidth(12)
         hist.vb.setMinimumWidth(0)
         hist.vb.setMaximumWidth(45)
-        hist.axis.setMinimumWidth(0)
-        hist.axis.setMaximumWidth(35)
-        hist.setMinimumWidth(92)
-        hist.setMaximumWidth(100)
+        hist.setMinimumWidth(80)
         
         if not interactive:
             hist.region.setMovable(False)
             for line in hist.region.lines:
                 line.setMovable(False)
             hist.gradient.setEnabled(False)
-            hist.vb.setMouseEnabled(x=False, y=False)
+            hist.vb.setMouseEnabled(x=False, y=True)
             
         pi = plot_win.getPlotItem()
         pi.layout.removeItem(pi.titleLabel)
@@ -1909,6 +1849,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         return hist
 
     def reset_plot_scaling(self):
+        self.reset_slice_levels = True
         v_min, v_max = min(self.v_coords), max(self.v_coords)
         b_min, b_max = min(self.b_coords), max(self.b_coords)
         
@@ -2010,6 +1951,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.cross3_h.setValue(p_b)
 
     def scale_plots(self):
+        self.reset_slice_levels = True
         """Scale all plots: zoom completely out on coordinates, auto-range 1D plots, and set colorbar levels to full data range."""
         # 1. Reset all viewbox ranges to coordinate limits (v, b, energy) by calling reset_plot_scaling
         self.reset_plot_scaling()
@@ -2175,10 +2117,23 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.spectrum_curve.setData(self.energy_axis, spectrum)
 
         vslice_data = processed_spectra[:, idx_v, :]
-        self.vslice_img.setImage(vslice_data)
+        auto_levels = getattr(self, "reset_slice_levels", True)
+        self.vslice_img.setImage(vslice_data, autoLevels=auto_levels)
+        if auto_levels and vslice_data.size > 0:
+            min_v, max_v = np.min(vslice_data), np.max(vslice_data)
+            if min_v == max_v:
+                max_v += 1.0
+            self.vslice_colorbar.setLevels(min_v, max_v)
 
         hslice_data = processed_spectra[idx_b, :, :]
-        self.hslice_img.setImage(hslice_data)
+        self.hslice_img.setImage(hslice_data, autoLevels=auto_levels)
+        if auto_levels and hslice_data.size > 0:
+            min_h, max_h = np.min(hslice_data), np.max(hslice_data)
+            if min_h == max_h:
+                max_h += 1.0
+            self.hslice_colorbar.setLevels(min_h, max_h)
+
+        self.reset_slice_levels = False
 
     def on_integration_region_changed(self):
         self.update_heatmaps_and_slices()
@@ -2260,73 +2215,90 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.on_tab3_crosshair_moved()
 
     def apply_theme(self):
+        """Premium light theme styling matching Single Spectra (rectangular, strict monochromatic white/grey/black, no blue tint)"""
         qss = """
         QMainWindow, QWidget {
             background-color: #ffffff;
-            color: #1e293b;
-            font-family: "Segoe UI", Arial;
-            font-size: 13px;
+            color: #000000;
         }
         QGroupBox {
-            background-color: #f8fafc;
-            border: 1px solid #cbd5e1;
-            border-radius: 8px;
-            margin-top: 14px;
+            background-color: #ffffff;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            margin-top: 2.5ex;
+            color: #000000;
             font-weight: bold;
-            color: #4f46e5;
+            font-size: 13px;
         }
         QGroupBox::title {
             subcontrol-origin: margin;
             subcontrol-position: top left;
             left: 10px;
-            padding: 2px 4px;
+            padding: 0 5px;
+            background-color: transparent;
         }
-        QDoubleSpinBox, QSpinBox, QComboBox, QLineEdit {
-            background-color: #ffffff;
-            color: #1e293b;
-            border: 1px solid #cbd5e1;
-            border-radius: 4px;
-            padding: 4px;
+        QLabel {
+            color: #000000;
+            font-size: 12px;
+            background-color: transparent;
         }
         QPushButton {
-            background-color: #f1f5f9;
-            color: #1e293b;
-            border: 1px solid #cbd5e1;
-            border-radius: 6px;
-            padding: 6px;
+            background-color: #ffffff;
+            color: #000000;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            padding: 8px 16px;
             font-weight: bold;
+            font-size: 12px;
         }
         QPushButton:hover {
-            background-color: #e2e8f0;
+            background-color: #eeeeee;
+            border-color: #999999;
         }
-        QTabWidget::pane {
-            border: 1px solid #cbd5e1;
-            border-radius: 8px;
+        QPushButton:pressed {
+            background-color: #dddddd;
+        }
+        QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
             background-color: #ffffff;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            color: #000000;
+            padding: 5px;
+            font-family: Consolas, monospace;
+            font-size: 12px;
         }
-        QTabBar::tab {
-            background-color: #f1f5f9;
-            color: #475569;
-            border: 1px solid #cbd5e1;
-            border-bottom-color: none;
-            padding: 8px 16px;
-        }
-        QTabBar::tab:selected {
-            background-color: #ffffff;
-            color: #4f46e5;
-            font-weight: bold;
+        QComboBox::drop-down {
+            border: none;
         }
         QProgressBar {
+            background-color: #eeeeee;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
             text-align: center;
-            border: 1px solid #cbd5e1;
-            border-radius: 4px;
-            background-color: #f1f5f9;
+            color: #000000;
+            font-weight: bold;
+            height: 18px;
         }
         QProgressBar::chunk {
-            background-color: #10b981;
+            background-color: #333333;
+            border-radius: 0px;
+        }
+        QCheckBox {
+            background-color: transparent;
         }
         """
         self.setStyleSheet(qss)
+
+        # Apply unified styling (white background and slate axes) to all PlotWidgets
+        import pyqtgraph as pg
+        for attr_name in dir(self):
+            attr = getattr(self, attr_name, None)
+            if isinstance(attr, pg.PlotWidget):
+                attr.setBackground('w')
+                attr.getAxis('left').setPen(pg.mkPen('#334155'))
+                attr.getAxis('bottom').setPen(pg.mkPen('#334155'))
+                attr.getAxis('left').setTextPen(pg.mkPen('#334155'))
+                attr.getAxis('bottom').setTextPen(pg.mkPen('#334155'))
 
     def set_inputs_enabled(self, enabled: bool):
         self.b_coord_name.setEnabled(enabled)
@@ -2364,6 +2336,8 @@ class BVSweepWindow(QtWidgets.QMainWindow):
             return
 
         if self.is_running: return
+
+        self.reset_slice_levels = True
 
         self._autosaved_this_run = False
         self.was_aborted = False

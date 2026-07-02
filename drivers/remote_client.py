@@ -460,7 +460,7 @@ class ClientLightFieldCamera(Instrument):
             if pyro_uri is None:
                 pyro_uri = f"PYRO:LightField@{server_ip}:{port}"
             proxy = Pyro4.Proxy(pyro_uri)
-            if spectrometer_type == 'wingspecG15':
+            if spectrometer_type in ['wingspecG15', 'winspecG11', 'wingspecG11', 'winspecG15']:
                 self.remote_lf = PyroProxyWrapper(proxy)
             else:
                 self.remote_lf = proxy
@@ -476,36 +476,18 @@ class ClientLightFieldCamera(Instrument):
                            get_cmd=lambda: remote_get(self.remote_lf, 'num_frames', 'get_num_frames'),
                            set_cmd=lambda val: remote_set(self.remote_lf, 'num_frames', val, 'set_num_frames'))
 
-        self.add_parameter('acquisition_mode',
-                           label='Acquisition Mode',
-                           get_cmd=self._get_acquisition_mode,
-                           set_cmd=self._set_acquisition_mode)
-
         self.add_parameter('readout_mode',
                            label='Readout Mode',
-                           get_cmd=lambda: remote_get(self.remote_lf, 'readout_mode', 'get_readout_mode'),
+                           get_cmd=lambda: "Full Frame",
                            set_cmd=lambda val: remote_set(self.remote_lf, 'readout_mode', val, 'set_readout_mode'))
                            
         self.add_parameter('image',
                            parameter_class=RemoteCCDImage,
                            shape=(512, 512))
 
-    def _get_acquisition_mode(self) -> str:
-        try:
-            return remote_get(self.remote_lf, 'acquisition_mode', 'get_acquisition_mode')
-        except Exception as e:
-            print(f"Warning: Could not get remote acquisition mode: {e}")
-            return "Unknown"
-
-    def _set_acquisition_mode(self, val) -> None:
-        try:
-            remote_set(self.remote_lf, 'acquisition_mode', val, 'set_acquisition_mode')
-        except Exception as e:
-            print(f"Warning: Could not set remote acquisition mode to {val}: {e}")
-
     def capture_image(self) -> np.ndarray:
         # Fetch the spectrum (Note: get_spectrum returns (intensities, wavelengths))
-        if self.spectrometer_type == 'wingspecG15':
+        if self.spectrometer_type in ['wingspecG15', 'winspecG11', 'wingspecG11', 'winspecG15']:
             res = self.remote_lf.get_spectrum(wlen=True)
         else:
             res = self.remote_lf.get_spectrum()
@@ -542,7 +524,7 @@ class ClientLightFieldCamera(Instrument):
     def abort_acquisition(self) -> None:
         """Abort the current remote spectrum acquisition."""
         try:
-            if self.spectrometer_type == 'wingspecG15':
+            if self.spectrometer_type in ['wingspecG15', 'winspecG11', 'wingspecG11', 'winspecG15']:
                 # Release the main proxy connection to close the active socket and free the thread
                 if hasattr(self.remote_lf, "abort_acquisition"):
                     self.remote_lf.abort_acquisition()
@@ -573,7 +555,7 @@ class ClientLightFieldMonochromator(Instrument):
             if pyro_uri is None:
                 pyro_uri = f"PYRO:LightField@{server_ip}:{port}"
             proxy = Pyro4.Proxy(pyro_uri)
-            if spectrometer_type == 'wingspecG15':
+            if spectrometer_type in ['wingspecG15', 'winspecG11', 'wingspecG11', 'winspecG15']:
                 self.remote_lf = PyroProxyWrapper(proxy)
             else:
                 self.remote_lf = proxy

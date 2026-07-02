@@ -180,9 +180,12 @@ class ScalarMapWorker(QtCore.QThread):
     def set_piezo(self, axis, val):
         try:
             if hasattr(self.station, 'piezo300'):
-                param = getattr(self.station.piezo300, f'voltage_ch{axis}', None)
-                if param:
-                    param(val)
+                if hasattr(self.station.piezo300, 'set_voltage'):
+                    self.station.piezo300.set_voltage(axis, val)
+                else:
+                    param = getattr(self.station.piezo300, f'voltage_ch{axis}', None)
+                    if param:
+                        param(val)
         except Exception as e:
             print(f"Error setting ANC300 axis {axis}: {e}")
 
@@ -460,10 +463,6 @@ class ViewControlPopup(QtWidgets.QFrame):
         self.btn_grid_B.setStyleSheet(btn_style)
         self.btn_grid_C.setStyleSheet(btn_style)
         
-        self.btn_grid_A.setText("A")
-        self.btn_grid_B.setText("B")
-        self.btn_grid_C.setText("C")
-        
         grid.addWidget(self.btn_grid_A, 0, 0)
         grid.addWidget(self.btn_grid_B, 0, 1)
         grid.addWidget(self.btn_grid_C, 1, 0)
@@ -580,7 +579,13 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
         self.pause_start_time = None
 
         self._init_ui()
+        self.apply_theme()
         self.load_storage()
+        self.update_coordinates_from_ui()
+        self.reset_plot_bounds()
+        x_center = (self.x_coords[0] + self.x_coords[-1]) / 2.0
+        y_center = (self.y_coords[0] + self.y_coords[-1]) / 2.0
+        self.update_crosshair_values(x_center, y_center)
 
         # Initialize status updates
         self.live_status_worker = LiveStatusWorker(self.station)
@@ -613,16 +618,11 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
         param_layout.addRow("X parameter", self.x_param_cb)
         param_layout.addRow("Y parameter", self.y_param_cb)
 
-        scan_group = QtWidgets.QGroupBox("Scan area")
-        scan_layout = QtWidgets.QVBoxLayout(scan_group)
-        left_layout.addWidget(scan_group)
-
-        self.scan_table = QtWidgets.QTableWidget(4, 2)
-        self.scan_table.setHorizontalHeaderLabels(["X", "Y"])
-        self.scan_table.setVerticalHeaderLabels(["Start", "End", "No. points", "Pixel size"])
-        self.scan_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self.scan_table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self.scan_table.setMinimumHeight(160)
+        self.scan_group = QtWidgets.QGroupBox("Scan area")
+        scan_layout = QtWidgets.QGridLayout(self.scan_group)
+        scan_layout.setContentsMargins(12, 12, 12, 12)
+        scan_layout.setSpacing(8)
+        left_layout.addWidget(self.scan_group)
 
         self.x_start_spin = QtWidgets.QDoubleSpinBox(); self.x_start_spin.setRange(-1e6, 1e6); self.x_start_spin.setDecimals(3)
         self.x_end_spin   = QtWidgets.QDoubleSpinBox(); self.x_end_spin.setRange(-1e6, 1e6);   self.x_end_spin.setDecimals(3)
@@ -634,15 +634,6 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
         self.pixel_x_spin = QtWidgets.QDoubleSpinBox(); self.pixel_x_spin.setRange(0, 1e6);     self.pixel_x_spin.setDecimals(3)
         self.pixel_y_spin = QtWidgets.QDoubleSpinBox(); self.pixel_y_spin.setRange(0, 1e6);     self.pixel_y_spin.setDecimals(3)
 
-        self.scan_table.setCellWidget(0, 0, self.x_start_spin)
-        self.scan_table.setCellWidget(0, 1, self.y_start_spin)
-        self.scan_table.setCellWidget(1, 0, self.x_end_spin)
-        self.scan_table.setCellWidget(1, 1, self.y_end_spin)
-        self.scan_table.setCellWidget(2, 0, self.x_pts_spin)
-        self.scan_table.setCellWidget(2, 1, self.y_pts_spin)
-        self.scan_table.setCellWidget(3, 0, self.pixel_x_spin)
-        self.scan_table.setCellWidget(3, 1, self.pixel_y_spin)
-
         self.x_start_spin.valueChanged.connect(self.recalc_pixel_x)
         self.x_end_spin.valueChanged.connect(self.recalc_pixel_x)
         self.x_pts_spin.valueChanged.connect(self.recalc_pixel_x)
@@ -652,26 +643,51 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
         self.pixel_x_spin.valueChanged.connect(self.recalc_pts_x)
         self.pixel_y_spin.valueChanged.connect(self.recalc_pts_y)
 
-        self.scan_table.setStyleSheet("""
-            QTableWidget {
-                background-color: #ffffff;
-                gridline-color: #e2e8f0;
-                border: 1px solid #e2e8f0;
-            }
-            QHeaderView::section {
-                background-color: #f1f5f9;
-                border: 1px solid #e2e8f0;
-                font-weight: bold;
-            }
-        """)
-        scan_layout.addWidget(self.scan_table)
+        # Header labels
+        lbl_hdr_x = QtWidgets.QLabel("X")
+        lbl_hdr_x.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        lbl_hdr_x.setStyleSheet("font-weight: bold; color: #000000;")
+        lbl_hdr_y = QtWidgets.QLabel("Y")
+        lbl_hdr_y.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        lbl_hdr_y.setStyleSheet("font-weight: bold; color: #000000;")
 
-        meas_box = QtWidgets.QGroupBox("[ Measurement Controls ]")
+        scan_layout.addWidget(lbl_hdr_x, 0, 1)
+        scan_layout.addWidget(lbl_hdr_y, 0, 2)
+
+        # Start Row
+        lbl_start = QtWidgets.QLabel("Start")
+        lbl_start.setStyleSheet("font-weight: bold; color: #000000;")
+        scan_layout.addWidget(lbl_start, 1, 0)
+        scan_layout.addWidget(self.x_start_spin, 1, 1)
+        scan_layout.addWidget(self.y_start_spin, 1, 2)
+
+        # End Row
+        lbl_end = QtWidgets.QLabel("End")
+        lbl_end.setStyleSheet("font-weight: bold; color: #000000;")
+        scan_layout.addWidget(lbl_end, 2, 0)
+        scan_layout.addWidget(self.x_end_spin, 2, 1)
+        scan_layout.addWidget(self.y_end_spin, 2, 2)
+
+        # No. points Row
+        lbl_pts = QtWidgets.QLabel("No. points")
+        lbl_pts.setStyleSheet("font-weight: bold; color: #000000;")
+        scan_layout.addWidget(lbl_pts, 3, 0)
+        scan_layout.addWidget(self.x_pts_spin, 3, 1)
+        scan_layout.addWidget(self.y_pts_spin, 3, 2)
+
+        # Pixel size Row
+        lbl_pixel = QtWidgets.QLabel("Pixel size")
+        lbl_pixel.setStyleSheet("font-weight: bold; color: #000000;")
+        scan_layout.addWidget(lbl_pixel, 4, 0)
+        scan_layout.addWidget(self.pixel_x_spin, 4, 1)
+        scan_layout.addWidget(self.pixel_y_spin, 4, 2)
+
+        meas_box = QtWidgets.QGroupBox("Measurement Controls")
         meas_layout = QtWidgets.QVBoxLayout(meas_box)
         meas_layout.setSpacing(6)
         
         ctrl_layout = QtWidgets.QHBoxLayout()
-        self.btn_begin = QtWidgets.QPushButton("⚡ Begin Sweep")
+        self.btn_begin = QtWidgets.QPushButton("▶ Begin Sweep")
         self.btn_begin.setStyleSheet("background-color: #10b981; color: white; font-weight: bold; border: 1px solid #10b981;")
         self.btn_begin.clicked.connect(self.begin_sweep)
         ctrl_layout.addWidget(self.btn_begin)
@@ -690,7 +706,7 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
         btn_layout2.addWidget(self.btn_reset)
 
         self.btn_save = QtWidgets.QPushButton("💾 Save Dataset")
-        self.btn_save.setStyleSheet("background-color: #3b82f6; color: white; font-weight: bold; border: 1px solid #3b82f6;")
+        self.btn_save.setStyleSheet("background-color: #555555; color: white; font-weight: bold; border-radius: 0px;")
         self.btn_save.setEnabled(False)
         self.btn_save.clicked.connect(self.save_data)
         btn_layout2.addWidget(self.btn_save)
@@ -702,26 +718,27 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
         meas_layout.addWidget(self.progress_bar)
 
         self.lbl_expected_end = QtWidgets.QLabel("Expected End: --:--:--")
-        self.lbl_expected_end.setStyleSheet("font-family: Consolas, monospace; font-size: 13px; font-weight: bold; color: #1e293b;")
+        self.lbl_expected_end.setStyleSheet("font-family: Consolas, monospace; font-size: 13px; font-weight: bold; color: #000000;")
         meas_layout.addWidget(self.lbl_expected_end)
 
         self.lbl_status = QtWidgets.QLabel("Status: Idle")
-        self.lbl_status.setStyleSheet("color: #4f46e5; font-style: italic; font-weight: bold;")
+        self.lbl_status.setStyleSheet("color: #000000; font-style: italic; font-weight: bold;")
         meas_layout.addWidget(self.lbl_status)
 
-        self.lbl_current_b = QtWidgets.QLabel("B = --‑‑ T")
-        self.lbl_current_b.setStyleSheet("color: #1e293b; font-weight: bold;")
-        meas_layout.addWidget(self.lbl_current_b)
-
-        self.lbl_target_vc1 = QtWidgets.QLabel("Vc1 = --‑‑ V")
-        self.lbl_target_vc1.setStyleSheet("color: #1e293b; font-weight: bold;")
+        self.lbl_target_vc1 = QtWidgets.QLabel("V1 = --‑‑ V")
+        self.lbl_target_vc1.setStyleSheet("color: #000000; font-weight: bold;")
         meas_layout.addWidget(self.lbl_target_vc1)
 
-        self.lbl_target_vc2 = QtWidgets.QLabel("Vc2 = --‑‑ V")
-        self.lbl_target_vc2.setStyleSheet("color: #1e293b; font-weight: bold;")
+        self.lbl_target_vc2 = QtWidgets.QLabel("V2 = --‑‑ V")
+        self.lbl_target_vc2.setStyleSheet("color: #000000; font-weight: bold;")
         meas_layout.addWidget(self.lbl_target_vc2)
 
+        self.lbl_current_b = QtWidgets.QLabel("B = --‑‑ T")
+        self.lbl_current_b.setStyleSheet("color: #000000; font-weight: bold;")
+        meas_layout.addWidget(self.lbl_current_b)
+
         left_layout.addWidget(meas_box)
+        left_layout.addStretch(1)
 
         # ----- Right side – Header layout + 3-panel plot layout -----
         right_widget = QtWidgets.QWidget()
@@ -761,9 +778,9 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
         grid_layout.setSpacing(8)
         right_layout.addWidget(grid_widget)
 
-        self.map_plot = pg.PlotWidget(viewBox=EnhancedViewBox(), title="A: XY Map (Power)")
-        self.slice_y_plot = pg.PlotWidget(viewBox=EnhancedViewBox(), title="B: Slice at fixed X")
-        self.slice_x_plot = pg.PlotWidget(viewBox=EnhancedViewBox(), title="C: Slice at fixed Y")
+        self.map_plot = pg.PlotWidget(viewBox=EnhancedViewBox(), title="XY Map (Power)")
+        self.slice_y_plot = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Vertical Slice")
+        self.slice_x_plot = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Horizontal Slice")
 
         grid_layout.addWidget(self.map_plot, 0, 0)
         grid_layout.addWidget(self.slice_y_plot, 0, 1)
@@ -773,6 +790,14 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
         grid_layout.setRowStretch(1, 1)
         grid_layout.setColumnStretch(0, 1)
         grid_layout.setColumnStretch(1, 1)
+
+        # Apply unified styling (white background and slate axes)
+        for p in [self.map_plot, self.slice_y_plot, self.slice_x_plot]:
+            p.setBackground('w')
+            p.getAxis('left').setPen(pg.mkPen('#334155'))
+            p.getAxis('bottom').setPen(pg.mkPen('#334155'))
+            p.getAxis('left').setTextPen(pg.mkPen('#334155'))
+            p.getAxis('bottom').setTextPen(pg.mkPen('#334155'))
 
         # Setup Image and curves
         self.map_img = pg.ImageItem()
@@ -790,16 +815,25 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
         self.slice_x_plot.getViewBox().setMouseEnabled(x=True, y=True)
 
         # Draggable crosshair lines in Plot A
-        self.cross_v = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen('#e11d48', width=1.5, style=QtCore.Qt.PenStyle.DashLine))
-        self.cross_h = pg.InfiniteLine(angle=0, movable=True, pen=pg.mkPen('#e11d48', width=1.5, style=QtCore.Qt.PenStyle.DashLine))
+        self.cross_v = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen('#4f46e5', width=2))
+        self.cross_h = pg.InfiniteLine(angle=0, movable=True, pen=pg.mkPen('#4f46e5', width=2))
         self.map_plot.addItem(self.cross_v)
         self.map_plot.addItem(self.cross_h)
 
         self.cross_v.sigPositionChanged.connect(self.on_crosshair_moved)
         self.cross_h.sigPositionChanged.connect(self.on_crosshair_moved)
 
-        # Connect mouse clicks on Map Plot to reposition crosshairs
-        self.map_plot.scene().sigMouseClicked.connect(self.on_map_clicked)
+        # Monkey-patch ViewBox to intercept left clicks and reposition crosshair lines
+        viewbox_map = self.map_plot.getViewBox()
+        viewbox_map.originalMouseClickEvent = viewbox_map.mouseClickEvent
+        def map_click_event(ev):
+            if ev.button() == QtCore.Qt.MouseButton.LeftButton:
+                mouse_point = viewbox_map.mapSceneToView(ev.scenePos())
+                self.update_crosshair_values(mouse_point.x(), mouse_point.y())
+                ev.accept()
+            else:
+                viewbox_map.originalMouseClickEvent(ev)
+        viewbox_map.mouseClickEvent = map_click_event
 
         # Load values to spinboxes and combos
         self.load_storage()
@@ -821,24 +855,21 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
         
         hist.layout.setColumnFixedWidth(0, 12)
         hist.layout.setColumnFixedWidth(1, 45)
-        hist.layout.setColumnFixedWidth(2, 35)
         
         hist.gradient.setMinimumWidth(0)
         hist.gradient.setMaximumWidth(12)
         hist.vb.setMinimumWidth(0)
         hist.vb.setMaximumWidth(45)
-        hist.axis.setMinimumWidth(0)
-        hist.axis.setMaximumWidth(35)
         
-        hist.setMinimumWidth(92)
-        hist.setMaximumWidth(100)
+        # Allow the axis and the overall widget to grow dynamically to fit any text length
+        hist.setMinimumWidth(80)
         
         if not interactive:
             hist.region.setMovable(False)
             for line in hist.region.lines:
                 line.setMovable(False)
             hist.gradient.setEnabled(False)
-            hist.vb.setMouseEnabled(x=False, y=False)
+            hist.vb.setMouseEnabled(x=False, y=True)
             
         pi = plot_win.getPlotItem()
         pi.layout.removeItem(pi.titleLabel)
@@ -890,15 +921,7 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
             elif target_axes == 'y':
                 self.slice_x_plot.enableAutoRange(axis='y', enable=True)
 
-    def on_map_clicked(self, event):
-        if event.button() == QtCore.Qt.MouseButton.LeftButton:
-            pos = event.scenePos()
-            mouse_point = self.map_plot.getViewBox().mapSceneToView(pos)
-            if self.x_coords is not None and self.y_coords is not None:
-                x_min, x_max = min(self.x_coords), max(self.x_coords)
-                y_min, y_max = min(self.y_coords), max(self.y_coords)
-                if x_min <= mouse_point.x() <= x_max and y_min <= mouse_point.y() <= y_max:
-                    self.update_crosshair_values(mouse_point.x(), mouse_point.y())
+
 
     def update_crosshair_values(self, x_val, y_val):
         self.cross_v.blockSignals(True)
@@ -950,6 +973,7 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
         else:
             self.pixel_x_spin.setValue(0.0)
         self.pixel_x_spin.blockSignals(False)
+        self.on_sweep_range_changed()
 
     def recalc_pixel_y(self):
         start = self.y_start_spin.value()
@@ -961,6 +985,7 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
         else:
             self.pixel_y_spin.setValue(0.0)
         self.pixel_y_spin.blockSignals(False)
+        self.on_sweep_range_changed()
 
     def recalc_pts_x(self):
         start = self.x_start_spin.value()
@@ -971,6 +996,7 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
             pts = int(round(abs(end - start) / pixel)) + 1
             self.x_pts_spin.setValue(max(1, pts))
         self.x_pts_spin.blockSignals(False)
+        self.on_sweep_range_changed()
 
     def recalc_pts_y(self):
         start = self.y_start_spin.value()
@@ -981,6 +1007,7 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
             pts = int(round(abs(end - start) / pixel)) + 1
             self.y_pts_spin.setValue(max(1, pts))
         self.y_pts_spin.blockSignals(False)
+        self.on_sweep_range_changed()
 
     # --- Live status label updates ---
     def update_live_labels(self, b_val, v1_val, v2_val):
@@ -1206,10 +1233,7 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
         else:
             self.lbl_expected_end.setText("Expected End: --:--:--")
 
-        # Trigger autosave halfway/end if requested
-        if cnt >= total // 2 and not self._autosaved_this_run:
-            self.trigger_autosave(was_interrupted=True)
-            self._autosaved_this_run = True
+
 
     def _on_sweep_finished(self):
         if getattr(self, "was_aborted", False):
@@ -1246,6 +1270,7 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
         self.update_map_plot()
         self.set_inputs_enabled(True)
         QtCore.QTimer.singleShot(500, self.resume_status_worker)
+        QtWidgets.QMessageBox.information(self, "Sweep Complete", "Scalar map sweep finished successfully!")
 
     def _on_sweep_error(self, msg):
         if getattr(self, "was_aborted", False):
@@ -1288,6 +1313,26 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
                 max_v += 1e-9
             self.map_colorbar.setLevels(min_v, max_v)
 
+    def update_coordinates_from_ui(self):
+        """Build coordinates and grids from UI control values."""
+        x_start = self.x_start_spin.value()
+        x_end = self.x_end_spin.value()
+        x_pts = self.x_pts_spin.value()
+
+        y_start = self.y_start_spin.value()
+        y_end = self.y_end_spin.value()
+        y_pts = self.y_pts_spin.value()
+
+        self.x_coords = np.linspace(x_start, x_end, x_pts) if x_pts > 1 else np.array([x_start])
+        self.y_coords = np.linspace(y_start, y_end, y_pts) if y_pts > 1 else np.array([y_start])
+
+    def on_sweep_range_changed(self):
+        """Called dynamically when sweep parameters are changed in the UI."""
+        if not self.is_running:
+            self.update_coordinates_from_ui()
+            self.reset_plot_bounds()
+            self.save_storage()
+
     def reset_plot_bounds(self):
         if self.x_coords is None or self.y_coords is None:
             return
@@ -1326,10 +1371,11 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
     # --- Save / AutoSave ---
     def trigger_autosave(self, was_interrupted=False):
         try:
-            data_dir = os.path.join(parent_dir, "data")
-            os.makedirs(data_dir, exist_ok=True)
+            autosave_dir = os.path.join(parent_dir, "data", "autosave")
+            os.makedirs(autosave_dir, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
             suffix = "_interrupted" if was_interrupted else ""
-            auto_path = os.path.join(data_dir, f"scalar_map_autosave{suffix}.h5")
+            auto_path = os.path.join(autosave_dir, f"autosave_scalar_map_{timestamp}{suffix}.h5")
             self.save_data(file_path=auto_path)
         except Exception as e:
             print(f"ScalarMapWindow Autosave failed: {e}")
@@ -1388,6 +1434,81 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
         except Exception as e:
             if file_path is None:
                 QtWidgets.QMessageBox.critical(self, "Save error", str(e))
+
+    def apply_theme(self):
+        """Premium light theme styling matching Single Spectra (rectangular, strict monochromatic white/grey/black, no blue tint)"""
+        qss = """
+        QMainWindow, QWidget {
+            background-color: #ffffff;
+            color: #000000;
+        }
+        QGroupBox {
+            background-color: #ffffff;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            margin-top: 2.5ex;
+            color: #000000;
+            font-weight: bold;
+            font-size: 13px;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            subcontrol-position: top left;
+            left: 10px;
+            padding: 0 5px;
+            background-color: transparent;
+        }
+        QLabel {
+            color: #000000;
+            font-size: 12px;
+            background-color: transparent;
+        }
+        QPushButton {
+            background-color: #ffffff;
+            color: #000000;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            padding: 8px 16px;
+            font-weight: bold;
+            font-size: 12px;
+        }
+        QPushButton:hover {
+            background-color: #eeeeee;
+            border-color: #999999;
+        }
+        QPushButton:pressed {
+            background-color: #dddddd;
+        }
+        QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
+            background-color: #ffffff;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            color: #000000;
+            padding: 5px;
+            font-family: Consolas, monospace;
+            font-size: 12px;
+        }
+        QComboBox::drop-down {
+            border: none;
+        }
+        QProgressBar {
+            background-color: #eeeeee;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            text-align: center;
+            color: #000000;
+            font-weight: bold;
+            height: 18px;
+        }
+        QProgressBar::chunk {
+            background-color: #333333;
+            border-radius: 0px;
+        }
+        QCheckBox {
+            background-color: transparent;
+        }
+        """
+        self.setStyleSheet(qss)
 
     # --- Value Storage Persistence ---
     def load_storage(self):
@@ -1505,7 +1626,7 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
     def set_inputs_enabled(self, enabled: bool):
         self.x_param_cb.setEnabled(enabled)
         self.y_param_cb.setEnabled(enabled)
-        self.scan_table.setEnabled(enabled)
+        self.scan_group.setEnabled(enabled)
 
     def centralWidget(self):
         return self

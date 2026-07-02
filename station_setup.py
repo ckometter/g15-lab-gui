@@ -29,8 +29,8 @@ from drivers.oxford_magnet import OxfordMagnet
 from drivers.thorlabs_pm100d import ThorlabsPM100D
 
 # Spectrometer configuration switch
-# Options: 'lightfieldG15', 'wingspecG15', 'lightfieldG11'
-SPECTROMETER_TYPE = 'wingspecG15'
+# Options: 'lightfieldG15', 'wingspecG15', 'lightfieldG11', 'winspecG11'
+SPECTROMETER_TYPE = 'winspecG15'
 
 
 # Configuration details for each spectrometer
@@ -49,6 +49,11 @@ SPECTROMETER_CONFIGS = {
         'server_ip': "10.236.10.143",  # this is the Nirvana computer --- might need to update if device PC reboots
         'port': 65432,
         'pyro_uri': None
+    },
+    'winspecG11': {
+        'server_ip': None,
+        'port': None,
+        'pyro_uri': "PYRO:winspecServer@bluefors-pc.dhcp-int.phys.ethz.ch:9090"
     }
 }
 
@@ -56,14 +61,14 @@ SPECTROMETER_CONFIGS = {
 simulated_devices = {
     'smu': False,
     'monochromator': False,
-    'rotator1': False,
+    'rotator1': True,
     'rotator2': True,
     'rotator3': True,
     'camera': False,
     'piezo150': True,
-    'piezo300': True,
+    'piezo300': False,
     'magnet': True,
-    'powermeter': False
+    'powermeter': True
 }
 
 def initialize_station(simulated: bool = False, simulated_devices: dict = None, db_path: str = "my_measurement_data.db", spectrometer_type: str = SPECTROMETER_TYPE) -> qc.Station:
@@ -101,14 +106,20 @@ def initialize_station(simulated: bool = False, simulated_devices: dict = None, 
     station.add_component(smu)
 
     # Retrieve configuration for selected spectrometer
-    spec_cfg = SPECTROMETER_CONFIGS.get(spectrometer_type, SPECTROMETER_CONFIGS['lightfieldG15'])
+    resolved_type = spectrometer_type
+    if resolved_type == 'wingspecG11':
+        resolved_type = 'winspecG11'
+    elif resolved_type == 'winspecG15':
+        resolved_type = 'wingspecG15'
+
+    spec_cfg = SPECTROMETER_CONFIGS.get(resolved_type, SPECTROMETER_CONFIGS['lightfieldG15'])
     spec_ip = spec_cfg.get('server_ip') or 'G15-Pylon.dhcp-int.phys.ethz.ch'
     spec_port = spec_cfg.get('port') or 50920
     spec_uri = spec_cfg.get('pyro_uri')
 
     # 2. Add Acton SpectraPro 750 Monochromator (Strictly Physical Remote Connection)
     from drivers.remote_client import ClientLightFieldMonochromator
-    monochromator = ClientLightFieldMonochromator('monochromator', server_ip=spec_ip, port=spec_port, pyro_uri=spec_uri, spectrometer_type=spectrometer_type)
+    monochromator = ClientLightFieldMonochromator('monochromator', server_ip=spec_ip, port=spec_port, pyro_uri=spec_uri, spectrometer_type=resolved_type)
     station.add_component(monochromator)
 
     # 3. Add Thorlabs ELL14 Rotators
@@ -150,7 +161,7 @@ def initialize_station(simulated: bool = False, simulated_devices: dict = None, 
 
     # 4. Add Princeton Pylon CCD Camera (Strictly Physical Remote Connection)
     from drivers.remote_client import ClientLightFieldCamera
-    camera = ClientLightFieldCamera('camera', server_ip=spec_ip, port=spec_port, pyro_uri=spec_uri, spectrometer_type=spectrometer_type)
+    camera = ClientLightFieldCamera('camera', server_ip=spec_ip, port=spec_port, pyro_uri=spec_uri, spectrometer_type=resolved_type)
     station.add_component(camera)
 
     # 5. Add Attocube ANC150 (adjustment-only stage)
@@ -189,13 +200,43 @@ def initialize_station(simulated: bool = False, simulated_devices: dict = None, 
 
     # 8. Add Thorlabs PM100D Powermeter
     if not should_simulate('powermeter'):
+        powermeter = None
+        pm_addr = None
         try:
-            pm_addr = 'USB0::0x1313::0x8078::P0013460::INSTR'
-            powermeter = ThorlabsPM100D('powermeter', address=pm_addr)
+            import pyvisa
+            rm = pyvisa.ResourceManager()
+            resources = rm.list_resources()
+            # Search for USB resources containing Thorlabs Vendor ID '1313'
+            pm_addresses = [r for r in resources if '1313' in r and 'USB' in r]
+            if pm_addresses:
+                pm_addr = pm_addresses[0]
+                print(f"Auto-detected Thorlabs powermeter at VISA resource: {pm_addr}")
+                try:
+                    powermeter = ThorlabsPM100D('powermeter', address=pm_addr)
+                except Exception as e:
+                    import traceback; traceback.print_exc()
+                    print(f"Error: Could not connect to physical Thorlabs PM100D at {pm_addr}: {e}")
+                    if "VI_ERROR_NCIC" in str(e):
+                        print("\n" + "="*80)
+                        print("CRITICAL: VISA Resource Lock Error (VI_ERROR_NCIC) detected!")
+                        print("This typically happens if a previous Python session crashed or another program has locked the connection.")
+                        print("SOLUTION: Please UNPLUG the USB cable from the Thorlabs PM100, wait 3 seconds, and plug it back in.")
+                        print("="*80 + "\n")
+            else:
+                print("No Thorlabs powermeter detected on USB ports.")
         except Exception as e:
-            import traceback; traceback.print_exc()
-            print(f"Warning: Could not connect to physical Thorlabs PM100D at {pm_addr} ({e}). Falling back to simulation.")
-            powermeter = ThorlabsPM100D('powermeter', address='simulated')
+            print(f"Warning: Error during dynamic VISA lookup for Thorlabs powermeter: {e}")
+
+        if powermeter is None:
+            # Fallback to hardcoded address if dynamic discovery failed but we want physical
+            fallback_addr = 'USB0::0x1313::0x8078::P0013460::0::INSTR'
+            print(f"Attempting connection to physical fallback address: {fallback_addr}")
+            try:
+                powermeter = ThorlabsPM100D('powermeter', address=fallback_addr)
+            except Exception as e:
+                print(f"Warning: Could not connect to fallback physical address {fallback_addr} ({e}).")
+                print("Falling back to simulated Thorlabs PM100D powermeter.")
+                powermeter = ThorlabsPM100D('powermeter', address='simulated')
     else:
         powermeter = ThorlabsPM100D('powermeter', address='simulated')
     station.add_component(powermeter)

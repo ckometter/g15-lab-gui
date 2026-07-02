@@ -181,9 +181,12 @@ class PLMapWorker(QtCore.QThread):
     def set_piezo(self, axis, val):
         try:
             if hasattr(self.station, 'piezo300'):
-                param = getattr(self.station.piezo300, f'voltage_ch{axis}', None)
-                if param:
-                    param(val)
+                if hasattr(self.station.piezo300, 'set_voltage'):
+                    self.station.piezo300.set_voltage(axis, val)
+                else:
+                    param = getattr(self.station.piezo300, f'voltage_ch{axis}', None)
+                    if param:
+                        param(val)
         except Exception as e:
             print(f"Error setting ANC300 axis {axis}: {e}")
 
@@ -637,11 +640,15 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         super().__init__()
         self.station = station
         self.embed = embed
+        self.reset_slice_levels = True
         
         # Data containers
         self.x_coords = None
         self.y_coords = None
-        self.wavelengths = None
+        try:
+            self.wavelengths = self.station.camera.wavelengths()
+        except Exception:
+            self.wavelengths = np.linspace(500, 600, 512)
         self.data_spectra = None
         self.data_measured_v1 = None
         self.data_measured_v2 = None
@@ -651,6 +658,7 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         self.data_measured_mask = None
         
         self._init_ui()
+        self.apply_theme()
         self.is_running = False
         self.is_paused = False
         self.was_aborted = False
@@ -667,6 +675,11 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         
         # Load persistent configuration
         self.load_storage()
+        self.update_coordinates_from_ui()
+        self.reset_plot_bounds()
+        x_center = (self.x_coords[0] + self.x_coords[-1]) / 2.0
+        y_center = (self.y_coords[0] + self.y_coords[-1]) / 2.0
+        self.update_crosshair_values(x_center, y_center)
 
         # Start background 5 Hz status polling worker
         self.live_status_worker = LiveStatusWorker(self.station, parent=self)
@@ -699,17 +712,11 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         param_layout.addRow("X parameter", self.x_param_cb)
         param_layout.addRow("Y parameter", self.y_param_cb)
 
-        # Scan area QTableWidget layout
-        scan_group = QtWidgets.QGroupBox("Scan area")
-        scan_layout = QtWidgets.QVBoxLayout(scan_group)
-        left_layout.addWidget(scan_group)
-
-        self.scan_table = QtWidgets.QTableWidget(4, 2)
-        self.scan_table.setHorizontalHeaderLabels(["X", "Y"])
-        self.scan_table.setVerticalHeaderLabels(["Start", "End", "No. points", "Pixel size"])
-        self.scan_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self.scan_table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self.scan_table.setMinimumHeight(160)
+        self.scan_group = QtWidgets.QGroupBox("Scan area")
+        scan_layout = QtWidgets.QGridLayout(self.scan_group)
+        scan_layout.setContentsMargins(12, 12, 12, 12)
+        scan_layout.setSpacing(8)
+        left_layout.addWidget(self.scan_group)
 
         self.x_start_spin = QtWidgets.QDoubleSpinBox(); self.x_start_spin.setRange(-1e6, 1e6); self.x_start_spin.setDecimals(3)
         self.x_end_spin   = QtWidgets.QDoubleSpinBox(); self.x_end_spin.setRange(-1e6, 1e6);   self.x_end_spin.setDecimals(3)
@@ -721,42 +728,56 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         self.pixel_x_spin = QtWidgets.QDoubleSpinBox(); self.pixel_x_spin.setRange(0, 1e6);     self.pixel_x_spin.setDecimals(3)
         self.pixel_y_spin = QtWidgets.QDoubleSpinBox(); self.pixel_y_spin.setRange(0, 1e6);     self.pixel_y_spin.setDecimals(3)
 
-        self.scan_table.setCellWidget(0, 0, self.x_start_spin)
-        self.scan_table.setCellWidget(0, 1, self.y_start_spin)
-        self.scan_table.setCellWidget(1, 0, self.x_end_spin)
-        self.scan_table.setCellWidget(1, 1, self.y_end_spin)
-        self.scan_table.setCellWidget(2, 0, self.x_pts_spin)
-        self.scan_table.setCellWidget(2, 1, self.y_pts_spin)
-        self.scan_table.setCellWidget(3, 0, self.pixel_x_spin)
-        self.scan_table.setCellWidget(3, 1, self.pixel_y_spin)
-
-        # Wire up pixel size <-> no. points calculations
         self.x_start_spin.valueChanged.connect(self.recalc_pixel_x)
         self.x_end_spin.valueChanged.connect(self.recalc_pixel_x)
         self.x_pts_spin.valueChanged.connect(self.recalc_pixel_x)
         self.y_start_spin.valueChanged.connect(self.recalc_pixel_y)
         self.y_end_spin.valueChanged.connect(self.recalc_pixel_y)
         self.y_pts_spin.valueChanged.connect(self.recalc_pixel_y)
-        
         self.pixel_x_spin.valueChanged.connect(self.recalc_pts_x)
         self.pixel_y_spin.valueChanged.connect(self.recalc_pts_y)
 
-        self.scan_table.setStyleSheet("""
-            QTableWidget {
-                background-color: #ffffff;
-                gridline-color: #e2e8f0;
-                border: 1px solid #e2e8f0;
-            }
-            QHeaderView::section {
-                background-color: #f1f5f9;
-                border: 1px solid #e2e8f0;
-                font-weight: bold;
-            }
-        """)
-        scan_layout.addWidget(self.scan_table)
+        # Header labels
+        lbl_hdr_x = QtWidgets.QLabel("X")
+        lbl_hdr_x.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        lbl_hdr_x.setStyleSheet("font-weight: bold; color: #000000;")
+        lbl_hdr_y = QtWidgets.QLabel("Y")
+        lbl_hdr_y.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        lbl_hdr_y.setStyleSheet("font-weight: bold; color: #000000;")
+
+        scan_layout.addWidget(lbl_hdr_x, 0, 1)
+        scan_layout.addWidget(lbl_hdr_y, 0, 2)
+
+        # Start Row
+        lbl_start = QtWidgets.QLabel("Start")
+        lbl_start.setStyleSheet("font-weight: bold; color: #000000;")
+        scan_layout.addWidget(lbl_start, 1, 0)
+        scan_layout.addWidget(self.x_start_spin, 1, 1)
+        scan_layout.addWidget(self.y_start_spin, 1, 2)
+
+        # End Row
+        lbl_end = QtWidgets.QLabel("End")
+        lbl_end.setStyleSheet("font-weight: bold; color: #000000;")
+        scan_layout.addWidget(lbl_end, 2, 0)
+        scan_layout.addWidget(self.x_end_spin, 2, 1)
+        scan_layout.addWidget(self.y_end_spin, 2, 2)
+
+        # No. points Row
+        lbl_pts = QtWidgets.QLabel("No. points")
+        lbl_pts.setStyleSheet("font-weight: bold; color: #000000;")
+        scan_layout.addWidget(lbl_pts, 3, 0)
+        scan_layout.addWidget(self.x_pts_spin, 3, 1)
+        scan_layout.addWidget(self.y_pts_spin, 3, 2)
+
+        # Pixel size Row
+        lbl_pixel = QtWidgets.QLabel("Pixel size")
+        lbl_pixel.setStyleSheet("font-weight: bold; color: #000000;")
+        scan_layout.addWidget(lbl_pixel, 4, 0)
+        scan_layout.addWidget(self.pixel_x_spin, 4, 1)
+        scan_layout.addWidget(self.pixel_y_spin, 4, 2)
 
         # Measurement Control Box (matching Dual_gate_sweep_gui.py / B_V_sweep_gui.py style)
-        meas_box = QtWidgets.QGroupBox("[ Measurement Controls ]")
+        meas_box = QtWidgets.QGroupBox("Measurement Controls")
         meas_layout = QtWidgets.QVBoxLayout(meas_box)
         meas_layout.setSpacing(6)
         
@@ -782,7 +803,7 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         btn_layout2.addWidget(self.btn_reset)
 
         self.btn_save = QtWidgets.QPushButton("💾 Save Dataset")
-        self.btn_save.setStyleSheet("background-color: #3b82f6; color: white; font-weight: bold; border: 1px solid #3b82f6;")
+        self.btn_save.setStyleSheet("background-color: #555555; color: white; font-weight: bold; border-radius: 0px;")
         self.btn_save.setEnabled(False)
         self.btn_save.clicked.connect(self.save_data)
         btn_layout2.addWidget(self.btn_save)
@@ -795,26 +816,27 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         meas_layout.addWidget(self.progress_bar)
 
         self.lbl_expected_end = QtWidgets.QLabel("Expected End: --:--:--")
-        self.lbl_expected_end.setStyleSheet("font-family: Consolas, monospace; font-size: 13px; font-weight: bold; color: #1e293b;")
+        self.lbl_expected_end.setStyleSheet("font-family: Consolas, monospace; font-size: 13px; font-weight: bold; color: #000000;")
         meas_layout.addWidget(self.lbl_expected_end)
 
         self.lbl_status = QtWidgets.QLabel("Status: Idle")
-        self.lbl_status.setStyleSheet("color: #4f46e5; font-style: italic; font-weight: bold;")
+        self.lbl_status.setStyleSheet("color: #000000; font-style: italic; font-weight: bold;")
         meas_layout.addWidget(self.lbl_status)
 
-        self.lbl_current_b = QtWidgets.QLabel("B = --‑‑ T")
-        self.lbl_current_b.setStyleSheet("color: #1e293b; font-weight: bold;")
-        meas_layout.addWidget(self.lbl_current_b)
-
-        self.lbl_target_vc1 = QtWidgets.QLabel("Vc1 = --‑‑ V")
-        self.lbl_target_vc1.setStyleSheet("color: #1e293b; font-weight: bold;")
+        self.lbl_target_vc1 = QtWidgets.QLabel("V1 = --‑‑ V")
+        self.lbl_target_vc1.setStyleSheet("color: #000000; font-weight: bold;")
         meas_layout.addWidget(self.lbl_target_vc1)
 
-        self.lbl_target_vc2 = QtWidgets.QLabel("Vc2 = --‑‑ V")
-        self.lbl_target_vc2.setStyleSheet("color: #1e293b; font-weight: bold;")
+        self.lbl_target_vc2 = QtWidgets.QLabel("V2 = --‑‑ V")
+        self.lbl_target_vc2.setStyleSheet("color: #000000; font-weight: bold;")
         meas_layout.addWidget(self.lbl_target_vc2)
 
+        self.lbl_current_b = QtWidgets.QLabel("B = --‑‑ T")
+        self.lbl_current_b.setStyleSheet("color: #000000; font-weight: bold;")
+        meas_layout.addWidget(self.lbl_current_b)
+
         left_layout.addWidget(meas_box)
+        left_layout.addStretch(1)
 
         # ----- Right side – Header layout + 4-panel plot layout -----
         right_widget = QtWidgets.QWidget()
@@ -858,7 +880,7 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         right_layout.addWidget(grid_widget)
 
         # Panel A: X vs Y heatmap (Top Left)
-        self.map_plot = pg.PlotWidget(viewBox=EnhancedViewBox(), title="A: X‑Y Map (Integrated Counts)")
+        self.map_plot = pg.PlotWidget(viewBox=EnhancedViewBox(), title="2D Map (Integrated Counts)")
         self.map_plot.getViewBox().setMouseEnabled(x=True, y=True)
         self.map_img = pg.ImageItem()
         self.map_img.setOpts(axisOrder='row-major')
@@ -890,7 +912,7 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         viewbox_map.mouseClickEvent = map_click_event
 
         # Panel B: Y vs Energy (Top Right)
-        self.wl_vs_y_plot = pg.PlotWidget(viewBox=EnhancedViewBox(), title="B: Y vs Energy")
+        self.wl_vs_y_plot = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Vertical Slice spectra")
         self.wl_vs_y_plot.getViewBox().setMouseEnabled(x=True, y=True)
         self.wl_vs_y_img = pg.ImageItem()
         self.wl_vs_y_img.setOpts(axisOrder='row-major')
@@ -901,7 +923,7 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         self.wl_vs_y_colorbar = self.setup_histogram_lut(self.wl_vs_y_plot, self.wl_vs_y_img, interactive=True)
 
         # Panel C: X vs Energy (Bottom Left)
-        self.wl_vs_x_plot = pg.PlotWidget(viewBox=EnhancedViewBox(), title="C: X vs Energy")
+        self.wl_vs_x_plot = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Horizontal Slice spectra")
         self.wl_vs_x_plot.getViewBox().setMouseEnabled(x=True, y=True)
         self.wl_vs_x_img = pg.ImageItem()
         self.wl_vs_x_img.setOpts(axisOrder='row-major')
@@ -912,12 +934,20 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         self.wl_vs_x_colorbar = self.setup_histogram_lut(self.wl_vs_x_plot, self.wl_vs_x_img, interactive=True)
 
         # Panel D: Counts vs Energy (Bottom Right)
-        self.spectrum_plot = pg.PlotWidget(viewBox=EnhancedViewBox(), title="D: Counts vs Energy")
+        self.spectrum_plot = pg.PlotWidget(viewBox=EnhancedViewBox(), title="CCD Spectrum at Crosshair")
         self.spectrum_plot.getViewBox().setMouseEnabled(x=True, y=True)
         self.spectrum_curve = self.spectrum_plot.plot(pen=pg.mkPen('#7c3aed', width=2))
         self.spectrum_plot.setLabel('left', 'Counts')
         self.spectrum_plot.setLabel('bottom', 'Energy', units='eV')
         grid_layout.addWidget(self.spectrum_plot, 1, 1)
+
+        # Apply unified styling (white background and slate axes)
+        for p in [self.map_plot, self.wl_vs_y_plot, self.wl_vs_x_plot, self.spectrum_plot]:
+            p.setBackground('w')
+            p.getAxis('left').setPen(pg.mkPen('#334155'))
+            p.getAxis('bottom').setPen(pg.mkPen('#334155'))
+            p.getAxis('left').setTextPen(pg.mkPen('#334155'))
+            p.getAxis('bottom').setTextPen(pg.mkPen('#334155'))
 
         # Vertical integration window region in Panel D
         self.integration_region = pg.LinearRegionItem(
@@ -1027,6 +1057,7 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         self.pixel_x_spin.blockSignals(True)
         self.pixel_x_spin.setValue(val)
         self.pixel_x_spin.blockSignals(False)
+        self.on_sweep_range_changed()
 
     def recalc_pixel_y(self):
         start = self.y_start_spin.value()
@@ -1039,6 +1070,7 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         self.pixel_y_spin.blockSignals(True)
         self.pixel_y_spin.setValue(val)
         self.pixel_y_spin.blockSignals(False)
+        self.on_sweep_range_changed()
 
     def recalc_pts_x(self):
         start = self.x_start_spin.value()
@@ -1050,6 +1082,7 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
             self.x_pts_spin.blockSignals(True)
             self.x_pts_spin.setValue(pts)
             self.x_pts_spin.blockSignals(False)
+            self.on_sweep_range_changed()
 
     def recalc_pts_y(self):
         start = self.y_start_spin.value()
@@ -1061,6 +1094,7 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
             self.y_pts_spin.blockSignals(True)
             self.y_pts_spin.setValue(pts)
             self.y_pts_spin.blockSignals(False)
+            self.on_sweep_range_changed()
 
     def setup_histogram_lut(self, plot_win, image_item, interactive=True):
         """Helper to create a HistogramLUTItem matching the Dual-Gate Sweep style."""
@@ -1080,24 +1114,21 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         
         hist.layout.setColumnFixedWidth(0, 12)
         hist.layout.setColumnFixedWidth(1, 45)
-        hist.layout.setColumnFixedWidth(2, 35)
         
         hist.gradient.setMinimumWidth(0)
         hist.gradient.setMaximumWidth(12)
         hist.vb.setMinimumWidth(0)
         hist.vb.setMaximumWidth(45)
-        hist.axis.setMinimumWidth(0)
-        hist.axis.setMaximumWidth(35)
         
-        hist.setMinimumWidth(92)
-        hist.setMaximumWidth(100)
+        # Allow the axis and the overall widget to grow dynamically to fit any text length
+        hist.setMinimumWidth(80)
         
         if not interactive:
             hist.region.setMovable(False)
             for line in hist.region.lines:
                 line.setMovable(False)
             hist.gradient.setEnabled(False)
-            hist.vb.setMouseEnabled(x=False, y=False)
+            hist.vb.setMouseEnabled(x=False, y=True)
             
         pi = plot_win.getPlotItem()
         pi.layout.removeItem(pi.titleLabel)
@@ -1121,6 +1152,8 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
 
         if self.is_running:
             return
+
+        self.reset_slice_levels = True
             
         # Pause the status worker first to avoid any race conditions during monochromator/camera queries
         self.live_status_worker.pause()
@@ -1405,7 +1438,28 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         self.sweep_worker.error.connect(self._on_sweep_error)
         self.sweep_worker.start()
 
+    def update_coordinates_from_ui(self):
+        """Build coordinates and grids from UI control values."""
+        x_start = self.x_start_spin.value()
+        x_end = self.x_end_spin.value()
+        x_pts = self.x_pts_spin.value()
+
+        y_start = self.y_start_spin.value()
+        y_end = self.y_end_spin.value()
+        y_pts = self.y_pts_spin.value()
+
+        self.x_coords = np.linspace(x_start, x_end, x_pts) if x_pts > 1 else np.array([x_start])
+        self.y_coords = np.linspace(y_start, y_end, y_pts) if y_pts > 1 else np.array([y_start])
+
+    def on_sweep_range_changed(self):
+        """Called dynamically when sweep parameters are changed in the UI."""
+        if not self.is_running:
+            self.update_coordinates_from_ui()
+            self.reset_plot_bounds()
+            self.save_storage()
+
     def reset_plot_bounds(self):
+        self.reset_slice_levels = True
         if self.x_coords is None or self.y_coords is None or self.wavelengths is None:
             return
             
@@ -1670,8 +1724,7 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         self.update_map_plot()
         self.set_inputs_enabled(True)
         QtCore.QTimer.singleShot(500, self.resume_status_worker)
-        
-        # Do not perform continuous autoscale as the toggle button is removed
+        QtWidgets.QMessageBox.information(self, "Sweep Complete", "Vector map sweep finished successfully!")
 
     def _on_sweep_error(self, msg):
         if getattr(self, "was_aborted", False):
@@ -1785,8 +1838,9 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
 
         # 2. Update Panel B: Vertical Slice (Energy vs Y)
         vslice_data = processed_spectra[:, idx_x, :]  # shape: (y_pts, wl_pts)
-        self.wl_vs_y_img.setImage(vslice_data[:, ::-1], autoLevels=True)
-        if vslice_data.size > 0:
+        auto_levels = getattr(self, "reset_slice_levels", True)
+        self.wl_vs_y_img.setImage(vslice_data[:, ::-1], autoLevels=auto_levels)
+        if auto_levels and vslice_data.size > 0:
             min_v, max_v = np.min(vslice_data), np.max(vslice_data)
             if min_v == max_v:
                 max_v += 1.0
@@ -1794,12 +1848,14 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
 
         # 3. Update Panel C: Horizontal Slice (X vs Energy)
         hslice_data = processed_spectra[idx_y, :, ::-1]  # shape: (x_pts, wl_pts)
-        self.wl_vs_x_img.setImage(hslice_data, autoLevels=True)
-        if hslice_data.size > 0:
+        self.wl_vs_x_img.setImage(hslice_data, autoLevels=auto_levels)
+        if auto_levels and hslice_data.size > 0:
             min_h, max_h = np.min(hslice_data), np.max(hslice_data)
             if min_h == max_h:
                 max_h += 1.0
             self.wl_vs_x_colorbar.setLevels(min_h, max_h)
+            
+        self.reset_slice_levels = False
             
         # Do not perform continuous autoscale as the toggle button is removed
 
@@ -1817,7 +1873,7 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
             data_dir = os.path.join(parent_dir, "data")
             os.makedirs(data_dir, exist_ok=True)
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            default_name = f"pl_map_{timestamp}.h5"
+            default_name = f"vector_map_{timestamp}.h5"
             if file_path is None:
                 filename, _ = QtWidgets.QFileDialog.getSaveFileName(
                     self,
@@ -1900,13 +1956,88 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         os.makedirs(autosave_dir, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         suffix = "_interrupted" if was_interrupted else ""
-        filename = f"autosave_pl_map_{timestamp}{suffix}.h5"
+        filename = f"autosave_vector_map_{timestamp}{suffix}.h5"
         file_path = os.path.join(autosave_dir, filename)
         try:
             self.save_data(file_path=file_path)
             self._autosaved_this_run = True
         except Exception as e:
             print(f"Auto-save trigger failed: {e}")
+
+    def apply_theme(self):
+        """Premium light theme styling matching Single Spectra (rectangular, strict monochromatic white/grey/black, no blue tint)"""
+        qss = """
+        QMainWindow, QWidget {
+            background-color: #ffffff;
+            color: #000000;
+        }
+        QGroupBox {
+            background-color: #ffffff;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            margin-top: 2.5ex;
+            color: #000000;
+            font-weight: bold;
+            font-size: 13px;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            subcontrol-position: top left;
+            left: 10px;
+            padding: 0 5px;
+            background-color: transparent;
+        }
+        QLabel {
+            color: #000000;
+            font-size: 12px;
+            background-color: transparent;
+        }
+        QPushButton {
+            background-color: #ffffff;
+            color: #000000;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            padding: 8px 16px;
+            font-weight: bold;
+            font-size: 12px;
+        }
+        QPushButton:hover {
+            background-color: #eeeeee;
+            border-color: #999999;
+        }
+        QPushButton:pressed {
+            background-color: #dddddd;
+        }
+        QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
+            background-color: #ffffff;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            color: #000000;
+            padding: 5px;
+            font-family: Consolas, monospace;
+            font-size: 12px;
+        }
+        QComboBox::drop-down {
+            border: none;
+        }
+        QProgressBar {
+            background-color: #eeeeee;
+            border: 1px solid #cccccc;
+            border-radius: 0px;
+            text-align: center;
+            color: #000000;
+            font-weight: bold;
+            height: 18px;
+        }
+        QProgressBar::chunk {
+            background-color: #333333;
+            border-radius: 0px;
+        }
+        QCheckBox {
+            background-color: transparent;
+        }
+        """
+        self.setStyleSheet(qss)
 
     # --- Value Storage Persistence ---
     def load_storage(self):
@@ -2035,7 +2166,7 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         """Lock or unlock parameter and scan area configuration inputs."""
         self.x_param_cb.setEnabled(enabled)
         self.y_param_cb.setEnabled(enabled)
-        self.scan_table.setEnabled(enabled)
+        self.scan_group.setEnabled(enabled)
 
     def centralWidget(self):
         return self

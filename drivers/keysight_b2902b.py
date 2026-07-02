@@ -10,7 +10,14 @@ class RampedSet:
         self.channel = channel
 
 
-    def _ramp(self, parameter_name: str, target_val: float):
+    def _ramp(self, parameter_name: str, target_val: float, callback=None):
+        self.channel.ramping = True
+        try:
+            self._do_ramp(parameter_name, target_val, callback=callback)
+        finally:
+            self.channel.ramping = False
+
+    def _do_ramp(self, parameter_name: str, target_val: float, callback=None):
         import os
         import json
         import time
@@ -45,6 +52,9 @@ class RampedSet:
         
         if ramp_rate <= 0 or ramp_step <= 0:
             param(target_val)
+            if callback is not None:
+                try: callback(target_val)
+                except Exception: pass
             return
             
         try:
@@ -58,6 +68,9 @@ class RampedSet:
         num_steps = int(abs(dval) / ramp_step)
         if num_steps <= 1:
             param(target_val)
+            if callback is not None:
+                try: callback(target_val)
+                except Exception: pass
             return
             
         dt = ramp_step / ramp_rate
@@ -89,10 +102,16 @@ class RampedSet:
                 fraction = i / num_steps
                 next_val = current_val + dval * fraction
                 param(next_val)
+                if callback is not None:
+                    try: callback(next_val)
+                    except Exception: pass
                 time.sleep(dt)
                 
             if not getattr(self.channel, "ramp_stop_requested", False):
                 param(target_val)
+                if callback is not None:
+                    try: callback(target_val)
+                    except Exception: pass
         finally:
             # Restore the original visa timeout
             if old_timeout is not None and hasattr(smu, "timeout") and not getattr(smu, "simulated", False):
@@ -105,11 +124,11 @@ class RampedSet:
                 except Exception:
                     pass
 
-    def volt(self, target_voltage: float):
-        self._ramp("volt", target_voltage)
+    def volt(self, target_voltage: float, callback=None):
+        self._ramp("volt", target_voltage, callback=callback)
 
-    def curr(self, target_current: float):
-        self._ramp("curr", target_current)
+    def curr(self, target_current: float, callback=None):
+        self._ramp("curr", target_current, callback=callback)
 
 class B2902BChannel(InstrumentChannel):
     """
@@ -119,6 +138,7 @@ class B2902BChannel(InstrumentChannel):
         super().__init__(parent, name)
         self.channel_num = channel_num
         self.simulated = parent.simulated
+        self.ramping = False
         self.set_r = RampedSet(self)
         
         if self.simulated:

@@ -47,11 +47,13 @@ if PhysicalANC300 is not None:
                         for p_name in ['triggerUp', 'triggerDown']:
                             if p_name in ax.parameters:
                                 ax.parameters[p_name].snapshot_get = False
+                                ax.parameters[p_name]._snapshot_get = False
                 for submod in self.submodules.values():
                     if hasattr(submod, 'parameters'):
                         for p_name in ['triggerUp', 'triggerDown']:
                             if p_name in submod.parameters:
                                 submod.parameters[p_name].snapshot_get = False
+                                submod.parameters[p_name]._snapshot_get = False
 
         def _open_resource(self, address: str, visalib: str | None):
             resource, visabackend, resource_manager = super()._open_resource(address, visalib)
