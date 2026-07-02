@@ -8,17 +8,12 @@ import h5py
 from PyQt6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-# Ensure parent directory is in path for importing station_setup
+# Ensure parent directory is in path for importing station_setup and drivers
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
-# Add spectrometers directory to path to import lightfield_qcodes
-spectrometers_dir = os.path.join(parent_dir, "spectrometers")
-if spectrometers_dir not in sys.path:
-    sys.path.insert(0, spectrometers_dir)
-
-from lightfield_qcodes import lf_signal_bridge
+from drivers.lightfield_qcodes import lf_signal_bridge
 from station_setup import initialize_station, simulated_devices
 
 

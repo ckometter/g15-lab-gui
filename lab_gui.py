@@ -1,21 +1,12 @@
 import sys
 import os
 
-# Ensure parent directory and measurement sub-package directory are in path
-# The structure assumes this script is inside a package directory at the same level as 'measurements'
+# Ensure the root directory is in sys.path
 current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-if parent_dir not in sys.path:
-    sys.path.insert(0, parent_dir)
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
 
 from PyQt6 import QtWidgets, QtGui, QtCore
-
-# Ensure parent directory is in path for imports
-import sys, os
-parent_dir = os.path.dirname(os.path.abspath(__file__))
-parent_root = os.path.dirname(parent_dir)
-if parent_root not in sys.path:
-    sys.path.insert(0, parent_root)
 
 import station_setup
 from measurements.single_spectra_gui import SingleSpectraWindow
