@@ -59,14 +59,14 @@ SPECTROMETER_CONFIGS = {
 
 # Default dictionary of simulated devices
 simulated_devices = {
-    'smu': False,
-    'monochromator': False,
+    'smu': True,
+    'monochromator': True,
     'rotator1': True,
     'rotator2': True,
     'rotator3': True,
-    'camera': False,
+    'camera': True,
     'piezo150': True,
-    'piezo300': False,
+    'piezo300': True,
     'magnet': True,
     'powermeter': True
 }
@@ -117,9 +117,9 @@ def initialize_station(simulated: bool = False, simulated_devices: dict = None, 
     spec_port = spec_cfg.get('port') or 50920
     spec_uri = spec_cfg.get('pyro_uri')
 
-    # 2. Add Acton SpectraPro 750 Monochromator (Strictly Physical Remote Connection)
+    # 2. Add Acton SpectraPro 750 Monochromator (Remote Connection)
     from drivers.remote_client import ClientLightFieldMonochromator
-    monochromator = ClientLightFieldMonochromator('monochromator', server_ip=spec_ip, port=spec_port, pyro_uri=spec_uri, spectrometer_type=resolved_type)
+    monochromator = ClientLightFieldMonochromator('monochromator', server_ip=spec_ip, port=spec_port, pyro_uri=spec_uri, spectrometer_type=resolved_type, simulated=should_simulate('monochromator'))
     station.add_component(monochromator)
 
     # 3. Add Thorlabs ELL14 Rotators
@@ -159,9 +159,9 @@ def initialize_station(simulated: bool = False, simulated_devices: dict = None, 
         rotator3 = ThorlabsELL14('rotator3', port='simulated', address='2')
     station.add_component(rotator3)
 
-    # 4. Add Princeton Pylon CCD Camera (Strictly Physical Remote Connection)
+    # 4. Add Princeton Pylon CCD Camera (Remote Connection)
     from drivers.remote_client import ClientLightFieldCamera
-    camera = ClientLightFieldCamera('camera', server_ip=spec_ip, port=spec_port, pyro_uri=spec_uri, spectrometer_type=resolved_type)
+    camera = ClientLightFieldCamera('camera', server_ip=spec_ip, port=spec_port, pyro_uri=spec_uri, spectrometer_type=resolved_type, simulated=should_simulate('camera'))
     station.add_component(camera)
 
     # 5. Add Attocube ANC150 (adjustment-only stage)

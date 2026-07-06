@@ -784,12 +784,10 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         # Play/Pause control row
         ctrl_layout = QtWidgets.QHBoxLayout()
         self.btn_start = QtWidgets.QPushButton("▶ Begin Sweep")
-        self.btn_start.setStyleSheet("background-color: #10b981; color: white; font-weight: bold; border: 1px solid #10b981;")
         self.btn_start.clicked.connect(self.begin_sweep)
         ctrl_layout.addWidget(self.btn_start)
 
         self.btn_pause = QtWidgets.QPushButton("⏸ Interrupt")
-        self.btn_pause.setStyleSheet("background-color: #ef4444; color: white; font-weight: bold; border: 1px solid #ef4444;")
         self.btn_pause.setEnabled(False)
         self.btn_pause.clicked.connect(self.on_interrupt_clicked)
         ctrl_layout.addWidget(self.btn_pause)
@@ -803,7 +801,6 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         btn_layout2.addWidget(self.btn_reset)
 
         self.btn_save = QtWidgets.QPushButton("💾 Save Dataset")
-        self.btn_save.setStyleSheet("background-color: #555555; color: white; font-weight: bold; border-radius: 0px;")
         self.btn_save.setEnabled(False)
         self.btn_save.clicked.connect(self.save_data)
         btn_layout2.addWidget(self.btn_save)
@@ -1100,7 +1097,7 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         """Helper to create a HistogramLUTItem matching the Dual-Gate Sweep style."""
         hist = pg.HistogramLUTItem(gradientPosition='left')
         hist.setImageItem(image_item)
-        hist.gradient.loadPreset('viridis')
+        hist.gradient.loadPreset('thermal')
         
         hist.layout.removeItem(hist.gradient)
         hist.layout.removeItem(hist.vb)
@@ -1136,6 +1133,11 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
             
         plot_win.getPlotItem().layout.addItem(hist, 2, 5)
         plot_win.getPlotItem().layout.setColumnFixedWidth(4, 3)
+                # Hide the gradient editor ticks for a cleaner look
+        for tick in list(hist.gradient.ticks.keys()):
+            tick.hide()
+        hist.gradient.allowAdd = False
+        
         return hist
 
     def start_sweep(self):
@@ -1511,6 +1513,22 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         # Panel D limits
         self.spectrum_plot.setLimits(xMin=e_min, xMax=e_max)
         self.spectrum_plot.setRange(xRange=(e_min, e_max), padding=0)
+
+        # Auto-center integration regions on the spectrum plot if bounds are reset
+        if hasattr(self, 'integration_region'):
+            reg_min, reg_max = self.integration_region.getRegion()
+            if reg_min < e_min or reg_max > e_max or reg_min >= reg_max or (reg_min == 0.0 and reg_max == 1.0):
+                e_center = (e_min + e_max) / 2.0
+                self.integration_region.blockSignals(True)
+                self.integration_region.setRegion((e_center - 0.02, e_center + 0.02))
+                self.integration_region.blockSignals(False)
+
+        if hasattr(self, 'integration_h_region'):
+            h_reg_min, h_reg_max = self.integration_h_region.getRegion()
+            if h_reg_min < 0 or h_reg_max <= h_reg_min or (h_reg_min == 0.0 and h_reg_max == 1.0):
+                self.integration_h_region.blockSignals(True)
+                self.integration_h_region.setRegion((200.0, 1500.0))
+                self.integration_h_region.blockSignals(False)
 
     def pause_sweep(self):
         if not self.is_running:
@@ -1965,81 +1983,25 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
             print(f"Auto-save trigger failed: {e}")
 
     def apply_theme(self):
-        """Premium light theme styling matching Single Spectra (rectangular, strict monochromatic white/grey/black, no blue tint)"""
-        qss = """
-        QMainWindow, QWidget {
-            background-color: #ffffff;
-            color: #000000;
-        }
-        QGroupBox {
-            background-color: #ffffff;
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            margin-top: 2.5ex;
-            color: #000000;
-            font-weight: bold;
-            font-size: 13px;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            subcontrol-position: top left;
-            left: 10px;
-            padding: 0 5px;
-            background-color: transparent;
-        }
-        QLabel {
-            color: #000000;
-            font-size: 12px;
-            background-color: transparent;
-        }
-        QPushButton {
-            background-color: #ffffff;
-            color: #000000;
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            padding: 8px 16px;
-            font-weight: bold;
-            font-size: 12px;
-        }
-        QPushButton:hover {
-            background-color: #eeeeee;
-            border-color: #999999;
-        }
-        QPushButton:pressed {
-            background-color: #dddddd;
-        }
-        QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
-            background-color: #ffffff;
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            color: #000000;
-            padding: 5px;
-            font-family: Consolas, monospace;
-            font-size: 12px;
-        }
-        QComboBox::drop-down {
-            border: none;
-        }
-        QProgressBar {
-            background-color: #eeeeee;
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            text-align: center;
-            color: #000000;
-            font-weight: bold;
-            height: 18px;
-        }
-        QProgressBar::chunk {
-            background-color: #333333;
-            border-radius: 0px;
-        }
-        QCheckBox {
-            background-color: transparent;
-        }
-        """
-        self.setStyleSheet(qss)
+        from theme import SCIENTIFIC_THEME_QSS
+        self.setStyleSheet(SCIENTIFIC_THEME_QSS)
 
-    # --- Value Storage Persistence ---
+        # Hide up/down arrows on all spinboxes
+        for spin in self.findChildren(QtWidgets.QAbstractSpinBox):
+            spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+
+        # Apply unified dark styling and gridlines to all PlotWidgets
+        import pyqtgraph as pg
+        for attr_name in dir(self):
+            attr = getattr(self, attr_name, None)
+            if isinstance(attr, pg.PlotWidget):
+                attr.setBackground('#ffffff')
+                attr.getAxis('left').setPen(pg.mkPen('#334155'))
+                attr.getAxis('bottom').setPen(pg.mkPen('#334155'))
+                attr.getAxis('left').setTextPen(pg.mkPen('#334155'))
+                attr.getAxis('bottom').setTextPen(pg.mkPen('#334155'))
+                attr.showGrid(x=True, y=True, alpha=0.15)
+
     def load_storage(self):
         storage_path = os.path.join(parent_dir, "value_storage")
         defaults = {

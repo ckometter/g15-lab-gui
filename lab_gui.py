@@ -118,7 +118,7 @@ class LabMainWindow(QtWidgets.QMainWindow):
                 location = "10.236.10.143"
         lf_label = QtWidgets.QLabel(f"{spec_name}: CONNECTED ({location})  ")
         lf_label.setStyleSheet(
-            "color: #10b981; font-weight: bold; font-family: Consolas, monospace;"
+            "color: #059669; font-weight: bold; font-family: Consolas, monospace; font-size: 11px;"
         )
         status_bar.addPermanentWidget(lf_label)
 
@@ -127,120 +127,8 @@ class LabMainWindow(QtWidgets.QMainWindow):
 
     def apply_theme(self):
         """Premium light theme styling matching Single Spectra applied globally to the main dashboard window, tab bar, and unstyled tabs."""
-        global_qss = """
-        QMainWindow, QWidget {
-            background-color: #ffffff;
-            color: #000000;
-        }
-        QTabWidget::pane {
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            background-color: #ffffff;
-            padding: 5px;
-        }
-        QTabBar::tab {
-            background-color: #f5f5f5;
-            color: #555555;
-            border: 1px solid #cccccc;
-            border-right-color: none;
-            border-top-left-radius: 0px;
-            border-bottom-left-radius: 0px;
-            padding: 12px 16px;
-            margin-bottom: 2px;
-            font-weight: bold;
-            font-size: 12px;
-        }
-        QTabBar::tab:selected {
-            background-color: #ffffff;
-            color: #000000;
-            border-right-color: transparent;
-            font-weight: bold;
-        }
-        QTabBar::tab:hover {
-            background-color: #eeeeee;
-            color: #000000;
-        }
-        QGroupBox {
-            background-color: #ffffff;
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            margin-top: 2.5ex;
-            color: #000000;
-            font-weight: bold;
-            font-size: 13px;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            subcontrol-position: top left;
-            left: 10px;
-            padding: 0 5px;
-            background-color: transparent;
-        }
-        QLabel {
-            color: #000000;
-            font-size: 12px;
-            background-color: transparent;
-        }
-        QPushButton {
-            background-color: #ffffff;
-            color: #000000;
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            padding: 8px 16px;
-            font-weight: bold;
-            font-size: 12px;
-        }
-        QPushButton:hover {
-            background-color: #eeeeee;
-            border-color: #999999;
-        }
-        QPushButton:pressed {
-            background-color: #dddddd;
-        }
-        QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
-            background-color: #ffffff;
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            color: #000000;
-            padding: 5px;
-            font-family: Consolas, monospace;
-            font-size: 12px;
-        }
-        QComboBox::drop-down {
-            border: none;
-        }
-        QProgressBar {
-            background-color: #eeeeee;
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            text-align: center;
-            color: #000000;
-            font-weight: bold;
-            height: 18px;
-        }
-        QProgressBar::chunk {
-            background-color: #333333;
-            border-radius: 0px;
-        }
-        QCheckBox {
-            background-color: transparent;
-        }
-        QScrollBar:vertical {
-            border: none;
-            background: #f5f5f5;
-            width: 10px;
-            margin: 0px;
-        }
-        QScrollBar::handle:vertical {
-            background: #cccccc;
-            min-height: 20px;
-            border-radius: 0px;
-        }
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-            height: 0px;
-        }
-        """
-        self.setStyleSheet(global_qss)
+        from theme import SCIENTIFIC_THEME_QSS
+        self.setStyleSheet(SCIENTIFIC_THEME_QSS)
 
     def on_tab_changed(self, index):
         # Automatically close any open View Control popups

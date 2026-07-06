@@ -850,79 +850,8 @@ class PolarizationControlWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.warning(self, "Hardware Error", f"An error occurred during move:\n{err}")
 
     def apply_theme(self):
-        """Premium light theme styling matching Single Spectra (rectangular, strict monochromatic white/grey/black, no blue tint)"""
-        qss = """
-        QMainWindow, QWidget {
-            background-color: #ffffff;
-            color: #000000;
-        }
-        QGroupBox {
-            background-color: #ffffff;
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            margin-top: 2.5ex;
-            color: #000000;
-            font-weight: bold;
-            font-size: 13px;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            subcontrol-position: top left;
-            left: 10px;
-            padding: 0 5px;
-            background-color: transparent;
-        }
-        QLabel {
-            color: #000000;
-            font-size: 12px;
-            background-color: transparent;
-        }
-        QPushButton {
-            background-color: #ffffff;
-            color: #000000;
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            padding: 8px 16px;
-            font-weight: bold;
-            font-size: 12px;
-        }
-        QPushButton:hover {
-            background-color: #eeeeee;
-            border-color: #999999;
-        }
-        QPushButton:pressed {
-            background-color: #dddddd;
-        }
-        QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
-            background-color: #ffffff;
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            color: #000000;
-            padding: 5px;
-            font-family: Consolas, monospace;
-            font-size: 12px;
-        }
-        QComboBox::drop-down {
-            border: none;
-        }
-        QProgressBar {
-            background-color: #eeeeee;
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            text-align: center;
-            color: #000000;
-            font-weight: bold;
-            height: 18px;
-        }
-        QProgressBar::chunk {
-            background-color: #333333;
-            border-radius: 0px;
-        }
-        QCheckBox {
-            background-color: transparent;
-        }
-        """
-        self.setStyleSheet(qss)
+        from theme import SCIENTIFIC_THEME_QSS
+        self.setStyleSheet(SCIENTIFIC_THEME_QSS)
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():

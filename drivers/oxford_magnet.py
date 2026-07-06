@@ -10,7 +10,7 @@ import numpy as np
 import threading
 
 from qcodes.instrument import VisaInstrument, Instrument
-from qcodes.utils import validators as vals
+from qcodes import validators as vals
 
 log = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ class OxfordMagnet(VisaInstrument):
             pass
 
         self.simulated = (address == 'simulated' or visalib == 'simulated')
-        self._address = address
+        self.visa_address = address
         self.output_handle = output_handle if output_handle is not None else import_sys_stdout()
 
         # Ramping simulation states
@@ -309,7 +309,7 @@ class OxfordMagnet(VisaInstrument):
     # Simulation helper to update B-field over time
     def _update_simulated_sweep(self):
         if self._sim_activity == 'to set point':
-            dt = time.time() - self._sim_start_time
+            dt = (time.time() - self._sim_start_time) * 30.0
             if self._sim_sweep_duration <= 0 or dt >= self._sim_sweep_duration:
                 self._sim_current_field = self._sim_target_field
                 self._sim_activity = 'hold'
@@ -319,7 +319,7 @@ class OxfordMagnet(VisaInstrument):
             if self._sim_switch_heater == 'on':
                 self._sim_persistent_field = self._sim_current_field
         elif self._sim_activity == 'to zero':
-            dt = time.time() - self._sim_start_time
+            dt = (time.time() - self._sim_start_time) * 30.0
             if self._sim_sweep_duration <= 0 or dt >= self._sim_sweep_duration:
                 self._sim_current_field = 0.0
                 self._sim_activity = 'hold'

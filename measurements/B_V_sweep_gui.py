@@ -1136,15 +1136,15 @@ class BVSweepWindow(QtWidgets.QMainWindow):
 
         # Build plot tabs
         self.tab1 = QtWidgets.QWidget()
-        self.right_panel.addTab(self.tab1, "Spectra Slices")
+        self.right_panel.addTab(self.tab1, "optical signal")
         self.setup_tab1()
 
         self.tab2 = QtWidgets.QWidget()
-        self.right_panel.addTab(self.tab2, "Ch1 Current (Top Gate)")
+        self.right_panel.addTab(self.tab2, "IV channel 1")
         self.setup_tab2()
 
         self.tab3 = QtWidgets.QWidget()
-        self.right_panel.addTab(self.tab3, "Ch2 Current (Bottom Gate)")
+        self.right_panel.addTab(self.tab3, "IV channel 2")
         self.setup_tab3()
 
         # Add View Control button as corner widget of QTabWidget
@@ -1389,12 +1389,10 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         # Play/Pause control row
         ctrl_layout = QtWidgets.QHBoxLayout()
         self.btn_begin = QtWidgets.QPushButton("▶ Begin Sweep")
-        self.btn_begin.setStyleSheet("background-color: #10b981; color: white; font-weight: bold;")
         self.btn_begin.clicked.connect(self.begin_sweep)
         ctrl_layout.addWidget(self.btn_begin)
 
         self.btn_pause = QtWidgets.QPushButton("⏸ Interrupt")
-        self.btn_pause.setStyleSheet("background-color: #ef4444; color: white; font-weight: bold;")
         self.btn_pause.setEnabled(False)
         self.btn_pause.clicked.connect(self.toggle_pause)
         ctrl_layout.addWidget(self.btn_pause)
@@ -1407,7 +1405,6 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         btn_layout2.addWidget(self.btn_reset)
 
         self.btn_save = QtWidgets.QPushButton("💾 Save Dataset")
-        self.btn_save.setStyleSheet("background-color: #555555; color: white; font-weight: bold; border-radius: 0px;")
         self.btn_save.setEnabled(False)
         self.btn_save.clicked.connect(self.save_sweep_data)
         btn_layout2.addWidget(self.btn_save)
@@ -1548,7 +1545,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.update_step_calculations()
         if not self.is_running:
             self.update_coordinates_from_ui()
-            self.reset_plot_scaling()
+            self.reset_plot_scaling(reset_spectrum=False)
             self.save_storage()
 
     # Layout setups
@@ -1682,9 +1679,12 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.spectrum_win, 1, 1)
 
     def setup_tab2(self):
-        layout = QtWidgets.QHBoxLayout(self.tab2)
+        """Setup 2x2 layout for Ch1 Current vs coordinates"""
+        layout = QtWidgets.QGridLayout(self.tab2)
         layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(6)
 
+        # Heatmap (Top Left)
         self.t2_heatmap_win = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Top Gate Current Heatmap")
         self.t2_heatmap_win.getViewBox().setMouseEnabled(x=True, y=True)
         self.t2_heatmap_win.getViewBox().enableAutoRange(enable=False)
@@ -1693,48 +1693,39 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.t2_heatmap_win.addItem(self.t2_heatmap_img)
         self.t2_heatmap_win.setLabel('left', 'Magnetic Field', units='T')
         self.t2_heatmap_win.setLabel('bottom', 'Voltage (V1)', units='V')
+
         self.t2_colorbar = self.setup_histogram_lut(self.t2_heatmap_win, self.t2_heatmap_img, interactive=True)
 
+        # Draggable crosshair
         self.cross2_v = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen('#ea580c', width=2))
         self.cross2_h = pg.InfiniteLine(angle=0, movable=True, pen=pg.mkPen('#ea580c', width=2))
         self.t2_heatmap_win.addItem(self.cross2_v)
         self.t2_heatmap_win.addItem(self.cross2_h)
         self.cross2_v.sigPositionChanged.connect(self.on_tab2_crosshair_moved)
         self.cross2_h.sigPositionChanged.connect(self.on_tab2_crosshair_moved)
-
-        vb = self.t2_heatmap_win.getViewBox()
-        def t2_click(ev):
+        
+        # Monkey-patch ViewBox to intercept left clicks
+        viewbox2 = self.t2_heatmap_win.getViewBox()
+        viewbox2.originalMouseClickEvent = viewbox2.mouseClickEvent
+        def t2_click_event(ev):
             if ev.button() == QtCore.Qt.MouseButton.LeftButton:
-                pt = vb.mapSceneToView(ev.scenePos())
+                mouse_point = viewbox2.mapSceneToView(ev.scenePos())
                 self.cross2_v.blockSignals(True)
                 self.cross2_h.blockSignals(True)
-                self.cross2_v.setValue(pt.x())
-                self.cross2_h.setValue(pt.y())
+                self.cross2_v.setValue(mouse_point.x())
+                self.cross2_h.setValue(mouse_point.y())
                 self.cross2_v.blockSignals(False)
                 self.cross2_h.blockSignals(False)
                 self.on_tab2_crosshair_moved()
                 ev.accept()
             else:
-                vb.originalMouseClickEvent(ev)
-        vb.originalMouseClickEvent = vb.mouseClickEvent
-        vb.mouseClickEvent = t2_click
+                viewbox2.originalMouseClickEvent(ev)
+        viewbox2.mouseClickEvent = t2_click_event
 
-        layout.addWidget(self.t2_heatmap_win, 3)
+        layout.addWidget(self.t2_heatmap_win, 0, 0)
 
-        right_layout = QtWidgets.QVBoxLayout()
-        right_layout.setSpacing(6)
-
-        self.t2_hslice_win = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Slice at fixed B")
-        self.t2_hslice_win.getViewBox().setMouseEnabled(x=True, y=True)
-        self.t2_hslice_win.getViewBox().enableAutoRange(axis='x', enable=False)
-        self.t2_hslice_win.getViewBox().enableAutoRange(axis='y', enable=True)
-        self.t2_hslice_curve = self.t2_hslice_win.plot(pen=pg.mkPen('#2563eb', width=2))
-        self.t2_hslice_win.setLabel('left', 'Current', units='A')
-        self.t2_hslice_win.setLabel('bottom', 'Voltage (V1)', units='V')
-        self.t2_hslice_win.showGrid(x=True, y=True, alpha=0.3)
-        right_layout.addWidget(self.t2_hslice_win)
-
-        self.t2_vslice_win = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Slice at fixed V")
+        # Vertical Slice (Top Right)
+        self.t2_vslice_win = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Slice at fixed C1" if False else "Slice at fixed V")
         self.t2_vslice_win.getViewBox().setMouseEnabled(x=True, y=True)
         self.t2_vslice_win.getViewBox().enableAutoRange(axis='x', enable=False)
         self.t2_vslice_win.getViewBox().enableAutoRange(axis='y', enable=True)
@@ -1742,14 +1733,30 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.t2_vslice_win.setLabel('left', 'Current', units='A')
         self.t2_vslice_win.setLabel('bottom', 'Magnetic Field', units='T')
         self.t2_vslice_win.showGrid(x=True, y=True, alpha=0.3)
-        right_layout.addWidget(self.t2_vslice_win)
+        layout.addWidget(self.t2_vslice_win, 0, 1)
 
-        layout.addLayout(right_layout, 2)
+        # Horizontal Slice (Bottom Left)
+        self.t2_hslice_win = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Slice at fixed C2" if False else "Slice at fixed B")
+        self.t2_hslice_win.getViewBox().setMouseEnabled(x=True, y=True)
+        self.t2_hslice_win.getViewBox().enableAutoRange(axis='x', enable=False)
+        self.t2_hslice_win.getViewBox().enableAutoRange(axis='y', enable=True)
+        self.t2_hslice_curve = self.t2_hslice_win.plot(pen=pg.mkPen('#2563eb', width=2))
+        self.t2_hslice_win.setLabel('left', 'Current', units='A')
+        self.t2_hslice_win.setLabel('bottom', 'Voltage (V1)', units='V')
+        self.t2_hslice_win.showGrid(x=True, y=True, alpha=0.3)
+        layout.addWidget(self.t2_hslice_win, 1, 0)
+
+        # Empty (Bottom Right)
+        dummy = QtWidgets.QWidget()
+        layout.addWidget(dummy, 1, 1)
 
     def setup_tab3(self):
-        layout = QtWidgets.QHBoxLayout(self.tab3)
+        """Setup 2x2 layout for Ch2 Current vs coordinates"""
+        layout = QtWidgets.QGridLayout(self.tab3)
         layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(6)
 
+        # Heatmap (Top Left)
         self.t3_heatmap_win = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Bottom Gate Current Heatmap")
         self.t3_heatmap_win.getViewBox().setMouseEnabled(x=True, y=True)
         self.t3_heatmap_win.getViewBox().enableAutoRange(enable=False)
@@ -1758,48 +1765,39 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.t3_heatmap_win.addItem(self.t3_heatmap_img)
         self.t3_heatmap_win.setLabel('left', 'Magnetic Field', units='T')
         self.t3_heatmap_win.setLabel('bottom', 'Voltage (V1)', units='V')
+
         self.t3_colorbar = self.setup_histogram_lut(self.t3_heatmap_win, self.t3_heatmap_img, interactive=True)
 
+        # Draggable crosshair
         self.cross3_v = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen('#16a34a', width=2))
         self.cross3_h = pg.InfiniteLine(angle=0, movable=True, pen=pg.mkPen('#16a34a', width=2))
         self.t3_heatmap_win.addItem(self.cross3_v)
         self.t3_heatmap_win.addItem(self.cross3_h)
         self.cross3_v.sigPositionChanged.connect(self.on_tab3_crosshair_moved)
         self.cross3_h.sigPositionChanged.connect(self.on_tab3_crosshair_moved)
-
-        vb = self.t3_heatmap_win.getViewBox()
-        def t3_click(ev):
+        
+        # Monkey-patch ViewBox to intercept left clicks
+        viewbox3 = self.t3_heatmap_win.getViewBox()
+        viewbox3.originalMouseClickEvent = viewbox3.mouseClickEvent
+        def t3_click_event(ev):
             if ev.button() == QtCore.Qt.MouseButton.LeftButton:
-                pt = vb.mapSceneToView(ev.scenePos())
+                mouse_point = viewbox3.mapSceneToView(ev.scenePos())
                 self.cross3_v.blockSignals(True)
                 self.cross3_h.blockSignals(True)
-                self.cross3_v.setValue(pt.x())
-                self.cross3_h.setValue(pt.y())
+                self.cross3_v.setValue(mouse_point.x())
+                self.cross3_h.setValue(mouse_point.y())
                 self.cross3_v.blockSignals(False)
                 self.cross3_h.blockSignals(False)
                 self.on_tab3_crosshair_moved()
                 ev.accept()
             else:
-                vb.originalMouseClickEvent(ev)
-        vb.originalMouseClickEvent = vb.mouseClickEvent
-        vb.mouseClickEvent = t3_click
+                viewbox3.originalMouseClickEvent(ev)
+        viewbox3.mouseClickEvent = t3_click_event
 
-        layout.addWidget(self.t3_heatmap_win, 3)
+        layout.addWidget(self.t3_heatmap_win, 0, 0)
 
-        right_layout = QtWidgets.QVBoxLayout()
-        right_layout.setSpacing(6)
-
-        self.t3_hslice_win = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Slice at fixed B")
-        self.t3_hslice_win.getViewBox().setMouseEnabled(x=True, y=True)
-        self.t3_hslice_win.getViewBox().enableAutoRange(axis='x', enable=False)
-        self.t3_hslice_win.getViewBox().enableAutoRange(axis='y', enable=True)
-        self.t3_hslice_curve = self.t3_hslice_win.plot(pen=pg.mkPen('#2563eb', width=2))
-        self.t3_hslice_win.setLabel('left', 'Current', units='A')
-        self.t3_hslice_win.setLabel('bottom', 'Voltage (V1)', units='V')
-        self.t3_hslice_win.showGrid(x=True, y=True, alpha=0.3)
-        right_layout.addWidget(self.t3_hslice_win)
-
-        self.t3_vslice_win = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Slice at fixed V")
+        # Vertical Slice (Top Right)
+        self.t3_vslice_win = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Slice at fixed C1" if False else "Slice at fixed V")
         self.t3_vslice_win.getViewBox().setMouseEnabled(x=True, y=True)
         self.t3_vslice_win.getViewBox().enableAutoRange(axis='x', enable=False)
         self.t3_vslice_win.getViewBox().enableAutoRange(axis='y', enable=True)
@@ -1807,14 +1805,27 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.t3_vslice_win.setLabel('left', 'Current', units='A')
         self.t3_vslice_win.setLabel('bottom', 'Magnetic Field', units='T')
         self.t3_vslice_win.showGrid(x=True, y=True, alpha=0.3)
-        right_layout.addWidget(self.t3_vslice_win)
+        layout.addWidget(self.t3_vslice_win, 0, 1)
 
-        layout.addLayout(right_layout, 2)
+        # Horizontal Slice (Bottom Left)
+        self.t3_hslice_win = pg.PlotWidget(viewBox=EnhancedViewBox(), title="Slice at fixed C2" if False else "Slice at fixed B")
+        self.t3_hslice_win.getViewBox().setMouseEnabled(x=True, y=True)
+        self.t3_hslice_win.getViewBox().enableAutoRange(axis='x', enable=False)
+        self.t3_hslice_win.getViewBox().enableAutoRange(axis='y', enable=True)
+        self.t3_hslice_curve = self.t3_hslice_win.plot(pen=pg.mkPen('#2563eb', width=2))
+        self.t3_hslice_win.setLabel('left', 'Current', units='A')
+        self.t3_hslice_win.setLabel('bottom', 'Voltage (V1)', units='V')
+        self.t3_hslice_win.showGrid(x=True, y=True, alpha=0.3)
+        layout.addWidget(self.t3_hslice_win, 1, 0)
+
+        # Empty (Bottom Right)
+        dummy = QtWidgets.QWidget()
+        layout.addWidget(dummy, 1, 1)
 
     def setup_histogram_lut(self, plot_win, image_item, interactive=True):
         hist = pg.HistogramLUTItem(gradientPosition='left')
         hist.setImageItem(image_item)
-        hist.gradient.loadPreset('viridis')
+        hist.gradient.loadPreset('thermal')
         
         hist.layout.removeItem(hist.gradient)
         hist.layout.removeItem(hist.vb)
@@ -1846,9 +1857,14 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         pi.layout.addItem(pi.titleLabel, 0, 0, 1, 6)
         pi.layout.addItem(hist, 2, 5)
         pi.layout.setColumnFixedWidth(4, 3)
+                # Hide the gradient editor ticks for a cleaner look
+        for tick in list(hist.gradient.ticks.keys()):
+            tick.hide()
+        hist.gradient.allowAdd = False
+        
         return hist
 
-    def reset_plot_scaling(self):
+    def reset_plot_scaling(self, reset_spectrum=True):
         self.reset_slice_levels = True
         v_min, v_max = min(self.v_coords), max(self.v_coords)
         b_min, b_max = min(self.b_coords), max(self.b_coords)
@@ -1882,9 +1898,8 @@ class BVSweepWindow(QtWidgets.QMainWindow):
             self.hslice_img.setRect(QtCore.QRectF(self.energy_axis[0], self.v_coords[0], self.energy_axis[-1] - self.energy_axis[0], self.v_coords[-1] - self.v_coords[0]))
         self.hslice_win.setRange(xRange=(energy_min, energy_max), yRange=(v_min, v_max), padding=0)
 
-        self.spectrum_win.setLimits(xMin=energy_min, xMax=energy_max)
-        self.spectrum_win.setRange(xRange=(energy_min, energy_max), padding=0)
-
+        if reset_spectrum:
+            self.spectrum_win.setLimits(xMin=energy_min, xMax=energy_max)
         # Current Heatmaps
         self.t2_heatmap_win.getViewBox().update_bounds(v_min, v_max, b_min, b_max)
         if self.t2_heatmap_img.image is not None:
@@ -1910,12 +1925,15 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.spectrum_v_region.blockSignals(True)
         self.spectrum_h_region.blockSignals(True)
 
-        # Center the vertical region lines dynamically inside the active energy range (30% to 70% of the span) if needed
-        e_range = energy_max - energy_min
-        curr_v_reg = self.spectrum_v_region.getRegion()
-        v_reg_min, v_reg_max = curr_v_reg
-        if v_reg_min < energy_min or v_reg_max > energy_max or v_reg_min >= v_reg_max or (v_reg_min == 0.0 and v_reg_max == 1.0):
-            self.spectrum_v_region.setRegion((energy_min + 0.3 * e_range, energy_min + 0.7 * e_range))
+        if reset_spectrum:
+            self.spectrum_win.setRange(xRange=(energy_min, energy_max), padding=0)
+
+            # Center the vertical region lines dynamically inside the active energy range (30% to 70% of the span) if needed
+            e_range = energy_max - energy_min
+            curr_v_reg = self.spectrum_v_region.getRegion()
+            v_reg_min, v_reg_max = curr_v_reg
+            if v_reg_min < energy_min or v_reg_max > energy_max or v_reg_min >= v_reg_max or (v_reg_min == 0.0 and v_reg_max == 1.0):
+                self.spectrum_v_region.setRegion((energy_min + 0.3 * e_range, energy_min + 0.7 * e_range))
 
         # Center the horizontal region lines dynamically inside the active counts range (30% to 70% of the span) if needed
         if np.any(self.data_measured_mask):
@@ -1930,11 +1948,12 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         if y_range <= 0:
             y_range = 1.0
 
-        curr_h_reg = self.spectrum_h_region.getRegion()
-        h_reg_min, h_reg_max = curr_h_reg
-        if h_reg_min < 0 or h_reg_max <= h_reg_min or (h_reg_min == 0.0 and h_reg_max == 1.0):
-            self.spectrum_h_region.setRegion((y_min + 0.3 * y_range, y_min + 0.7 * y_range))
-        self.spectrum_win.setRange(yRange=(y_min - 0.1 * y_range, y_max + 0.1 * y_range), padding=0)
+        if reset_spectrum:
+            curr_h_reg = self.spectrum_h_region.getRegion()
+            h_reg_min, h_reg_max = curr_h_reg
+            if h_reg_min < 0 or h_reg_max <= h_reg_min or (h_reg_min == 0.0 and h_reg_max == 1.0):
+                self.spectrum_h_region.setRegion((y_min + 0.3 * y_range, y_min + 0.7 * y_range))
+            self.spectrum_win.setRange(yRange=(y_min - 0.1 * y_range, y_max + 0.1 * y_range), padding=0)
 
         self.spectrum_v_region.blockSignals(False)
         self.spectrum_h_region.blockSignals(False)
@@ -1954,13 +1973,13 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.reset_slice_levels = True
         """Scale all plots: zoom completely out on coordinates, auto-range 1D plots, and set colorbar levels to full data range."""
         # 1. Reset all viewbox ranges to coordinate limits (v, b, energy) by calling reset_plot_scaling
-        self.reset_plot_scaling()
+        self.reset_plot_scaling(reset_spectrum=False)
 
         # 2. Scale interactive colorbars to full data range (min to max of the active slice/current data)
-        self.vslice_colorbar.gradient.loadPreset('viridis')
-        self.hslice_colorbar.gradient.loadPreset('viridis')
-        self.t2_colorbar.gradient.loadPreset('viridis')
-        self.t3_colorbar.gradient.loadPreset('viridis')
+        self.vslice_colorbar.gradient.loadPreset('thermal')
+        self.hslice_colorbar.gradient.loadPreset('thermal')
+        self.t2_colorbar.gradient.loadPreset('thermal')
+        self.t3_colorbar.gradient.loadPreset('thermal')
 
         if self.vslice_img.image is not None and self.vslice_img.image.size > 0:
             vslice_data = self.vslice_img.image
@@ -2215,90 +2234,24 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.on_tab3_crosshair_moved()
 
     def apply_theme(self):
-        """Premium light theme styling matching Single Spectra (rectangular, strict monochromatic white/grey/black, no blue tint)"""
-        qss = """
-        QMainWindow, QWidget {
-            background-color: #ffffff;
-            color: #000000;
-        }
-        QGroupBox {
-            background-color: #ffffff;
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            margin-top: 2.5ex;
-            color: #000000;
-            font-weight: bold;
-            font-size: 13px;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            subcontrol-position: top left;
-            left: 10px;
-            padding: 0 5px;
-            background-color: transparent;
-        }
-        QLabel {
-            color: #000000;
-            font-size: 12px;
-            background-color: transparent;
-        }
-        QPushButton {
-            background-color: #ffffff;
-            color: #000000;
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            padding: 8px 16px;
-            font-weight: bold;
-            font-size: 12px;
-        }
-        QPushButton:hover {
-            background-color: #eeeeee;
-            border-color: #999999;
-        }
-        QPushButton:pressed {
-            background-color: #dddddd;
-        }
-        QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
-            background-color: #ffffff;
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            color: #000000;
-            padding: 5px;
-            font-family: Consolas, monospace;
-            font-size: 12px;
-        }
-        QComboBox::drop-down {
-            border: none;
-        }
-        QProgressBar {
-            background-color: #eeeeee;
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            text-align: center;
-            color: #000000;
-            font-weight: bold;
-            height: 18px;
-        }
-        QProgressBar::chunk {
-            background-color: #333333;
-            border-radius: 0px;
-        }
-        QCheckBox {
-            background-color: transparent;
-        }
-        """
-        self.setStyleSheet(qss)
+        from theme import SCIENTIFIC_THEME_QSS
+        self.setStyleSheet(SCIENTIFIC_THEME_QSS)
 
-        # Apply unified styling (white background and slate axes) to all PlotWidgets
+        # Hide up/down arrows on all spinboxes
+        for spin in self.findChildren(QtWidgets.QAbstractSpinBox):
+            spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+
+        # Apply unified dark styling and gridlines to all PlotWidgets
         import pyqtgraph as pg
         for attr_name in dir(self):
             attr = getattr(self, attr_name, None)
             if isinstance(attr, pg.PlotWidget):
-                attr.setBackground('w')
+                attr.setBackground('#ffffff')
                 attr.getAxis('left').setPen(pg.mkPen('#334155'))
                 attr.getAxis('bottom').setPen(pg.mkPen('#334155'))
                 attr.getAxis('left').setTextPen(pg.mkPen('#334155'))
                 attr.getAxis('bottom').setTextPen(pg.mkPen('#334155'))
+                attr.showGrid(x=True, y=True, alpha=0.15)
 
     def set_inputs_enabled(self, enabled: bool):
         self.b_coord_name.setEnabled(enabled)
@@ -2406,7 +2359,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.energy_sort_idx = np.argsort(energy_raw)
         self.energy_axis = energy_raw[self.energy_sort_idx]
 
-        self.reset_plot_scaling()
+        self.reset_plot_scaling(reset_spectrum=True)
         self.set_inputs_enabled(False)
         self.is_running = True
         self.is_paused = False

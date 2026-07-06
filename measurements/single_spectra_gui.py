@@ -860,7 +860,23 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         for mode, colour in PLOT_MODES:
             cb = QtWidgets.QCheckBox(mode)
             cb.setChecked(self.stored_plot_modes.get(mode, mode == "Signal"))
-            cb.setStyleSheet(f"color: {colour}; font-size: 11px;")
+            cb.setStyleSheet(f"""
+                QCheckBox {{
+                    color: {colour};
+                    font-size: 11px;
+                }}
+                QCheckBox::indicator {{
+                    border: 1px solid #94A3B8;
+                    border-radius: 0px;
+                    background-color: #FFFFFF;
+                    width: 14px;
+                    height: 14px;
+                }}
+                QCheckBox::indicator:checked {{
+                    background-color: #475569;
+                    border-color: #334155;
+                }}
+            """)
             cb.stateChanged.connect(self.replot)
             cb.stateChanged.connect(lambda _: self.save_value_storage())
             self.plot_mode_checks[mode] = cb
@@ -2055,138 +2071,9 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
             if mode == "Both":
                 self.plot_widget.autoRange()
 
-    # --- Modern Visual Styling ---
     def apply_qss_theme(self):
-        # Clean white/light theme (rectangular, strict monochromatic white/grey/black, no blue tint)
-        style = """
-        QMainWindow, QWidget {
-            background-color: #ffffff;
-            color: #000000;
-        }
-        QGroupBox {
-            background-color: #ffffff;
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            margin-top: 2.5ex;
-            color: #000000;
-            font-weight: bold;
-            font-size: 13px;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            subcontrol-position: top left;
-            left: 10px;
-            padding: 0 5px;
-            background-color: transparent;
-        }
-        QLabel {
-            color: #000000;
-            font-size: 12px;
-            background-color: transparent;
-        }
-        QPushButton {
-            background-color: #ffffff;
-            color: #000000;
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            padding: 8px 16px;
-            font-weight: bold;
-            font-size: 12px;
-        }
-        QPushButton:hover {
-            background-color: #eeeeee;
-            border-color: #999999;
-        }
-        QPushButton:pressed {
-            background-color: #dddddd;
-        }
-        QPushButton#acquireBtn {
-            background-color: #000000;
-            color: #ffffff;
-            border-color: #000000;
-        }
-        QPushButton#acquireBtn:hover {
-            background-color: #333333;
-        }
-        QPushButton#saveBtn {
-            background-color: #555555;
-            color: #ffffff;
-            border-color: #444444;
-        }
-        QPushButton#saveBtn:hover {
-            background-color: #333333;
-        }
-        QPushButton#bgBtn, QPushButton#refBtn {
-            background-color: #777777;
-            color: #ffffff;
-            border-color: #666666;
-        }
-        QPushButton#bgBtn:hover, QPushButton#refBtn:hover {
-            background-color: #555555;
-        }
-        QPushButton#runBtn:checked {
-            background-color: #222222;
-            color: #ffffff;
-            border-color: #000000;
-        }
-        QPushButton#runBtn:checked:hover {
-            background-color: #000000;
-        }
-        QPushButton#interruptBtn {
-            background-color: #444444;
-            color: #ffffff;
-            border-color: #333333;
-        }
-        QPushButton#interruptBtn:hover {
-            background-color: #222222;
-        }
-        QPushButton#scaleBtn {
-            background-color: #ffffff;
-            color: #000000;
-            border-color: #cccccc;
-            border-radius: 0px;
-            padding: 4px 10px;
-            font-size: 11px;
-        }
-        QPushButton#scaleBtn:hover {
-            background-color: #eeeeee;
-            border-color: #999999;
-        }
-        QPushButton:disabled {
-            background-color: #f9f9f9;
-            color: #aaaaaa;
-            border-color: #eeeeee;
-        }
-        QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
-            background-color: #ffffff;
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            color: #000000;
-            padding: 5px;
-            font-family: Consolas, monospace;
-            font-size: 12px;
-        }
-        QComboBox::drop-down {
-            border: none;
-        }
-        QProgressBar {
-            background-color: #eeeeee;
-            border: 1px solid #cccccc;
-            border-radius: 0px;
-            text-align: center;
-            color: #000000;
-            font-weight: bold;
-            height: 18px;
-        }
-        QProgressBar::chunk {
-            background-color: #333333;
-            border-radius: 0px;
-        }
-        QCheckBox {
-            background-color: transparent;
-        }
-        """
-        self.setStyleSheet(style)
+        from theme import SCIENTIFIC_THEME_QSS
+        self.setStyleSheet(SCIENTIFIC_THEME_QSS)
         # Also set the pyqtgraph plot background to white
         self.plot_widget.setBackground('w')
         self.plot_widget.getAxis('left').setPen(pg.mkPen('#334155'))

@@ -8,7 +8,7 @@ except ImportError:
     elliptec = None
 
 from qcodes.instrument import Instrument
-from qcodes.utils import validators as vals
+from qcodes import validators as vals
 
 log = logging.getLogger(__name__)
 

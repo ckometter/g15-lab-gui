@@ -1,0 +1,4 @@
+pip install PyQt6 pyqtgraph Pyro4 h5py numpy pandas qcodes pyvisa
+pip install qcodes qcodes-contrib-drivers PyQt6 pyqtgraph h5py numpy Pyro4 pyvisa pyvisa-py
+
+pip install thorlabs-elliptec

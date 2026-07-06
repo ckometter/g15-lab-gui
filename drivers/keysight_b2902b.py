@@ -50,13 +50,6 @@ class RampedSet:
         
         param = getattr(self.channel, parameter_name)
         
-        if ramp_rate <= 0 or ramp_step <= 0:
-            param(target_val)
-            if callback is not None:
-                try: callback(target_val)
-                except Exception: pass
-            return
-            
         try:
             current_val = param.get_latest()
             if current_val is None:
@@ -65,6 +58,32 @@ class RampedSet:
             current_val = param()
         dval = target_val - current_val
         
+        if getattr(self.channel, "simulated", False):
+            # Simulated software ramping: limit to 5 steps to be fast but visible
+            num_steps = min(5, int(abs(dval) / ramp_step)) if ramp_step > 0 else 0
+            if num_steps <= 1:
+                param(target_val)
+                if callback is not None:
+                    try: callback(target_val)
+                    except Exception: pass
+            else:
+                for i in range(1, num_steps + 1):
+                    fraction = i / num_steps
+                    next_val = current_val + dval * fraction
+                    param(next_val)
+                    if callback is not None:
+                        try: callback(next_val)
+                        except Exception: pass
+                    time.sleep(0.002)
+            return
+        
+        if ramp_rate <= 0 or ramp_step <= 0:
+            param(target_val)
+            if callback is not None:
+                try: callback(target_val)
+                except Exception: pass
+            return
+            
         num_steps = int(abs(dval) / ramp_step)
         if num_steps <= 1:
             param(target_val)
