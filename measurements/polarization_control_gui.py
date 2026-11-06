@@ -154,6 +154,7 @@ class PolarizationWorker(QtCore.QThread):
         self.station = station
         self._is_running = True
         self.cmd_queue = []
+        self.moving = False
         self.mutex = QtCore.QMutex()
         
         self._sim_exc_angle = 0.0
@@ -200,6 +201,7 @@ class PolarizationWorker(QtCore.QThread):
             self.mutex.unlock()
 
             if cmd is not None:
+                self.moving = True
                 cmd_type, angle = cmd
                 if cmd_type == "move_exc":
                     if rotator1 and not rotator1.simulated:
@@ -257,6 +259,7 @@ class PolarizationWorker(QtCore.QThread):
                 except Exception:
                     pass
 
+            self.moving = False
             self.msleep(300)
 
 

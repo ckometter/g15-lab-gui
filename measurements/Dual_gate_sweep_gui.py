@@ -9,14 +9,14 @@ import numpy as np
 from PyQt6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 try:
-    from .utils import EnhancedViewBox, calculate_expected_duration
+    from .utils import EnhancedViewBox, calculate_expected_duration, configure_plot_axes, update_current_slice
 except ImportError:
     import sys
     import os
     _measurements_dir = os.path.dirname(os.path.abspath(__file__))
     if _measurements_dir not in sys.path:
         sys.path.insert(0, _measurements_dir)
-    from utils import EnhancedViewBox, calculate_expected_duration
+    from utils import EnhancedViewBox, calculate_expected_duration, configure_plot_axes, update_current_slice
 
 # Ensure parent directory is in path for importing station_setup
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,6 +24,13 @@ if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
 from station_setup import initialize_station, simulated_devices
+from gate_safety import (GATE_CURRENT_COMPLIANCE_A, GATE_MAX_ABS_VOLTAGE_V,
+                         GateRampCancelled, validate_gate_targets, validate_gate_voltage,
+                         validate_current_compliance)
+from gui_safety import install_parameter_wheel_guard
+from measurement_data_paths import dated_measurement_filename, dated_measurement_path
+from measurement_data_paths import measurement_data_dir, measurement_start_text, new_measurement_start, measurement_device_modes
+from measurement_acquisition import acquire_sweep_spectrum
 
 # Setup pyqtgraph themes (Light Theme)
 pg.setConfigOption('background', '#ffffff')
@@ -143,16 +150,68 @@ class ScientificDoubleSpinBox(_OriginalQDoubleSpinBox):
 QtWidgets.QDoubleSpinBox = ScientificDoubleSpinBox
 
 
-def transform_c_to_v(c1, c2, a, b, c, d):
+def transform_c_to_v(vg1, vg2, a, b, c, d):
     """
-    Convert virtual gate coordinates (c1, c2) to physical voltages (v1, v2)
-    using the linear mapping:
-      v1 = a * c1 + b * c2
-      v2 = c * c1 + d * c2
+    Convert virtual gate coordinates (vg1, vg2) to physical channel voltages (ch1, ch2).
+
+    The matrix M is defined by the user as:
+      VG1 = a * ch1 + b * ch2
+      VG2 = c * ch1 + d * ch2
+
+    To sweep at a given (vg1, vg2) we need the inverse:
+      ch1 = ( d * vg1 - b * vg2) / det
+      ch2 = (-c * vg1 + a * vg2) / det
+    where det = a*d - b*c.
+
+    Raises ValueError if the matrix is singular (det ≈ 0).
     """
-    v1 = a * c1 + b * c2
-    v2 = c * c1 + d * c2
-    return v1, v2
+    if not np.isfinite([a, b, c, d]).all():
+        raise ValueError('Gate transformation coefficients must be finite.')
+    det = a * d - b * c
+    if abs(det) < 1e-9:
+        raise ValueError(
+            f"Gate transformation matrix is singular (det={det:.2e}). "
+            "Adjust coefficients so that a·d − b·c ≠ 0."
+        )
+    ch1 = ( d * vg1 - b * vg2) / det
+    ch2 = (-c * vg1 + a * vg2) / det
+    return ch1, ch2
+
+
+def finite_plot_levels(values):
+    """Missing saved-data pixels must not produce NaN axes or colour limits."""
+    array = np.asarray(values)
+    finite = array[np.isfinite(array)]
+    return (float(finite.min()), float(finite.max())) if finite.size else (0.0, 1.0)
+
+
+def validate_dgs_parameters(params):
+    """Linear transform extrema occur at corners; preflight before any motion."""
+    x = [params['c1_start'], params['c1_end'] if params['c1_pts'] > 1 else params['c1_start']]
+    y = [params['c2_start'], params['c2_end'] if params['c2_pts'] > 1 else params['c2_start']]
+    xx, yy = np.meshgrid(x, y)
+    validate_gate_targets(*transform_c_to_v(xx, yy, *(params[k] for k in ('a', 'b', 'c', 'd'))))
+
+
+def require_voltage_source_modes(smu):
+    for axis in (1, 2):
+        channel = getattr(smu, f'ch{axis}')
+        if channel.source_mode() != 'VOLT':
+            raise RuntimeError(f'Channel {axis} is not in voltage-source mode. Gate sweep blocked.')
+        validate_gate_voltage(channel.volt(), axis)
+
+
+def read_compliance_values(smu):
+    readings = {}
+    for axis in (1, 2):
+        try:
+            channel = getattr(smu, f'ch{axis}')
+            mode = channel.source_mode()
+            value = channel.volt_limit() if mode == 'CURR' else channel.curr_limit()
+            readings[axis] = (mode, float(value))
+        except Exception:
+            readings[axis] = None
+    return readings
 
 
 class SingleRampWorker(QtCore.QThread):
@@ -161,6 +220,8 @@ class SingleRampWorker(QtCore.QThread):
     without freezing the main GUI thread.
     """
     progress = QtCore.pyqtSignal(str, float, float)
+    output_updated = QtCore.pyqtSignal(str, bool)
+    compliance_updated = QtCore.pyqtSignal(int, float)
     finished = QtCore.pyqtSignal()
     error = QtCore.pyqtSignal(str)
 
@@ -170,12 +231,16 @@ class SingleRampWorker(QtCore.QThread):
         self.target_val = target_val
         self.param_name = param_name
         self.ch_name = ch_name
+        self._stop_requested = False
+        self.channel.ramp_stop_requested = False
 
     def stop(self):
+        self._stop_requested = True
         self.channel.ramp_stop_requested = True
 
     def run(self):
-        max_retries = 3
+        # A failed manual operation is reported; do not replay an uncertain write.
+        max_retries = 1
         
         def progress_callback(val):
             curr_val = 0.0
@@ -198,14 +263,26 @@ class SingleRampWorker(QtCore.QThread):
             
         for attempt in range(1, max_retries + 1):
             try:
-                self.channel.ramp_stop_requested = False
-                if self.param_name == "curr":
+                if self._stop_requested:
+                    raise GateRampCancelled("Manual ramp stopped")
+                if self.param_name == "output":
+                    self.channel.output(bool(self.target_val))
+                    self.output_updated.emit(self.ch_name, bool(self.channel.output()))
+                elif self.param_name == 'curr_limit':
+                    self.channel.curr_limit(self.target_val)
+                    self.compliance_updated.emit(self.channel.channel_num, float(self.target_val))
+                elif self.param_name == "curr":
                     self.channel.set_r.curr(self.target_val, callback=progress_callback)
                 else:
                     self.channel.set_r.volt(self.target_val, callback=progress_callback)
                 break
+            except GateRampCancelled:
+                self.report_output_state()
+                self.finished.emit()
+                return
             except Exception as e:
-                if attempt == max_retries:
+                if attempt == max_retries or self.param_name == "output":
+                    self.report_output_state()
                     self.error.emit(str(e))
                     return
                 try:
@@ -220,16 +297,23 @@ class SingleRampWorker(QtCore.QThread):
             pass
         self.finished.emit()
 
+    def report_output_state(self):
+        if self.param_name == 'output':
+            try:
+                self.output_updated.emit(self.ch_name, bool(self.channel.output()))
+            except Exception:
+                pass
+
 
 class SweepWorker(QtCore.QThread):
     """
     Background worker thread that runs the gate sweep measurement.
     Communicates back to the main thread via Qt signals.
     """
-    point_measured = QtCore.pyqtSignal(int, int, float, float, float, float, np.ndarray, float, float, float, float, float)
+    point_measured = QtCore.pyqtSignal(int, int, float, float, float, float, np.ndarray, float, float, float, float, float, np.ndarray)
     progress_updated = QtCore.pyqtSignal(int, int)
     status_updated = QtCore.pyqtSignal(str)
-    voltage_updated = QtCore.pyqtSignal(float, float)
+    voltage_updated = QtCore.pyqtSignal(float, float, float, float)
     finished = QtCore.pyqtSignal()
     error_occurred = QtCore.pyqtSignal(str)
 
@@ -241,10 +325,13 @@ class SweepWorker(QtCore.QThread):
         self._is_paused = False
         self.mutex = QtCore.QMutex()
         self.pause_cond = QtCore.QWaitCondition()
+        self._control = self
+        self._cancel_generation = 0
 
     def pause(self):
         self.mutex.lock()
         self._is_paused = True
+        self._cancel_generation += 1
         try:
             self.station.smu.ch1.ramp_stop_requested = True
         except Exception:
@@ -265,6 +352,7 @@ class SweepWorker(QtCore.QThread):
         self.mutex.lock()
         self._is_running = False
         self._is_paused = False
+        self._cancel_generation += 1
         try:
             self.station.smu.ch1.ramp_stop_requested = True
         except Exception:
@@ -275,6 +363,22 @@ class SweepWorker(QtCore.QThread):
             pass
         self.pause_cond.wakeAll()
         self.mutex.unlock()
+
+    def prepare_gate_ramp(self):
+        """Clear an earlier pause only while holding the stop/pause mutex."""
+        control = self._control
+        control.mutex.lock()
+        try:
+            while control._is_paused:
+                control.status_updated.emit('Status: Paused')
+                control.pause_cond.wait(control.mutex)
+            if not control._is_running:
+                return None
+            self.station.smu.ch1.ramp_stop_requested = False
+            self.station.smu.ch2.ramp_stop_requested = False
+            return control._cancel_generation
+        finally:
+            control.mutex.unlock()
 
     def check_pause_and_stop(self):
         self.mutex.lock()
@@ -307,7 +411,10 @@ class SweepWorker(QtCore.QThread):
 
     def _do_run(self):
         try:
+            validate_dgs_parameters(self.params)
             smu = self.station.smu
+            require_voltage_source_modes(smu)
+            smu.enforce_current_compliance()
             camera = self.station.camera
             mono = self.station.monochromator
 
@@ -348,6 +455,9 @@ class SweepWorker(QtCore.QThread):
                     do_average   = str(single_data.get("average",      vs.get("average",      "No"))) == "Yes"
                 except Exception as e:
                     print(f"SweepWorker: could not read value_storage ({e}), using defaults")
+
+            # Use the same frame count as the preallocated data array.
+            num_spectra = int(self.params.get("num_spectra", num_spectra))
 
             # Set CCD exposure and native frames count directly on the remote camera
             camera.exposure_time(exposure_time)
@@ -403,45 +513,30 @@ class SweepWorker(QtCore.QThread):
                     v1, v2 = transform_c_to_v(c1, c2, a, b, c, d)
 
                     # 2. Ramp physical voltages (blocking hardware set call, with interrupt retry loop)
-                    self.voltage_updated.emit(v1, v2)
+                    self.voltage_updated.emit(c1, c2, v1, v2)
                     while True:
                         if not self.check_pause_and_stop():
                             return
                         
-                        smu.ch1.ramp_stop_requested = False
-                        smu.ch2.ramp_stop_requested = False
-                        
-                        max_retries = 3
-                        for attempt in range(1, max_retries + 1):
-                            try:
-                                smu.ch1.set_r.volt(v1)
-                                break
-                            except Exception as ex:
-                                if attempt == max_retries:
-                                    raise ex
-                                print(f"SweepWorker: Retrying SMU1 set voltage (attempt {attempt+1}/{max_retries}) due to error: {ex}")
-                                try:
-                                    smu.visa_handle.clear()
-                                except Exception:
-                                    pass
-                                time.sleep(0.1)
-                                
-                        for attempt in range(1, max_retries + 1):
-                            try:
-                                smu.ch2.set_r.volt(v2)
-                                break
-                            except Exception as ex:
-                                if attempt == max_retries:
-                                    raise ex
-                                print(f"SweepWorker: Retrying SMU2 set voltage (attempt {attempt+1}/{max_retries}) due to error: {ex}")
-                                try:
-                                    smu.visa_handle.clear()
-                                except Exception:
-                                    pass
-                                time.sleep(0.1)
-                        
-                        # If ramping was interrupted, loop again to handle pause/stop check
-                        if getattr(smu.ch1, "ramp_stop_requested", False) or getattr(smu.ch2, "ramp_stop_requested", False):
+                        generation = self.prepare_gate_ramp()
+                        if generation is None:
+                            return
+                        try:
+                            smu.ch1.set_r.volt(v1)
+                            if not self.check_pause_and_stop():
+                                return
+                            smu.ch2.set_r.volt(v2)
+                        except GateRampCancelled:
+                            # Resume retries this entire point, with a fresh ramp
+                            # readback, before starting its full settling delay.
+                            if not self._control._is_running:
+                                return
+                            if self._control._cancel_generation == generation:
+                                raise
+                            continue
+                        if getattr(smu.ch1, 'ramp_stop_requested', False) or getattr(smu.ch2, 'ramp_stop_requested', False):
+                            if self._control._cancel_generation == generation:
+                                raise GateRampCancelled('Gate output cancelled during sweep')
                             continue
                         break
 
@@ -453,36 +548,11 @@ class SweepWorker(QtCore.QThread):
                                 return
                             time.sleep(0.05)
 
-                    # 4. Acquire spectrum with multi-exposure accumulation
-                    self.status_updated.emit(
-                        f"Status: Acquiring spectrum ({num_spectra}x, {accum_method})..."
-                    )
-                    spectrum = None
-                    if not self.check_pause_and_stop():
-                        return
-                    try:
-                        res = camera.remote_lf.get_spectrum()
-                        if res is not None:
-                            intensities, _ = res
-                            intensities_arr = np.array(intensities, dtype=float)
-                            if intensities_arr.ndim == 2:
-                                if do_average or accum_method == "Average":
-                                    intensities_arr = np.mean(intensities_arr, axis=0)
-                                else:
-                                    intensities_arr = np.sum(intensities_arr, axis=0)
-                            spectrum = intensities_arr
-                    except Exception as e:
-                        if self._is_running:
-                            print(f"SweepWorker error fetching spectrum: {e}")
-                    
-                    if spectrum is None:
-                        spectrum = np.zeros(num_pixels)
-
                     if not self.check_pause_and_stop():
                         return
 
-                    # Query hardware output states before measuring current and voltage
-                    # to prevent automated query-based power-on
+                    # 4. Read actual SMU voltage and current (before spectrum, so values
+                    #    reflect the settled state, not the state after a long exposure)
                     try:
                         ch1_on = bool(smu.ch1.output())
                         curr_ch1 = smu.ch1.measure_curr() if ch1_on else 0.0
@@ -510,8 +580,26 @@ class SweepWorker(QtCore.QThread):
                             except Exception:
                                 pass
 
+                    # 5. Acquire spectrum
+                    if not self.check_pause_and_stop():
+                        return
+                    try:
+                        spectrum, raw_frames = acquire_sweep_spectrum(
+                            camera, pixels=num_pixels, frames=num_spectra,
+                            average=do_average or accum_method == "Average",
+                            wavelengths=self.params.get('wl_axis'),
+                        )
+                    except Exception:
+                        if not self._control._is_running:
+                            return
+                        raise
+
+                    if not self.check_pause_and_stop():
+                        return
+
+                    # 6. Emit results
                     point_count += 1
-                    self.point_measured.emit(i, j, c1, c2, v1, v2, spectrum, curr_ch1, curr_ch2, meas_v1, meas_v2, meas_b)
+                    self.point_measured.emit(i, j, c1, c2, v1, v2, spectrum, curr_ch1, curr_ch2, meas_v1, meas_v2, meas_b, raw_frames)
                     self.progress_updated.emit(point_count, total_points)
 
             self.finished.emit()
@@ -756,6 +844,7 @@ class LiveStatusWorker(QtCore.QThread):
     Background worker thread to continuously poll B, V1, V2 at 5 Hz.
     """
     status_updated = QtCore.pyqtSignal(float, float, float)
+    compliance_updated = QtCore.pyqtSignal(object)
 
     def __init__(self, station, parent=None):
         super().__init__(parent)
@@ -763,6 +852,7 @@ class LiveStatusWorker(QtCore.QThread):
         self._stop_requested = False
         self._is_paused = False
         self._actively_polling = False
+        self._last_compliance_poll = 0.0
 
     def stop(self):
         self._stop_requested = True
@@ -860,6 +950,10 @@ class LiveStatusWorker(QtCore.QThread):
                                 except Exception:
                                     pass
                 
+                if smu is not None and not (getattr(smu.ch1, 'ramping', False) or getattr(smu.ch2, 'ramping', False)):
+                    if time.monotonic() - self._last_compliance_poll >= 1.0:
+                        self.compliance_updated.emit(read_compliance_values(smu))
+                        self._last_compliance_poll = time.monotonic()
                 self.status_updated.emit(b_val, v1_val, v2_val)
             except Exception:
                 pass
@@ -869,10 +963,17 @@ class LiveStatusWorker(QtCore.QThread):
             self.msleep(200) # 5 Hz
 
 class MainWindow(QtWidgets.QMainWindow):
+    editable_current_compliance = True
+
     def __init__(self, station, embed=False):
         super().__init__()
         self.station = station
         self._embed = embed
+        self.plotter_mode = False
+        self._compliance_readbacks = {}
+        self._compliance_edits = set()
+        self._applying_compliance = False
+        install_parameter_wheel_guard(self)
         self.setWindowTitle("Electrostatic Gate Control & 2D Sweep Spectrometer")
         self.setMinimumSize(1280, 850)
 
@@ -898,6 +999,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # 3D spectra storage: (c2_len, c1_len, 512)
         self.data_spectra = np.array([])
+        self.data_raw_spectra = np.array([])
         self.data_current_ch1 = np.array([])
         self.data_current_ch2 = np.array([])
         self.data_measured_mask = np.array([]) # Tracks which points are measured
@@ -905,6 +1007,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Energy calibration axis
         self.energy_axis = np.linspace(1.5, 3.0, 512) # Dummy range initialized at startup
+        self.linear_energy_axis = self.energy_axis
         self.energy_sort_idx = np.arange(512)
         self.selected_energy = 2.25
 
@@ -916,6 +1019,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.load_storage()
 
         self.setup_ui()
+        self._update_compliance_controls()
+        # Manual naming metadata only: never sends a monochromator command.
+        self.filename_wavelength_box = QtWidgets.QDoubleSpinBox()
+        self.filename_wavelength_box.setRange(1, 100000)
+        self.filename_wavelength_box.setValue(1090)
+        self.filename_wavelength_box.setSuffix(" nm")
+        self.filename_wavelength_box.setToolTip("Central wavelength for the saved filename; entered manually, not a hardware setting.")
+        naming_layout = QtWidgets.QFormLayout()
+        naming_layout.addRow("Filename wavelength:", self.filename_wavelength_box)
+        self.save_btn.parentWidget().layout().addLayout(naming_layout)
         self.apply_theme()
         
         # Read live output states from physical SMU at startup to sync buttons
@@ -949,19 +1062,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ch2_mode.blockSignals(False)
             
             # Trigger label/range adjustments to match active modes
-            self.on_mode_changed()
+            self.on_mode_changed(write_hardware=False)
             
-            # Sync compliance values as well
-            if ch1_mode == "CURR":
-                self.ch1_compliance.setValue(smu.ch1.volt_limit())
-            else:
-                self.ch1_compliance.setValue(smu.ch1.curr_limit())
-                
-            if ch2_mode == "CURR":
-                self.ch2_compliance.setValue(smu.ch2.volt_limit())
-            else:
-                self.ch2_compliance.setValue(smu.ch2.curr_limit())
-                
+            self.on_compliance_readback(read_compliance_values(smu))
+
             # Release front panel lock back to local control
             try:
                 smu.return_to_local()
@@ -975,13 +1079,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # Start background 5 Hz status polling worker
         self.live_status_worker = LiveStatusWorker(self.station, parent=self)
         self.live_status_worker.status_updated.connect(self.on_live_status_updated)
+        self.live_status_worker.compliance_updated.connect(self.on_compliance_readback)
         self.live_status_worker.start()
 
     def setup_histogram_lut(self, plot_win, image_item, interactive=True):
         """Helper to create a HistogramLUTItem with the colorbar positioned between the plot and the scale."""
         hist = pg.HistogramLUTItem(gradientPosition='left')
         hist.setImageItem(image_item)
-        hist.gradient.loadPreset('thermal')
+        hist.gradient.loadPreset('viridis')
         
         # Rearrange layout to place colorbar between plot (2D heatmap) and scale (histogram + axis)
         hist.layout.removeItem(hist.gradient)
@@ -1036,11 +1141,13 @@ class MainWindow(QtWidgets.QMainWindow):
             "settling_time": 0.05,
             "ramprate1": 0.1,
             "ramprate2": 0.1,
-            "ramp_step": 0.0005,
+            "ramp_step": 0.05,
             "c1_name": "Vc1",
             "c2_name": "Vc2",
-            "v1_compliance": 0.01,
-            "v2_compliance": 0.01,
+            "v1_compliance": GATE_CURRENT_COMPLIANCE_A,
+            "v1_voltage_compliance": 10.0,
+            "v2_compliance": GATE_CURRENT_COMPLIANCE_A,
+            "v2_voltage_compliance": 10.0,
             "c1_start": -0.005,
             "c1_end": 0.005,
             "c1_pts": 21,
@@ -1069,16 +1176,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 for key in defaults:
                     if key not in ("exposure_time", "settling_time"):
                         if key == "v1_compliance":
-                            self.stored_settings[key] = dg_data.get("v1_compliance", dg_data.get("c1_compliance", raw_data.get("v1_compliance", raw_data.get("c1_compliance", defaults[key]))))
+                            self.stored_settings[key] = GATE_CURRENT_COMPLIANCE_A
                         elif key == "v2_compliance":
-                            self.stored_settings[key] = dg_data.get("v2_compliance", dg_data.get("c2_compliance", raw_data.get("v2_compliance", raw_data.get("c2_compliance", defaults[key]))))
+                            self.stored_settings[key] = GATE_CURRENT_COMPLIANCE_A
                         elif key == "c1_name":
                             self.stored_settings[key] = shared_data.get("c1_name", dg_data.get("c1_name", raw_data.get("c1_name", defaults["c1_name"])))
                         elif key == "c2_name":
                             self.stored_settings[key] = shared_data.get("c2_name", dg_data.get("c2_name", raw_data.get("c2_name", defaults["c2_name"])))
                         elif key in ("coeff_a", "coeff_b", "coeff_c", "coeff_d"):
                             legacy_key = f"dg_coeff_{key[-1]}"
-                            self.stored_settings[key] = shared_data.get(key, dg_data.get(legacy_key, raw_data.get(legacy_key, defaults[key])))
+                            self.stored_settings[key] = dg_data.get(key, dg_data.get(legacy_key,
+                                raw_data.get(legacy_key, shared_data.get(key, defaults[key]))))
                         else:
                             self.stored_settings[key] = dg_data.get(key, raw_data.get(key, defaults[key]))
 
@@ -1099,6 +1207,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 print(f"Error loading value_storage: {e}")
 
     def save_storage(self):
+        if getattr(self, "plotter_mode", False):
+            return
         storage_path = os.path.join(parent_dir, "value_storage")
         if hasattr(self, "c1_name_edit"):
             self.stored_settings["c1_name"] = self.c1_name_edit.text()
@@ -1132,6 +1242,10 @@ class MainWindow(QtWidgets.QMainWindow):
             current_data["shared"]["coeff_b"] = self.stored_settings.get("coeff_b", 0.0)
             current_data["shared"]["coeff_c"] = self.stored_settings.get("coeff_c", 0.0)
             current_data["shared"]["coeff_d"] = self.stored_settings.get("coeff_d", 1.0)
+            # DGS owns its matrix. Shared values remain a compatibility mirror
+            # for map panels; B/V owns its independent control coefficients.
+            for key in ('coeff_a', 'coeff_b', 'coeff_c', 'coeff_d'):
+                current_data["dual_gate"][key] = self.stored_settings[key]
             camera = getattr(self.station, "camera", None)
             current_data["shared"]["spectrometer"] = getattr(camera, "spectrometer_type", "lightfieldG15")
             current_data["dual_gate"]["ramprate1"] = self.stored_settings.get("ramprate1", 0.1)
@@ -1142,9 +1256,9 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # New inputs
             if hasattr(self, "ch1_compliance"):
-                current_data["dual_gate"]["v1_compliance"] = self.ch1_compliance.value()
+                current_data["dual_gate"]["v1_compliance"] = self._compliance_setting(1)
             if hasattr(self, "ch2_compliance"):
-                current_data["dual_gate"]["v2_compliance"] = self.ch2_compliance.value()
+                current_data["dual_gate"]["v2_compliance"] = self._compliance_setting(2)
             if hasattr(self, "c1_start"):
                 current_data["dual_gate"]["c1_start"] = self.c1_start.value()
             if hasattr(self, "c1_end"):
@@ -1195,6 +1309,8 @@ class MainWindow(QtWidgets.QMainWindow):
             print(f"Error saving to value_storage: {e}")
 
     def reload_gui_from_storage(self):
+        if getattr(self, "plotter_mode", False):
+            return
         self.load_storage()
         
         self.c1_name_edit.blockSignals(True)
@@ -1223,11 +1339,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Compliance
         self.ch1_compliance.blockSignals(True)
-        self.ch1_compliance.setValue(self.stored_settings.get("v1_compliance", 0.01))
+        self.ch1_compliance.setValue(self._compliance_setting(1))
         self.ch1_compliance.blockSignals(False)
 
         self.ch2_compliance.blockSignals(True)
-        self.ch2_compliance.setValue(self.stored_settings.get("v2_compliance", 0.01))
+        self.ch2_compliance.setValue(self._compliance_setting(2))
         self.ch2_compliance.blockSignals(False)
 
         # Sweep range C1
@@ -1284,6 +1400,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.update_step_calculations()
         self.update_variable_names()
+        self.update_coordinates_from_ui()
         self.on_compliance_changed()
 
     def create_scientific_validator(self, minimum, maximum, decimals):
@@ -1392,11 +1509,13 @@ class MainWindow(QtWidgets.QMainWindow):
         grid1.addWidget(self.ch1_compliance_lbl, 4, 0)
         self.ch1_compliance = QtWidgets.QDoubleSpinBox()
         self.ch1_compliance.setRange(1e-9, 3.0)
-        self.ch1_compliance.setDecimals(6)
-        self.ch1_compliance.setValue(self.stored_settings.get("v1_compliance", 0.01))
+        self.ch1_compliance.setDecimals(9)
+        self.ch1_compliance.setValue(self._compliance_setting(1))
         self.ch1_compliance.setSingleStep(0.001)
         self.ch1_compliance.setKeyboardTracking(False)
-        self.ch1_compliance.editingFinished.connect(self.on_compliance_changed)
+        self.ch1_compliance.valueChanged.connect(lambda _value: self._compliance_edits.add(1))
+        self.ch1_compliance.lineEdit().textEdited.connect(lambda _text: self._compliance_edits.add(1))
+        self.ch1_compliance.editingFinished.connect(lambda: self.on_compliance_changed(1))
         self.ch1_compliance.setSuffix(" A")
         grid1.addWidget(self.ch1_compliance, 4, 1)
         ch1_layout.addLayout(grid1)
@@ -1518,11 +1637,13 @@ class MainWindow(QtWidgets.QMainWindow):
         grid2.addWidget(self.ch2_compliance_lbl, 4, 0)
         self.ch2_compliance = QtWidgets.QDoubleSpinBox()
         self.ch2_compliance.setRange(1e-9, 3.0)
-        self.ch2_compliance.setDecimals(6)
-        self.ch2_compliance.setValue(self.stored_settings.get("v2_compliance", 0.01))
+        self.ch2_compliance.setDecimals(9)
+        self.ch2_compliance.setValue(self._compliance_setting(2))
         self.ch2_compliance.setSingleStep(0.001)
         self.ch2_compliance.setKeyboardTracking(False)
-        self.ch2_compliance.editingFinished.connect(self.on_compliance_changed)
+        self.ch2_compliance.valueChanged.connect(lambda _value: self._compliance_edits.add(2))
+        self.ch2_compliance.lineEdit().textEdited.connect(lambda _text: self._compliance_edits.add(2))
+        self.ch2_compliance.editingFinished.connect(lambda: self.on_compliance_changed(2))
         self.ch2_compliance.setSuffix(" A")
         grid2.addWidget(self.ch2_compliance, 4, 1)
         ch2_layout.addLayout(grid2)
@@ -1625,8 +1746,8 @@ class MainWindow(QtWidgets.QMainWindow):
         matrix_grid = QtWidgets.QGridLayout()
         matrix_grid.setSpacing(6)
 
-        # Row 1: V1 = coeff_a * C1 + coeff_b * C2
-        self.v1_formula_label = QtWidgets.QLabel("Voltage 1 =")
+        # Row 1: VG1 = coeff_a * ch1 + coeff_b * ch2
+        self.v1_formula_label = QtWidgets.QLabel(f"{c1_default_name} =")
         matrix_grid.addWidget(self.v1_formula_label, 0, 0)
 
         self.coeff_a = QtWidgets.QDoubleSpinBox()
@@ -1637,7 +1758,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.coeff_a.setKeyboardTracking(False)
         matrix_grid.addWidget(self.coeff_a, 0, 1)
 
-        self.v1_c1_label = QtWidgets.QLabel(f" * {c1_default_name}  + ")
+        self.v1_c1_label = QtWidgets.QLabel(" * ch1  + ")
         matrix_grid.addWidget(self.v1_c1_label, 0, 2)
 
         self.coeff_b = QtWidgets.QDoubleSpinBox()
@@ -1648,11 +1769,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.coeff_b.setKeyboardTracking(False)
         matrix_grid.addWidget(self.coeff_b, 0, 3)
 
-        self.v1_c2_label = QtWidgets.QLabel(f" * {c2_default_name}")
+        self.v1_c2_label = QtWidgets.QLabel(" * ch2")
         matrix_grid.addWidget(self.v1_c2_label, 0, 4)
 
-        # Row 2: V2 = coeff_c * C1 + coeff_d * C2
-        self.v2_formula_label = QtWidgets.QLabel("Voltage 2 =")
+        # Row 2: VG2 = coeff_c * ch1 + coeff_d * ch2
+        self.v2_formula_label = QtWidgets.QLabel(f"{c2_default_name} =")
         matrix_grid.addWidget(self.v2_formula_label, 1, 0)
 
         self.coeff_c = QtWidgets.QDoubleSpinBox()
@@ -1663,7 +1784,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.coeff_c.setKeyboardTracking(False)
         matrix_grid.addWidget(self.coeff_c, 1, 1)
 
-        self.v2_c1_label = QtWidgets.QLabel(f" * {c1_default_name}  + ")
+        self.v2_c1_label = QtWidgets.QLabel(" * ch1  + ")
         matrix_grid.addWidget(self.v2_c1_label, 1, 2)
 
         self.coeff_d = QtWidgets.QDoubleSpinBox()
@@ -1674,10 +1795,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.coeff_d.setKeyboardTracking(False)
         matrix_grid.addWidget(self.coeff_d, 1, 3)
 
-        self.v2_c2_label = QtWidgets.QLabel(f" * {c2_default_name}")
+        self.v2_c2_label = QtWidgets.QLabel(" * ch2")
         matrix_grid.addWidget(self.v2_c2_label, 1, 4)
 
         gate_layout.addLayout(matrix_grid)
+
+        # Determinant indicator — shown below the matrix
+        self.det_label = QtWidgets.QLabel("det = 1.0000  ✓")
+        self.det_label.setStyleSheet("color: #16a34a; font-weight: bold; font-size: 11px;")
+        gate_layout.addWidget(self.det_label)
+
         left_layout.addWidget(gate_box)
 
         # Connect name change events to update layouts and axes
@@ -1686,11 +1813,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.c1_name_edit.editingFinished.connect(self.save_storage)
         self.c2_name_edit.editingFinished.connect(self.save_storage)
 
-        # Connect coefficient updates to automatically recalculate coordinates
+        # Connect coefficient updates to automatically recalculate coordinates and det
         self.coeff_a.editingFinished.connect(self.on_sweep_range_changed)
         self.coeff_b.editingFinished.connect(self.on_sweep_range_changed)
         self.coeff_c.editingFinished.connect(self.on_sweep_range_changed)
         self.coeff_d.editingFinished.connect(self.on_sweep_range_changed)
+        self.coeff_a.editingFinished.connect(self.update_det_label)
+        self.coeff_b.editingFinished.connect(self.update_det_label)
+        self.coeff_c.editingFinished.connect(self.update_det_label)
+        self.coeff_d.editingFinished.connect(self.update_det_label)
 
         # --- ROW 4: Other Settings & Measurement Control next to each other ---
         bottom_row = QtWidgets.QHBoxLayout()
@@ -1989,7 +2120,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.spectrum_win.setLabel('left', 'Counts')
         self.spectrum_win.setLabel('bottom', 'Energy', units='eV')
-        self.spectrum_win.showGrid(x=True, y=True, alpha=0.3)
+        self.spectrum_win.showGrid(x=False, y=False)
 
         # Draggable vertical lines (spectrum_v1 and spectrum_v2) to highlight region (X-axis integration window)
         self.spectrum_v_region = pg.LinearRegionItem(
@@ -2079,7 +2210,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t2_vslice_curve = self.t2_vslice_win.plot(pen=pg.mkPen('#d97706', width=2))
         self.t2_vslice_win.setLabel('left', 'Current', units='A')
         self.t2_vslice_win.setLabel('bottom', 'Virtual Gate C2', units='V')
-        self.t2_vslice_win.showGrid(x=True, y=True, alpha=0.3)
+        self.t2_vslice_win.showGrid(x=False, y=False)
         layout.addWidget(self.t2_vslice_win, 0, 1)
 
         # Horizontal Slice (Bottom Left)
@@ -2090,7 +2221,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t2_hslice_curve = self.t2_hslice_win.plot(pen=pg.mkPen('#2563eb', width=2))
         self.t2_hslice_win.setLabel('left', 'Current', units='A')
         self.t2_hslice_win.setLabel('bottom', 'Virtual Gate C1', units='V')
-        self.t2_hslice_win.showGrid(x=True, y=True, alpha=0.3)
+        self.t2_hslice_win.showGrid(x=False, y=False)
         layout.addWidget(self.t2_hslice_win, 1, 0)
 
         # Empty (Bottom Right)
@@ -2151,7 +2282,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t3_vslice_curve = self.t3_vslice_win.plot(pen=pg.mkPen('#d97706', width=2))
         self.t3_vslice_win.setLabel('left', 'Current', units='A')
         self.t3_vslice_win.setLabel('bottom', 'Virtual Gate C2', units='V')
-        self.t3_vslice_win.showGrid(x=True, y=True, alpha=0.3)
+        self.t3_vslice_win.showGrid(x=False, y=False)
         layout.addWidget(self.t3_vslice_win, 0, 1)
 
         # Horizontal Slice (Bottom Left)
@@ -2162,7 +2293,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t3_hslice_curve = self.t3_hslice_win.plot(pen=pg.mkPen('#2563eb', width=2))
         self.t3_hslice_win.setLabel('left', 'Current', units='A')
         self.t3_hslice_win.setLabel('bottom', 'Virtual Gate C1', units='V')
-        self.t3_hslice_win.showGrid(x=True, y=True, alpha=0.3)
+        self.t3_hslice_win.showGrid(x=False, y=False)
         layout.addWidget(self.t3_hslice_win, 1, 0)
 
         # Empty (Bottom Right)
@@ -2173,7 +2304,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Helper to create a HistogramLUTItem with the colorbar positioned between the plot and the scale."""
         hist = pg.HistogramLUTItem(gradientPosition='left')
         hist.setImageItem(image_item)
-        hist.gradient.loadPreset('thermal')
+        hist.gradient.loadPreset('viridis')
         
         # Rearrange layout to place colorbar between plot (2D heatmap) and scale (histogram + axis)
         hist.layout.removeItem(hist.gradient)
@@ -2228,11 +2359,13 @@ class MainWindow(QtWidgets.QMainWindow):
             "settling_time": 0.05,
             "ramprate1": 0.1,
             "ramprate2": 0.1,
-            "ramp_step": 0.0005,
+            "ramp_step": 0.05,
             "c1_name": "Vc1",
             "c2_name": "Vc2",
-            "v1_compliance": 0.01,
-            "v2_compliance": 0.01,
+            "v1_compliance": GATE_CURRENT_COMPLIANCE_A,
+            "v1_voltage_compliance": 10.0,
+            "v2_compliance": GATE_CURRENT_COMPLIANCE_A,
+            "v2_voltage_compliance": 10.0,
             "c1_start": -0.005,
             "c1_end": 0.005,
             "c1_pts": 21,
@@ -2261,16 +2394,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 for key in defaults:
                     if key not in ("exposure_time", "settling_time"):
                         if key == "v1_compliance":
-                            self.stored_settings[key] = dg_data.get("v1_compliance", dg_data.get("c1_compliance", raw_data.get("v1_compliance", raw_data.get("c1_compliance", defaults[key]))))
+                            self.stored_settings[key] = GATE_CURRENT_COMPLIANCE_A
                         elif key == "v2_compliance":
-                            self.stored_settings[key] = dg_data.get("v2_compliance", dg_data.get("c2_compliance", raw_data.get("v2_compliance", raw_data.get("c2_compliance", defaults[key]))))
+                            self.stored_settings[key] = GATE_CURRENT_COMPLIANCE_A
                         elif key == "c1_name":
                             self.stored_settings[key] = shared_data.get("c1_name", dg_data.get("c1_name", raw_data.get("c1_name", defaults["c1_name"])))
                         elif key == "c2_name":
                             self.stored_settings[key] = shared_data.get("c2_name", dg_data.get("c2_name", raw_data.get("c2_name", defaults["c2_name"])))
                         elif key in ("coeff_a", "coeff_b", "coeff_c", "coeff_d"):
                             legacy_key = f"dg_coeff_{key[-1]}"
-                            self.stored_settings[key] = shared_data.get(key, dg_data.get(legacy_key, raw_data.get(legacy_key, defaults[key])))
+                            self.stored_settings[key] = dg_data.get(key, dg_data.get(legacy_key,
+                                raw_data.get(legacy_key, shared_data.get(key, defaults[key]))))
                         else:
                             self.stored_settings[key] = dg_data.get(key, raw_data.get(key, defaults[key]))
 
@@ -2291,6 +2425,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 print(f"Error loading value_storage: {e}")
 
     def save_storage(self):
+        if getattr(self, "plotter_mode", False):
+            return
         storage_path = os.path.join(parent_dir, "value_storage")
         if hasattr(self, "c1_name_edit"):
             self.stored_settings["c1_name"] = self.c1_name_edit.text()
@@ -2324,6 +2460,10 @@ class MainWindow(QtWidgets.QMainWindow):
             current_data["shared"]["coeff_b"] = self.stored_settings.get("coeff_b", 0.0)
             current_data["shared"]["coeff_c"] = self.stored_settings.get("coeff_c", 0.0)
             current_data["shared"]["coeff_d"] = self.stored_settings.get("coeff_d", 1.0)
+            # DGS owns its matrix. Shared values remain a compatibility mirror
+            # for map panels; B/V owns its independent control coefficients.
+            for key in ('coeff_a', 'coeff_b', 'coeff_c', 'coeff_d'):
+                current_data["dual_gate"][key] = self.stored_settings[key]
             camera = getattr(self.station, "camera", None)
             current_data["shared"]["spectrometer"] = getattr(camera, "spectrometer_type", "lightfieldG15")
             current_data["dual_gate"]["ramprate1"] = self.stored_settings.get("ramprate1", 0.1)
@@ -2334,9 +2474,9 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # New inputs
             if hasattr(self, "ch1_compliance"):
-                current_data["dual_gate"]["v1_compliance"] = self.ch1_compliance.value()
+                current_data["dual_gate"]["v1_compliance"] = self._compliance_setting(1)
             if hasattr(self, "ch2_compliance"):
-                current_data["dual_gate"]["v2_compliance"] = self.ch2_compliance.value()
+                current_data["dual_gate"]["v2_compliance"] = self._compliance_setting(2)
             if hasattr(self, "c1_start"):
                 current_data["dual_gate"]["c1_start"] = self.c1_start.value()
             if hasattr(self, "c1_end"):
@@ -2387,6 +2527,8 @@ class MainWindow(QtWidgets.QMainWindow):
             print(f"Error saving to value_storage: {e}")
 
     def reload_gui_from_storage(self):
+        if getattr(self, "plotter_mode", False):
+            return
         self.load_storage()
         
         self.c1_name_edit.blockSignals(True)
@@ -2415,11 +2557,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Compliance
         self.ch1_compliance.blockSignals(True)
-        self.ch1_compliance.setValue(self.stored_settings.get("v1_compliance", 0.01))
+        self.ch1_compliance.setValue(self._compliance_setting(1))
         self.ch1_compliance.blockSignals(False)
 
         self.ch2_compliance.blockSignals(True)
-        self.ch2_compliance.setValue(self.stored_settings.get("v2_compliance", 0.01))
+        self.ch2_compliance.setValue(self._compliance_setting(2))
         self.ch2_compliance.blockSignals(False)
 
         # Sweep range C1
@@ -2476,6 +2618,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.update_step_calculations()
         self.update_variable_names()
+        self.update_coordinates_from_ui()
         self.on_compliance_changed()
 
     def create_scientific_validator(self, minimum, maximum, decimals):
@@ -2584,11 +2727,13 @@ class MainWindow(QtWidgets.QMainWindow):
         grid1.addWidget(self.ch1_compliance_lbl, 4, 0)
         self.ch1_compliance = QtWidgets.QDoubleSpinBox()
         self.ch1_compliance.setRange(1e-9, 3.0)
-        self.ch1_compliance.setDecimals(6)
-        self.ch1_compliance.setValue(self.stored_settings.get("v1_compliance", 0.01))
+        self.ch1_compliance.setDecimals(9)
+        self.ch1_compliance.setValue(self._compliance_setting(1))
         self.ch1_compliance.setSingleStep(0.001)
         self.ch1_compliance.setKeyboardTracking(False)
-        self.ch1_compliance.editingFinished.connect(self.on_compliance_changed)
+        self.ch1_compliance.valueChanged.connect(lambda _value: self._compliance_edits.add(1))
+        self.ch1_compliance.lineEdit().textEdited.connect(lambda _text: self._compliance_edits.add(1))
+        self.ch1_compliance.editingFinished.connect(lambda: self.on_compliance_changed(1))
         self.ch1_compliance.setSuffix(" A")
         grid1.addWidget(self.ch1_compliance, 4, 1)
         ch1_layout.addLayout(grid1)
@@ -2710,11 +2855,13 @@ class MainWindow(QtWidgets.QMainWindow):
         grid2.addWidget(self.ch2_compliance_lbl, 4, 0)
         self.ch2_compliance = QtWidgets.QDoubleSpinBox()
         self.ch2_compliance.setRange(1e-9, 3.0)
-        self.ch2_compliance.setDecimals(6)
-        self.ch2_compliance.setValue(self.stored_settings.get("v2_compliance", 0.01))
+        self.ch2_compliance.setDecimals(9)
+        self.ch2_compliance.setValue(self._compliance_setting(2))
         self.ch2_compliance.setSingleStep(0.001)
         self.ch2_compliance.setKeyboardTracking(False)
-        self.ch2_compliance.editingFinished.connect(self.on_compliance_changed)
+        self.ch2_compliance.valueChanged.connect(lambda _value: self._compliance_edits.add(2))
+        self.ch2_compliance.lineEdit().textEdited.connect(lambda _text: self._compliance_edits.add(2))
+        self.ch2_compliance.editingFinished.connect(lambda: self.on_compliance_changed(2))
         self.ch2_compliance.setSuffix(" A")
         grid2.addWidget(self.ch2_compliance, 4, 1)
         ch2_layout.addLayout(grid2)
@@ -2870,6 +3017,9 @@ class MainWindow(QtWidgets.QMainWindow):
         matrix_grid.addWidget(self.v2_c2_label, 1, 4)
 
         gate_layout.addLayout(matrix_grid)
+        self.det_label = QtWidgets.QLabel()
+        self.det_label.setWordWrap(True)
+        gate_layout.addWidget(self.det_label)
         left_layout.addWidget(gate_box)
 
         # Connect name change events to update layouts and axes
@@ -3147,11 +3297,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # Draggable crosshair lines
         self.hslice_cross_v = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen('#4f46e5', width=2))
         self.hslice_cross_h = pg.InfiniteLine(angle=0, movable=True, pen=pg.mkPen('#4f46e5', width=2))
-        # Do not add crosshair lines to Horizontal Slice plot (Plot C) per user request
-        # self.hslice_win.addItem(self.hslice_cross_v)
-        # self.hslice_win.addItem(self.hslice_cross_h)
-        # self.hslice_cross_v.sigPositionChanged.connect(self.on_hslice_crosshair_moved)
-        # self.hslice_cross_h.sigPositionChanged.connect(self.on_hslice_crosshair_moved)
+        self.hslice_win.addItem(self.hslice_cross_v)
+        self.hslice_win.addItem(self.hslice_cross_h)
+        self.hslice_cross_v.sigPositionChanged.connect(self.on_hslice_crosshair_moved)
+        self.hslice_cross_h.sigPositionChanged.connect(self.on_hslice_crosshair_moved)
 
         # Monkey-patch ViewBox to intercept left clicks and reposition crosshair lines
         viewbox_hslice = self.hslice_win.getViewBox()
@@ -3181,7 +3330,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.spectrum_win.setLabel('left', 'Counts')
         self.spectrum_win.setLabel('bottom', 'Energy', units='eV')
-        self.spectrum_win.showGrid(x=True, y=True, alpha=0.3)
+        self.spectrum_win.showGrid(x=False, y=False)
 
         # Draggable vertical lines (spectrum_v1 and spectrum_v2) to highlight region (X-axis integration window)
         self.spectrum_v_region = pg.LinearRegionItem(
@@ -3271,7 +3420,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t2_vslice_curve = self.t2_vslice_win.plot(pen=pg.mkPen('#d97706', width=2))
         self.t2_vslice_win.setLabel('left', 'Current', units='A')
         self.t2_vslice_win.setLabel('bottom', 'Virtual Gate C2', units='V')
-        self.t2_vslice_win.showGrid(x=True, y=True, alpha=0.3)
+        self.t2_vslice_win.showGrid(x=False, y=False)
         layout.addWidget(self.t2_vslice_win, 0, 1)
 
         # Horizontal Slice (Bottom Left)
@@ -3282,7 +3431,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t2_hslice_curve = self.t2_hslice_win.plot(pen=pg.mkPen('#2563eb', width=2))
         self.t2_hslice_win.setLabel('left', 'Current', units='A')
         self.t2_hslice_win.setLabel('bottom', 'Virtual Gate C1', units='V')
-        self.t2_hslice_win.showGrid(x=True, y=True, alpha=0.3)
+        self.t2_hslice_win.showGrid(x=False, y=False)
         layout.addWidget(self.t2_hslice_win, 1, 0)
 
         # Empty (Bottom Right)
@@ -3343,7 +3492,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t3_vslice_curve = self.t3_vslice_win.plot(pen=pg.mkPen('#d97706', width=2))
         self.t3_vslice_win.setLabel('left', 'Current', units='A')
         self.t3_vslice_win.setLabel('bottom', 'Virtual Gate C2', units='V')
-        self.t3_vslice_win.showGrid(x=True, y=True, alpha=0.3)
+        self.t3_vslice_win.showGrid(x=False, y=False)
         layout.addWidget(self.t3_vslice_win, 0, 1)
 
         # Horizontal Slice (Bottom Left)
@@ -3354,7 +3503,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t3_hslice_curve = self.t3_hslice_win.plot(pen=pg.mkPen('#2563eb', width=2))
         self.t3_hslice_win.setLabel('left', 'Current', units='A')
         self.t3_hslice_win.setLabel('bottom', 'Virtual Gate C1', units='V')
-        self.t3_hslice_win.showGrid(x=True, y=True, alpha=0.3)
+        self.t3_hslice_win.showGrid(x=False, y=False)
         layout.addWidget(self.t3_hslice_win, 1, 0)
 
         # Empty (Bottom Right)
@@ -3374,12 +3523,13 @@ class MainWindow(QtWidgets.QMainWindow):
         for attr_name in dir(self):
             attr = getattr(self, attr_name, None)
             if isinstance(attr, pg.PlotWidget):
+                configure_plot_axes(attr)
                 attr.setBackground('#ffffff')
                 attr.getAxis('left').setPen(pg.mkPen('#334155'))
                 attr.getAxis('bottom').setPen(pg.mkPen('#334155'))
                 attr.getAxis('left').setTextPen(pg.mkPen('#334155'))
                 attr.getAxis('bottom').setTextPen(pg.mkPen('#334155'))
-                attr.showGrid(x=True, y=True, alpha=0.15)
+                attr.showGrid(x=False, y=False)
 
     def pause_status_polling(self):
         """Temporarily pause the live status worker and wait to ensure no active VISA query is running."""
@@ -3400,6 +3550,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # --- Live Parameter Readout ---
     # --- Live Parameter Readout (On Demand) ---
     def read_channel_one(self):
+        if getattr(self, "plotter_mode", False):
+            return
         was_paused = self.pause_status_polling()
         try:
             smu = self.station.smu
@@ -3436,6 +3588,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.resume_status_polling(was_paused)
 
     def read_channel_two(self):
+        if getattr(self, "plotter_mode", False):
+            return
         was_paused = self.pause_status_polling()
         try:
             smu = self.station.smu
@@ -3474,8 +3628,21 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_live_status_updated(self, b_val, v1_val, v2_val):
         self._last_polled_b = b_val
         self.lbl_current_b.setText(f"B = {b_val:.4f} T")
-        self.lbl_target_vc1.setText(f"V1 = {v1_val:.4f} V")
-        self.lbl_target_vc2.setText(f"V2 = {v2_val:.4f} V")
+
+        # Forward mapping: VG = M * CH  →  vg1 = a*v1 + b*v2,  vg2 = c*v1 + d*v2
+        a = self.coeff_a.value()
+        b = self.coeff_b.value()
+        c = self.coeff_c.value()
+        d = self.coeff_d.value()
+
+        c1_val = a * v1_val + b * v2_val
+        c2_val = c * v1_val + d * v2_val
+
+        c1_label = self.c1_name_edit.text() if hasattr(self, "c1_name_edit") and self.c1_name_edit.text() else "C1"
+        c2_label = self.c2_name_edit.text() if hasattr(self, "c2_name_edit") and self.c2_name_edit.text() else "C2"
+
+        self.lbl_target_vc1.setText(f"{c1_label} = {c1_val:.4f} V (V1 = {v1_val:.4f} V)")
+        self.lbl_target_vc2.setText(f"{c2_label} = {c2_val:.4f} V (V2 = {v2_val:.4f} V)")
 
     # --- Event Handlers & Input Syncing ---
     def update_step_calculations(self):
@@ -3511,13 +3678,16 @@ class MainWindow(QtWidgets.QMainWindow):
         c = self.coeff_c.value()
         d = self.coeff_d.value()
 
-        self.v1_grid = np.zeros((c2_pts_actual, c1_pts_actual))
-        self.v2_grid = np.zeros((c2_pts_actual, c1_pts_actual))
-        for j, c2_val in enumerate(self.c2_coords):
-            for i, c1_val in enumerate(self.c1_coords):
-                v1, v2 = transform_c_to_v(c1_val, c2_val, a, b, c, d)
-                self.v1_grid[j, i] = v1
-                self.v2_grid[j, i] = v2
+        try:
+            c1, c2 = np.meshgrid(self.c1_coords, self.c2_coords)
+            self.v1_grid, self.v2_grid = transform_c_to_v(c1, c2, a, b, c, d)
+        except ValueError:
+            # Saved or temporarily edited singular matrices must not prevent
+            # opening the GUI. Undefined targets cannot be used for a sweep.
+            shape = (c2_pts_actual, c1_pts_actual)
+            self.v1_grid = np.full(shape, np.nan)
+            self.v2_grid = np.full(shape, np.nan)
+        self.update_det_label()
 
     def on_sweep_range_changed(self):
         """Called dynamically when sweep parameters are changed in the UI."""
@@ -3526,6 +3696,30 @@ class MainWindow(QtWidgets.QMainWindow):
             self.update_coordinates_from_ui()
             self.reset_plot_scaling(reset_spectrum=False)
             self.save_storage()
+
+    def update_det_label(self):
+        """Recompute and display the determinant of the gate transformation matrix."""
+        a = self.coeff_a.value()
+        b = self.coeff_b.value()
+        c = self.coeff_c.value()
+        d = self.coeff_d.value()
+        det = a * d - b * c
+        try:
+            transform_c_to_v(0, 0, a, b, c, d)
+            valid = True
+            text = f"det = {det:.4g}"
+        except ValueError as error:
+            valid = False
+            text = f"Sweep disabled: {error}"
+        if hasattr(self, 'det_label'):
+            self.det_label.setText(text)
+            color = '#16a34a' if valid else '#dc2626'
+            self.det_label.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 11px;")
+        can_begin = valid and not getattr(self, 'plotter_mode', False)
+        ramp = getattr(self, 'ramp_worker', None)
+        if hasattr(self, 'begin_btn') and not self.is_running and not (ramp and ramp.isRunning()):
+            self.begin_btn.setEnabled(can_begin)
+        return can_begin
 
     def update_variable_names(self):
         """Dynamically update control group box titles, labels, equations and plot axes on user edit."""
@@ -3536,11 +3730,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ctrl_c1_box.setTitle(f"{c1_name}")
         self.ctrl_c2_box.setTitle(f"{c2_name}")
 
-        # Update formulas labels
-        self.v1_c1_label.setText(f" * {c1_name}  + ")
-        self.v1_c2_label.setText(f" * {c2_name}")
-        self.v2_c1_label.setText(f" * {c1_name}  + ")
-        self.v2_c2_label.setText(f" * {c2_name}")
+        # Update formula row labels (channel names are fixed; VG names update the row prefix)
+        self.v1_formula_label.setText(f"{c1_name} =")
+        self.v2_formula_label.setText(f"{c2_name} =")
+        self.v1_c1_label.setText(" * ch1  + ")
+        self.v1_c2_label.setText(" * ch2")
+        self.v2_c1_label.setText(" * ch1  + ")
+        self.v2_c2_label.setText(" * ch2")
+        self.update_det_label()
 
         # Format axes label strings
         c1_label = f"Vc1 ({c1_name})" if c1_name.lower() != "vc1" else "Vc1"
@@ -3569,6 +3766,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 't3_vslice_win'):
             self.t3_vslice_win.setLabel('bottom', c2_label, units='V')
 
+        # Re-trigger step, coordinate updates, and storage save
+        self.on_sweep_range_changed()
+
     def on_ch1_setpoint_enter(self):
         """Enter key pressed in Setpoint 1 - execute background ramping."""
         val = self.ch1_setpoint.value()
@@ -3582,25 +3782,43 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ramp_channel(self.station.smu.ch2, val, mode, "Channel 2")
 
     def ramp_channel(self, channel, target, param_name, ch_name):
+        if getattr(self, "plotter_mode", False) or self.is_running:
+            return
+        if self.ramp_worker is not None and self.ramp_worker.isRunning():
+            return
         if hasattr(self, 'live_status_worker') and self.live_status_worker:
             self.live_status_worker.pause()
         self.station.live_status_paused = True
-        unit = "A" if param_name == "curr" else "V"
-        self.status_lbl.setText(f"Status: Ramping {ch_name} to {target} {unit}...")
+        if self.ramp_worker is not None and self.ramp_worker.isRunning():
+            return
+        unit = "A" if param_name in ('curr', 'curr_limit') else "V"
+        self.status_lbl.setText(f"Status: Enabling {ch_name} with a voltage ramp..." if param_name == "output" else f"Status: Ramping {ch_name} to {target} {unit}...")
+        if param_name == 'curr_limit':
+            self.status_lbl.setText(f'Status: Setting {ch_name} current compliance to {target:g} A...')
         self.set_inputs_enabled(False)
-        self.pause_btn.setEnabled(True)
-        if ch_name == "Channel 1":
+        self.begin_btn.setEnabled(False)
+        self.reset_btn.setEnabled(False)
+        self.pause_btn.setEnabled(param_name != 'curr_limit')
+        if ch_name == "Channel 1" and param_name != 'curr_limit':
             self.ch1_stop_btn.setEnabled(True)
-        else:
+        elif param_name != 'curr_limit':
             self.ch2_stop_btn.setEnabled(True)
         
         self.ramp_worker = SingleRampWorker(channel, target, param_name, ch_name)
+        self.ramp_worker.output_updated.connect(self.on_output_updated)
+        self.ramp_worker.compliance_updated.connect(self.on_compliance_applied)
         self.ramp_worker.progress.connect(self.on_ramp_progress)
         self.ramp_worker.finished.connect(self.on_ramp_finished)
         self.ramp_worker.error.connect(self.on_ramp_error)
         self.ramp_worker.start()
+        # Lock competing tabs in this click handler, before another click can
+        # arrive; the periodic dashboard refresh alone leaves a race window.
+        dashboard = getattr(self, 'dashboard', None)
+        if dashboard is not None:
+            dashboard.check_measurement_status()
 
     def on_ramp_finished(self):
+        self._applying_compliance = False
         self.station.live_status_paused = False
         if hasattr(self, 'live_status_worker') and self.live_status_worker:
             self.live_status_worker.resume()
@@ -3608,21 +3826,35 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status_lbl.setText("Status: Ramping interrupted.")
         else:
             self.status_lbl.setText("Status: Ramping complete.")
+        if self.ramp_worker and self.ramp_worker.param_name == 'curr_limit':
+            self.status_lbl.setText('Status: Current compliance applied and verified.')
         self.set_inputs_enabled(True)
+        self.begin_btn.setEnabled(self.update_det_label())
+        self.reset_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self.ch1_stop_btn.setEnabled(False)
         self.ch2_stop_btn.setEnabled(False)
 
     def on_ramp_error(self, err_msg):
+        compliance_failed = self._applying_compliance
+        self._applying_compliance = False
         self.station.live_status_paused = False
         if hasattr(self, 'live_status_worker') and self.live_status_worker:
             self.live_status_worker.resume()
         self.status_lbl.setText(f"Status: Ramping error")
         self.set_inputs_enabled(True)
+        self.begin_btn.setEnabled(self.update_det_label())
+        self.reset_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self.ch1_stop_btn.setEnabled(False)
         self.ch2_stop_btn.setEnabled(False)
-        QtWidgets.QMessageBox.critical(self, "Ramping Error", f"Error ramping channel:\n{err_msg}")
+        if compliance_failed:
+            axis = self.ramp_worker.channel.channel_num
+            self._compliance_readbacks[axis] = None
+            self._compliance_edits.discard(axis)
+            self._update_compliance_controls(force=True)
+            self.status_lbl.setText('Status: Current compliance update failed.')
+        QtWidgets.QMessageBox.critical(self, 'Compliance Error' if compliance_failed else 'Ramping Error', err_msg)
 
     def on_ramp_progress(self, ch_name, volt_val, curr_val):
         def fmt(curr):
@@ -3652,106 +3884,140 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status_lbl.setText("Status: Interrupting Channel 2 ramp...")
             self.ch2_stop_btn.setEnabled(False)
 
+    def on_output_updated(self, ch_name, enabled):
+        axis = 1 if ch_name == 'Channel 1' else 2
+        button = getattr(self, f'ch{axis}_out_btn')
+        with QtCore.QSignalBlocker(button):
+            button.setChecked(enabled)
+            button.setText('ON' if enabled else 'OFF')
+            button.setStyleSheet(f"background-color: {'#10b981' if enabled else '#f1f5f9'}; color: {'white' if enabled else '#475569'}; font-weight: bold;")
+
+    def _toggle_output(self, axis, enabled):
+        if self.plotter_mode:
+            return
+        channel = getattr(self.station.smu, f'ch{axis}')
+        if enabled:
+            self.ramp_channel(channel, True, 'output', f'Channel {axis}')
+        else:
+            # OFF remains immediate; do not wait behind a running ramp.
+            try:
+                channel.output(False)
+                self.on_output_updated(f'Channel {axis}', False)
+            except Exception as exc:
+                QtWidgets.QMessageBox.critical(self, 'Hardware error', str(exc))
+
     def toggle_ch1_output(self, enabled):
-        was_paused = self.pause_status_polling()
-        try:
-            self.station.smu.ch1.output(enabled)
-            self.ch1_out_btn.setText(f"{'ON' if enabled else 'OFF'}")
-            self.ch1_out_btn.setStyleSheet(f"background-color: {'#10b981' if enabled else '#f1f5f9'}; color: {'white' if enabled else '#475569'}; border: 1px solid {'#10b981' if enabled else '#cbd5e1'}; font-weight: bold;")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Hardware Error", f"Failed to toggle Ch1 Output:\n{e}")
-        finally:
-            self.resume_status_polling(was_paused)
+        self._toggle_output(1, enabled)
 
     def toggle_ch2_output(self, enabled):
-        was_paused = self.pause_status_polling()
-        try:
-            self.station.smu.ch2.output(enabled)
-            self.ch2_out_btn.setText(f"{'ON' if enabled else 'OFF'}")
-            self.ch2_out_btn.setStyleSheet(f"background-color: {'#10b981' if enabled else '#f1f5f9'}; color: {'white' if enabled else '#475569'}; border: 1px solid {'#10b981' if enabled else '#cbd5e1'}; font-weight: bold;")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Hardware Error", f"Failed to toggle Ch2 Output:\n{e}")
-        finally:
-            self.resume_status_polling(was_paused)
+        self._toggle_output(2, enabled)
 
-    def on_compliance_changed(self):
-        was_paused = self.pause_status_polling()
+    def on_compliance_changed(self, axis=None):
+        # Only an edited current-limit field commits a hardware change. Calls
+        # from loading settings, mode changes and display refresh are read-only.
+        if axis is None or axis not in self._compliance_edits:
+            if axis is None:
+                self._compliance_edits.clear()
+            self._update_compliance_controls(force=axis is None)
+            return
+        self._compliance_edits.discard(axis)
+        if (self.plotter_mode or not self.editable_current_compliance
+                or self.is_running or self._applying_compliance
+                or (self.ramp_worker and self.ramp_worker.isRunning())
+                or getattr(self, f'ch{axis}_mode').currentText() != 'VOLT'):
+            self._update_compliance_controls(force=True)
+            return
+        dashboard = getattr(self, 'dashboard', None)
+        if dashboard and dashboard.measurement_active():
+            self._update_compliance_controls(force=True)
+            return
         try:
-            # Channel 1
-            if self.ch1_mode.currentText() == "CURR":
-                self.station.smu.ch1.volt_limit(self.ch1_compliance.value())
-            else:
-                self.station.smu.ch1.curr_limit(self.ch1_compliance.value())
-        except Exception as e:
-            print(f"Error setting Ch1 compliance: {e}")
+            value = validate_current_compliance(getattr(self, f'ch{axis}_compliance').value())
+        except ValueError as error:
+            self._update_compliance_controls(force=True)
+            QtWidgets.QMessageBox.warning(self, 'Invalid current compliance', str(error))
+            return
+        channel = getattr(self.station.smu, f'ch{axis}')
+        self._applying_compliance = True
+        self.ramp_channel(channel, value, 'curr_limit', f'Channel {axis}')
 
-        try:
-            # Channel 2
-            if self.ch2_mode.currentText() == "CURR":
-                self.station.smu.ch2.volt_limit(self.ch2_compliance.value())
-            else:
-                self.station.smu.ch2.curr_limit(self.ch2_compliance.value())
-        except Exception as e:
-            print(f"Error setting Ch2 compliance: {e}")
-
+    def on_compliance_applied(self, axis, value):
+        self._compliance_readbacks[axis] = ('VOLT', value)
+        self._compliance_edits.discard(axis)
+        self._update_compliance_controls(force=True)
         self.save_storage()
-        self.resume_status_polling(was_paused)
 
-    def on_mode_changed(self):
-        # Update physical instrument modes
+    def _compliance_setting(self, axis):
+        reading = self._compliance_readbacks.get(axis)
+        mode = getattr(self, f'ch{axis}_mode').currentText()
+        return reading[1] if reading is not None and reading[0] == mode else -1.0
+
+    def on_compliance_readback(self, readings):
+        if self.plotter_mode or self._applying_compliance:
+            return
+        self._compliance_readbacks = readings
+        self._update_compliance_controls()
+
+    def _update_compliance_controls(self, force=False):
+        for axis in (1, 2):
+            box = getattr(self, f'ch{axis}_compliance')
+            current_mode = getattr(self, f'ch{axis}_mode').currentText() == 'CURR'
+            value = self._compliance_setting(axis)
+            editable = self.editable_current_compliance and not current_mode and not self.plotter_mode
+            # Polling must not replace text while the user is entering a limit.
+            if editable and not force and (box.hasFocus() or axis in self._compliance_edits):
+                continue
+            with QtCore.QSignalBlocker(box):
+                box.setReadOnly(not editable)
+                box.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+                box.setDecimals(12)
+                box.setRange(-1.0, 1e12)
+                box.setSpecialValueText('Readback unavailable')
+                box.setSuffix(' V' if current_mode else ' A')
+                box.setValue(value)
+                box.setSingleStep(1e-9 if not current_mode else .1)
+                box.setToolTip('Current compliance in amperes (1 nA to 3 A). Press Enter or leave the edited field to apply and verify.'
+                               if editable else 'Read-only DC-source compliance readback.')
+                channel = getattr(self.station.smu, f'ch{axis}', None)
+                expected = getattr(channel, 'current_compliance_target', GATE_CURRENT_COMPLIANCE_A)
+                mismatch = value < 0 or (not current_mode and not math.isclose(value, expected, rel_tol=1e-6, abs_tol=1e-12)) or (current_mode and value > GATE_MAX_ABS_VOLTAGE_V)
+                box.setStyleSheet('color: #b91c1c; font-weight: bold;' if mismatch else '')
+            getattr(self, f'ch{axis}_compliance_lbl').setText('Voltage compliance:' if current_mode else 'Current limit:')
+
+    def on_mode_changed(self, *args, write_hardware=True):
+        if getattr(self, "plotter_mode", False):
+            return
         was_paused = self.pause_status_polling()
         try:
-            self.station.smu.ch1.source_mode(self.ch1_mode.currentText())
-            self.station.smu.ch2.source_mode(self.ch2_mode.currentText())
-        except Exception:
-            pass
+            if write_hardware:
+                self.station.smu.ch1.source_mode(self.ch1_mode.currentText())
+                self.station.smu.ch2.source_mode(self.ch2_mode.currentText())
+        except Exception as exc:
+            # A blocked mode change must not leave the GUI claiming another mode.
+            for axis in (1, 2):
+                box = getattr(self, f'ch{axis}_mode')
+                with QtCore.QSignalBlocker(box):
+                    box.setCurrentText(getattr(self.station.smu, f'ch{axis}').source_mode())
+            QtWidgets.QMessageBox.critical(self, 'Gate protection', str(exc))
+            write_hardware = False
         finally:
             self.resume_status_polling(was_paused)
 
-        # Update Channel 1 GUI labels, ranges, and steps
-        if self.ch1_mode.currentText() == "CURR":
-            self.ch1_setpoint_lbl.setText("Setpoint (A):")
-            self.ch1_setpoint.setRange(-3.0, 3.0)
-            self.ch1_setpoint.setDecimals(6)
-            self.ch1_setpoint.setSingleStep(1e-6)
-            self.ch1_compliance_lbl.setText("Compliance (V):")
-            self.ch1_compliance.setRange(1e-9, 210.0)
-            self.ch1_compliance.setDecimals(4)
-            self.ch1_compliance.setSingleStep(0.1)
-        else:
-            self.ch1_setpoint_lbl.setText("Setpoint (V):")
-            self.ch1_setpoint.setRange(-210.0, 210.0)
-            self.ch1_setpoint.setDecimals(4)
-            self.ch1_setpoint.setSingleStep(0.001)
-            self.ch1_compliance_lbl.setText("Compliance (A):")
-            self.ch1_compliance.setRange(1e-9, 3.0)
-            self.ch1_compliance.setDecimals(6)
-            self.ch1_compliance.setSingleStep(0.001)
-
-        # Update Channel 2 GUI labels, ranges, and steps
-        if self.ch2_mode.currentText() == "CURR":
-            self.ch2_setpoint_lbl.setText("Setpoint (A):")
-            self.ch2_setpoint.setRange(-3.0, 3.0)
-            self.ch2_setpoint.setDecimals(6)
-            self.ch2_setpoint.setSingleStep(1e-6)
-            self.ch2_compliance_lbl.setText("Compliance (V):")
-            self.ch2_compliance.setRange(1e-9, 210.0)
-            self.ch2_compliance.setDecimals(4)
-            self.ch2_compliance.setSingleStep(0.1)
-        else:
-            self.ch2_setpoint_lbl.setText("Setpoint (V):")
-            self.ch2_setpoint.setRange(-210.0, 210.0)
-            self.ch2_setpoint.setDecimals(4)
-            self.ch2_setpoint.setSingleStep(0.001)
-            self.ch2_compliance_lbl.setText("Compliance (A):")
-            self.ch2_compliance.setRange(1e-9, 3.0)
-            self.ch2_compliance.setDecimals(6)
-            self.ch2_compliance.setSingleStep(0.001)
-
-        # Sync compliance limits with new modes
-        self.on_compliance_changed()
+        self._compliance_edits.clear()
+        for axis in (1, 2):
+            current_mode = getattr(self, f'ch{axis}_mode').currentText() == 'CURR'
+            box = getattr(self, f'ch{axis}_setpoint')
+            getattr(self, f'ch{axis}_setpoint_lbl').setText('Setpoint (A):' if current_mode else 'Setpoint (V):')
+            box.setDecimals(9 if current_mode else 4)
+            box.setRange(-GATE_CURRENT_COMPLIANCE_A, GATE_CURRENT_COMPLIANCE_A) if current_mode else box.setRange(-GATE_MAX_ABS_VOLTAGE_V, GATE_MAX_ABS_VOLTAGE_V)
+            box.setSingleStep(1e-9 if current_mode else 0.001)
+        self._update_compliance_controls(force=True)
+        if write_hardware:
+            self.on_compliance_changed()
 
     def on_ch1_ramping_params_changed(self):
+        if getattr(self, "plotter_mode", False):
+            return
         """Save Channel 1 settings to value_storage and sync with hardware driver."""
         rate = self.ch1_ramp_rate.value()
         self.stored_settings["ramprate1"] = rate
@@ -3765,6 +4031,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.resume_status_polling(was_paused)
 
     def on_ch2_ramping_params_changed(self):
+        if getattr(self, "plotter_mode", False):
+            return
         """Save Channel 2 settings to value_storage and sync with hardware driver."""
         rate = self.ch2_ramp_rate.value()
         self.stored_settings["ramprate2"] = rate
@@ -3821,6 +4089,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # --- Sweep Measurement Control ---
     def begin_sweep(self):
+        if getattr(self, "plotter_mode", False):
+            return
+        if self.ramp_worker is not None and self.ramp_worker.isRunning():
+            return
         if self.is_paused:
             # Resume sweep
             self.is_paused = False
@@ -3835,6 +4107,19 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.is_running:
             return
 
+        try:
+            validate_dgs_parameters({
+                'a': self.coeff_a.value(), 'b': self.coeff_b.value(),
+                'c': self.coeff_c.value(), 'd': self.coeff_d.value(),
+                'c1_start': self.c1_start.value(), 'c1_end': self.c1_end.value(), 'c1_pts': self.c1_pts.value(),
+                'c2_start': self.c2_start.value(), 'c2_end': self.c2_end.value(), 'c2_pts': self.c2_pts.value(),
+            })
+            if self.ch1_mode.currentText() != 'VOLT' or self.ch2_mode.currentText() != 'VOLT':
+                raise ValueError('Gate sweeps require both DC sources in voltage mode.')
+        except Exception as exc:
+            self.status_lbl.setText(f'Sweep blocked: {exc}')
+            QtWidgets.QMessageBox.critical(self, 'Gate protection', str(exc))
+            return
         self.reset_slice_levels = True
 
         # Pause the status worker first to avoid any race conditions during monochromator/camera queries
@@ -3849,6 +4134,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 smu.write('*CLS')
             except Exception:
                 pass
+
+        if smu is not None:
+            try:
+                smu.enforce_current_compliance()
+                self.measurement_current_compliance = {
+                    axis: getattr(getattr(smu, f'ch{axis}'), 'current_compliance_target', GATE_CURRENT_COMPLIANCE_A)
+                    for axis in (1, 2)
+                }
+            except Exception as e:
+                self.station.live_status_paused = False
+                self.live_status_worker.resume()
+                self.status_lbl.setText(f'Sweep blocked: cannot confirm current compliance: {e}')
+                QtWidgets.QMessageBox.critical(self, 'Gate protection', self.status_lbl.text())
+                return
 
         # Prepare parameters and validate
         self.update_coordinates_from_ui()
@@ -3865,6 +4164,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             mono_wl = 500.0 # fallback
 
+        # Try to get wavelengths from cache first (fast, non-blocking)
         try:
             wls = self.station.camera.remote_lf.get_wavelengths_cache()
             if wls is not None and len(wls) > 0:
@@ -3872,23 +4172,26 @@ class MainWindow(QtWidgets.QMainWindow):
                 num_pixels = len(wavelengths)
         except Exception as e:
             print(f"Could not get wavelengths cache: {e}")
-            
-        if wavelengths is None:
-            try:
-                res = self.station.camera.remote_lf.get_spectrum()
-                if res is not None and len(res) >= 2 and len(res[0]) >= 1:
-                    num_pixels = len(res[0][0])
-                    if len(res[1]) > 0:
-                        wavelengths = np.array(res[1])
-            except Exception as e:
-                print(f"Could not fetch test spectrum for pixel count: {e}")
                 
         if wavelengths is None:
             # Fallback to manual calibration around center wavelength
             pixels_arr = np.arange(num_pixels)
             wavelengths = mono_wl + (pixels_arr - num_pixels // 2) * 0.05
 
+        # Load num_spectra from value_storage
+        num_spectra = 1
+        try:
+            storage_path = os.path.join(parent_dir, "value_storage")
+            if os.path.exists(storage_path):
+                with open(storage_path, "r") as f_vs:
+                    vs = json.load(f_vs)
+                single_data = vs.get("single_spectra", {})
+                num_spectra = int(single_data.get("num_spectra", vs.get("num_spectra", 1)))
+        except Exception:
+            num_spectra = 1
+
         self.data_spectra = np.zeros((c2_pts_actual, c1_pts_actual, num_pixels))
+        self.data_raw_spectra = np.zeros((c2_pts_actual, c1_pts_actual, num_spectra, num_pixels))
         self.data_current_ch1 = np.zeros((c2_pts_actual, c1_pts_actual))
         self.data_current_ch2 = np.zeros((c2_pts_actual, c1_pts_actual))
         self.data_measured_volt_ch1 = np.zeros((c2_pts_actual, c1_pts_actual))
@@ -3908,11 +4211,27 @@ class MainWindow(QtWidgets.QMainWindow):
         energy_raw = 1239.84193 / wavelengths
         self.energy_sort_idx = np.argsort(energy_raw)
         self.energy_axis = energy_raw[self.energy_sort_idx]
+        self.linear_energy_axis = np.linspace(self.energy_axis[0], self.energy_axis[-1], len(self.energy_axis))
+        self.wavelength_axis = wavelengths[self.energy_sort_idx]
 
         # Reset plots and set axes ranges
         self.reset_plot_scaling(reset_spectrum=True)
 
-        # Start sweep thread
+        # Start sweep thread — guard against singular transformation matrix
+        _a = self.coeff_a.value()
+        _b = self.coeff_b.value()
+        _c = self.coeff_c.value()
+        _d = self.coeff_d.value()
+        _det = _a * _d - _b * _c
+        if abs(_det) < 1e-9:
+            QtWidgets.QMessageBox.warning(
+                self, "Singular Matrix",
+                f"The gate transformation matrix is singular (det = {_det:.2e}).\n"
+                "Virtual gates cannot be converted to physical voltages.\n"
+                "Please adjust coefficients so that a·d − b·c ≠ 0."
+            )
+            return
+
         params = {
             'a': self.coeff_a.value(),
             'b': self.coeff_b.value(),
@@ -3928,7 +4247,8 @@ class MainWindow(QtWidgets.QMainWindow):
             'serpentine': self.serpentine_box.isChecked(),
             'exposure_time': self.exposure_box.value(),
             'settling_time': self.settling_box.value(),
-            'num_pixels': num_pixels
+            'num_pixels': num_pixels,
+            'wl_axis': wavelengths,
         }
 
         # Calculate total expected duration
@@ -4036,6 +4356,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sweep_initial_v2 = prev_v2
         self.sweep_initial_b = curr_b
         self.sweep_start_time = time.time()
+        self.measurement_started_at = new_measurement_start(self.sweep_start_time)
+        self.measurement_device_modes = measurement_device_modes(self.station)
         self.total_paused_time = 0.0
         self.pause_start_time = None
 
@@ -4045,6 +4367,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.is_paused = False
         self._autosaved_this_run = False
         
+        # Pause background status polling during active sweep to avoid SMU PyVISA collisions
+        if hasattr(self, 'live_status_worker') and self.live_status_worker:
+            self.live_status_worker.pause()
+        self.station.live_status_paused = True
+
+        # Clear SMU VISA session to discard any unread response or dirty buffer from active status workers
+        smu = getattr(self.station, "smu", None)
+        if smu is not None and not getattr(smu, "simulated", False):
+            try:
+                smu.visa_handle.clear()
+                smu.write('*CLS')
+            except Exception:
+                pass
+
         self.begin_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
         self.pause_btn.setText("⏸ Interrupt")
@@ -4053,7 +4389,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress_bar.setValue(0)
         self.set_inputs_enabled(False)
 
-        self.sweep_worker = SweepWorker(self.station, params)
+        params["num_spectra"] = self.data_raw_spectra.shape[2]
+        self._filename_context = {
+            "exposure": params["exposure_time"], "acquisitions": params["num_spectra"],
+            "axes": [(self.c1_name_edit.text(), self.c1_coords.copy()),
+                     (self.c2_name_edit.text(), self.c2_coords.copy())],
+            "field": curr_b,
+        }
+        self.sweep_worker = self.create_sweep_worker(params)
         self.sweep_worker.point_measured.connect(self.on_point_measured)
         self.sweep_worker.progress_updated.connect(self.on_progress_updated)
         self.sweep_worker.status_updated.connect(self.status_lbl.setText)
@@ -4061,6 +4404,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sweep_worker.finished.connect(self.on_sweep_finished)
         self.sweep_worker.error_occurred.connect(self.on_sweep_error)
         self.sweep_worker.start()
+
+    def create_sweep_worker(self, params):
+        return SweepWorker(self.station, params)
+
+    def default_sweep_filename(self):
+        from measurement_filenames import dgs_filename
+        context = getattr(self, "_filename_context", None) or {
+            "exposure": self.exposure_box.value(),
+            "acquisitions": self.data_raw_spectra.shape[2] if self.data_raw_spectra.size else 1,
+            "axes": [(self.c1_name_edit.text(), self.c1_coords),
+                     (self.c2_name_edit.text(), self.c2_coords)],
+            "field": getattr(self, "_last_polled_b", 0.0),
+        }
+        return dgs_filename(**context, wavelength=self.filename_wavelength_box.value())
 
     def on_interrupt_clicked(self):
         if self.ramp_worker and self.ramp_worker.isRunning():
@@ -4083,14 +4440,18 @@ class MainWindow(QtWidgets.QMainWindow):
             if getattr(self, "pause_start_time", None) is not None:
                 self.total_paused_time += time.time() - self.pause_start_time
                 self.pause_start_time = None
+            if hasattr(self, 'live_status_worker') and self.live_status_worker:
+                self.live_status_worker.pause()
+            self.station.live_status_paused = True
             self.sweep_worker.resume()
         else:
             self.is_paused = True
             self.pause_btn.setText("▶ Resume")
-            self.begin_btn.setEnabled(True)
+            self.begin_btn.setEnabled(self.update_det_label())
             self.save_btn.setEnabled(True if np.any(self.data_measured_mask) else False)
             self.status_lbl.setText("Status: Paused (Interrupt)")
             self.pause_start_time = time.time()
+            self.station.live_status_paused = True
             self.sweep_worker.pause()
 
     def reset_sweep(self):
@@ -4110,7 +4471,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sweep_total_duration = 0.0
         self.total_paused_time = 0.0
         self.pause_start_time = None
-        self.begin_btn.setEnabled(True)
+        self.begin_btn.setEnabled(self.update_det_label())
         self.pause_btn.setEnabled(False)
         self.pause_btn.setText("⏸ Interrupt")
         self.save_btn.setEnabled(True if np.any(self.data_measured_mask) else False)
@@ -4120,12 +4481,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_expected_end.setText("Expected End: --:--:--")
         self.status_lbl.setText("Status: Reset complete")
 
-    def on_point_measured(self, i, j, c1, c2, v1, v2, spectrum, curr_ch1, curr_ch2, meas_v1, meas_v2, meas_b):
+    def on_point_measured(self, i, j, c1, c2, v1, v2, spectrum, curr_ch1, curr_ch2, meas_v1, meas_v2, meas_b, raw_frames):
         # Sort spectrum to align with increasing energy values
         sorted_spectrum = spectrum[self.energy_sort_idx]
+        sorted_raw_frames = raw_frames[:, self.energy_sort_idx]
         
         # Save measurement point
         self.data_spectra[j, i, :] = sorted_spectrum
+        if getattr(self, "data_raw_spectra", None) is not None:
+            self.data_raw_spectra[j, i, :, :] = sorted_raw_frames
         self.data_current_ch1[j, i] = curr_ch1
         self.data_current_ch2[j, i] = curr_ch2
         self.data_measured_volt_ch1[j, i] = meas_v1
@@ -4144,8 +4508,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # Update panel labels with current sweep values
         self._last_polled_b = meas_b
         self.lbl_current_b.setText(f"B = {meas_b:.4f} T")
-        self.lbl_target_vc1.setText(f"V1 = {meas_v1:.4f} V")
-        self.lbl_target_vc2.setText(f"V2 = {meas_v2:.4f} V")
+        c1_label = self.c1_name_edit.text() if hasattr(self, "c1_name_edit") and self.c1_name_edit.text() else "C1"
+        c2_label = self.c2_name_edit.text() if hasattr(self, "c2_name_edit") and self.c2_name_edit.text() else "C2"
+        self.lbl_target_vc1.setText(f"{c1_label} = {c1:.4f} V (V1 = {meas_v1:.4f} V)")
+        self.lbl_target_vc2.setText(f"{c2_label} = {c2:.4f} V (V2 = {meas_v2:.4f} V)")
 
     def on_progress_updated(self, current, total):
         pct = int(100 * current / total)
@@ -4203,14 +4569,20 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.lbl_expected_end.setText("Expected End: --:--:--")
 
-    def on_sweep_voltage_updated(self, v1, v2):
+    def on_sweep_voltage_updated(self, c1, c2, v1, v2):
         self.ch1_setpoint.setValue(v1)
         self.ch2_setpoint.setValue(v2)
+        c1_label = self.c1_name_edit.text() if hasattr(self, "c1_name_edit") and self.c1_name_edit.text() else "C1"
+        c2_label = self.c2_name_edit.text() if hasattr(self, "c2_name_edit") and self.c2_name_edit.text() else "C2"
+        self.lbl_target_vc1.setText(f"{c1_label} = {c1:.4f} V (V1 = {v1:.4f} V)")
+        self.lbl_target_vc2.setText(f"{c2_label} = {c2:.4f} V (V2 = {v2:.4f} V)")
 
     def on_sweep_finished(self):
+        if not self.is_running:
+            return
         self.trigger_autosave(was_interrupted=False)
         self.is_running = False
-        self.begin_btn.setEnabled(True)
+        self.begin_btn.setEnabled(self.update_det_label())
         self.pause_btn.setEnabled(False)
         self.save_btn.setEnabled(True)
         self.set_inputs_enabled(True)
@@ -4223,7 +4595,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_sweep_error(self, err_msg):
         self.trigger_autosave(was_interrupted=True)
         self.is_running = False
-        self.begin_btn.setEnabled(True)
+        self.begin_btn.setEnabled(self.update_det_label())
         self.pause_btn.setEnabled(False)
         self.save_btn.setEnabled(True if np.any(self.data_measured_mask) else False)
         self.set_inputs_enabled(True)
@@ -4291,9 +4663,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gatemap_win.setRange(xRange=(c1_min, c1_max), yRange=(c2_min, c2_max), padding=0)
 
         # Tab 1: Vertical Slice (Y axis is C2, X axis is Energy)
-        width_vslice = self.energy_axis[-1] - self.energy_axis[0]
-        x_start_vslice = self.energy_axis[0]
-        if len(self.energy_axis) <= 1 or width_vslice == 0:
+        # Pixel-centre-aligned energy bounds: expand the rect by half a pixel on each side
+        # so that image column k is centred at energy_axis[k], matching the 1D spectrum
+        # curve which places data points at exact energy_axis[k] positions.
+        n_e = len(self.energy_axis)
+        if n_e > 1:
+            d_e = (self.energy_axis[-1] - self.energy_axis[0]) / (n_e - 1)
+            width_vslice = self.energy_axis[-1] - self.energy_axis[0] + d_e
+            x_start_vslice = self.energy_axis[0] - d_e / 2
+        else:
+            d_e = 1.0
             width_vslice = 1.0
             x_start_vslice = self.energy_axis[0] - 0.5
 
@@ -4306,7 +4685,7 @@ class MainWindow(QtWidgets.QMainWindow):
         rect_vslice = QtCore.QRectF(x_start_vslice, y_start_vslice, width_vslice, height_vslice)
         if self.vslice_img.image is not None:
             self.vslice_img.setRect(rect_vslice)
-        
+
         vb_vslice = self.vslice_win.getViewBox()
         vb_vslice.invertY(self.c2_coords[0] > self.c2_coords[-1])
         self.vslice_win.setRange(xRange=(energy_min, energy_max), yRange=(c2_min, c2_max), padding=0)
@@ -4318,9 +4697,11 @@ class MainWindow(QtWidgets.QMainWindow):
             width_hslice = 1.0
             x_start_hslice = self.c1_coords[0] - 0.5
 
-        height_hslice = self.energy_axis[-1] - self.energy_axis[0]
-        y_start_hslice = self.energy_axis[0]
-        if len(self.energy_axis) <= 1 or height_hslice == 0:
+        # Apply same pixel-centre-aligned energy bounds as vslice (d_e computed above)
+        if n_e > 1:
+            height_hslice = self.energy_axis[-1] - self.energy_axis[0] + d_e
+            y_start_hslice = self.energy_axis[0] - d_e / 2
+        else:
             height_hslice = 1.0
             y_start_hslice = self.energy_axis[0] - 0.5
 
@@ -4351,8 +4732,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Center the horizontal region lines dynamically inside the active counts range (30% to 70% of the span) if needed
         if np.any(self.data_measured_mask):
             measured_spectra = self.data_spectra[self.data_measured_mask]
-            y_min = np.min(measured_spectra)
-            y_max = np.max(measured_spectra)
+            y_min, y_max = finite_plot_levels(measured_spectra)
         else:
             y_min = 200.0
             y_max = 15000.0
@@ -4448,31 +4828,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cross3_v.setValue(p1)
         self.cross3_h.setValue(p2)
 
-        # Set custom tick labels showing start, end, and intermediate coordinate values
-        def generate_ticks(start, end):
-            if start == end:
-                return [(start, f"{start:.4f}".rstrip('0').rstrip('.'))]
-            vals = np.linspace(start, end, 5)
-            ticks = []
-            for val in vals:
-                ticks.append((val, f"{val:.4f}".rstrip('0').rstrip('.')))
-            return ticks
-
-        ticks_c1 = generate_ticks(self.c1_coords[0], self.c1_coords[-1])
-        ticks_c2 = generate_ticks(self.c2_coords[0], self.c2_coords[-1])
-
-        self.gatemap_win.getAxis('bottom').setTicks([ticks_c1])
-        self.gatemap_win.getAxis('left').setTicks([ticks_c2])
-        self.vslice_win.getAxis('left').setTicks([ticks_c2])
-        self.hslice_win.getAxis('bottom').setTicks([ticks_c1])
-        self.t2_heatmap_win.getAxis('bottom').setTicks([ticks_c1])
-        self.t2_heatmap_win.getAxis('left').setTicks([ticks_c2])
-        self.t2_hslice_win.getAxis('bottom').setTicks([ticks_c1])
-        self.t2_vslice_win.getAxis('bottom').setTicks([ticks_c2])
-        self.t3_heatmap_win.getAxis('bottom').setTicks([ticks_c1])
-        self.t3_heatmap_win.getAxis('left').setTicks([ticks_c2])
-        self.t3_hslice_win.getAxis('bottom').setTicks([ticks_c1])
-        self.t3_vslice_win.getAxis('bottom').setTicks([ticks_c2])
+        # All maps and slices need fresh ticks for the visible zoom range.
+        for plot in (self.gatemap_win, self.vslice_win, self.hslice_win,
+                     self.spectrum_win, self.t2_heatmap_win, self.t2_hslice_win,
+                     self.t2_vslice_win, self.t3_heatmap_win, self.t3_hslice_win,
+                     self.t3_vslice_win):
+            configure_plot_axes(plot)
 
     def scale_plots(self):
         self.reset_slice_levels = True
@@ -4481,22 +4842,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reset_plot_scaling(reset_spectrum=False)
 
         # 2. Scale interactive colorbars to full data range (min to max of the active slice/current data)
-        # Ensure gradients are ordered normally (yellow green blue)
-        self.vslice_colorbar.gradient.loadPreset('thermal')
-        self.hslice_colorbar.gradient.loadPreset('thermal')
-        self.t2_colorbar.gradient.loadPreset('thermal')
-        self.t3_colorbar.gradient.loadPreset('thermal')
+        # Restore the default Viridis palette for the main map and slices.
+        self.gatemap_colorbar.gradient.loadPreset('viridis')
+        self.vslice_colorbar.gradient.loadPreset('viridis')
+        self.hslice_colorbar.gradient.loadPreset('viridis')
+        self.t2_colorbar.gradient.loadPreset('viridis')
+        self.t3_colorbar.gradient.loadPreset('viridis')
 
         if self.vslice_img.image is not None and self.vslice_img.image.size > 0:
             vslice_data = self.vslice_img.image
-            min_v, max_v = np.min(vslice_data), np.max(vslice_data)
+            min_v, max_v = finite_plot_levels(vslice_data)
             if min_v == max_v:
                 max_v += 1.0
             self.vslice_colorbar.setLevels(min_v, max_v)
 
         if self.hslice_img.image is not None and self.hslice_img.image.size > 0:
             hslice_data = self.hslice_img.image
-            min_h, max_h = np.min(hslice_data), np.max(hslice_data)
+            min_h, max_h = finite_plot_levels(hslice_data)
             if min_h == max_h:
                 max_h += 1.0
             self.hslice_colorbar.setLevels(min_h, max_h)
@@ -4520,17 +4882,23 @@ class MainWindow(QtWidgets.QMainWindow):
         # 3. Reset Y-axis for 1D slice curves and spectrum curve using manual scaling helper
         def manually_scale_y(plot_win, curve):
             y_data = curve.yData
+            if y_data is not None:
+                y_data = np.asarray(y_data)[np.isfinite(y_data)]
             if y_data is not None and len(y_data) > 0:
                 y_min = np.min(y_data)
                 y_max = np.max(y_data)
                 y_range = y_max - y_min
                 if y_range <= 0:
-                    y_range = 1.0
+                    y_range = max(abs(y_min) * .1, 1e-12) if plot_win.getAxis('left').labelUnits == 'A' else 1.0
                 plot_win.getViewBox().setRange(yRange=(y_min - 0.05 * y_range, y_max + 0.05 * y_range), padding=0)
 
+        self.t2_hslice_win.getViewBox()._current_user_zoom = False
         manually_scale_y(self.t2_hslice_win, self.t2_hslice_curve)
+        self.t2_vslice_win.getViewBox()._current_user_zoom = False
         manually_scale_y(self.t2_vslice_win, self.t2_vslice_curve)
+        self.t3_hslice_win.getViewBox()._current_user_zoom = False
         manually_scale_y(self.t3_hslice_win, self.t3_hslice_curve)
+        self.t3_vslice_win.getViewBox()._current_user_zoom = False
         manually_scale_y(self.t3_vslice_win, self.t3_vslice_curve)
         manually_scale_y(self.spectrum_win, self.spectrum_curve)
 
@@ -4620,7 +4988,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bg_interp = get_interp_spectrum(bg_x, bg_y)
         ref_interp = get_interp_spectrum(ref_x, ref_y)
         
-        if option == "Signal - BG":
+        if option in ("Signal - BG", "Signal - Background"):
             return raw_spectra - bg_interp
         elif option == "(S-R)/(R-B)":
             denom = ref_interp - bg_interp
@@ -4786,9 +5154,10 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Manually scale the Y-axis to fit only the spectrum curve if autoRange is still enabled
         vb_spec = self.spectrum_win.getViewBox()
-        if vb_spec.state['autoRange'][1]:
-            y_min = np.min(spectrum)
-            y_max = np.max(spectrum)
+        finite_spectrum = spectrum[np.isfinite(spectrum)]
+        if vb_spec.state['autoRange'][1] and finite_spectrum.size:
+            y_min = np.min(finite_spectrum)
+            y_max = np.max(finite_spectrum)
             y_range = y_max - y_min
             if y_range <= 0:
                 y_range = 1.0
@@ -4796,23 +5165,40 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 2. Update Vertical Slice (all C2 coordinates at fixed C1)
         vslice_data = processed_spectra[:, idx_c1, :]
+        vslice_data_linear = np.zeros_like(vslice_data)
+        if vslice_data.size > 0:
+            for idx in range(vslice_data.shape[0]):
+                vslice_data_linear[idx, :] = np.interp(self.linear_energy_axis, self.energy_axis, vslice_data[idx, :])
         auto_levels = getattr(self, "reset_slice_levels", True)
-        self.vslice_img.setImage(vslice_data, autoLevels=auto_levels)
-        if auto_levels and vslice_data.size > 0:
-            min_v, max_v = np.min(vslice_data), np.max(vslice_data)
+        self.vslice_img.setImage(vslice_data_linear, autoLevels=auto_levels)
+        finite_vslice = vslice_data[np.isfinite(vslice_data)]
+        if auto_levels and finite_vslice.size > 0:
+            min_v, max_v = np.min(finite_vslice), np.max(finite_vslice)
             if min_v == max_v:
                 max_v += 1
             self.vslice_colorbar.setLevels(min_v, max_v)
 
         # 3. Update Horizontal Slice (all C1 coordinates at fixed C2)
         hslice_data = processed_spectra[idx_c2, :, :]
-        self.hslice_img.setImage(hslice_data, autoLevels=auto_levels)
-        if auto_levels and hslice_data.size > 0:
-            min_h, max_h = np.min(hslice_data), np.max(hslice_data)
+        hslice_data_linear = np.zeros_like(hslice_data)
+        if hslice_data.size > 0:
+            for idx in range(hslice_data.shape[0]):
+                hslice_data_linear[idx, :] = np.interp(self.linear_energy_axis, self.energy_axis, hslice_data[idx, :])
+        self.hslice_img.setImage(hslice_data_linear, autoLevels=auto_levels)
+        finite_hslice = hslice_data[np.isfinite(hslice_data)]
+        if auto_levels and finite_hslice.size > 0:
+            min_h, max_h = np.min(finite_hslice), np.max(finite_hslice)
             if min_h == max_h:
                 max_h += 1
             self.hslice_colorbar.setLevels(min_h, max_h)
             
+        # Update spectrum plot title to show the gate voltage coordinates at the current crosshair
+        c1_label = self.c1_name_edit.text() if hasattr(self, 'c1_name_edit') and self.c1_name_edit.text() else 'C1'
+        c2_label = self.c2_name_edit.text() if hasattr(self, 'c2_name_edit') and self.c2_name_edit.text() else 'C2'
+        self.spectrum_win.setTitle(
+            f"<span style='font-size:9pt'>CCD Spectrum &nbsp;&mdash;&nbsp; "
+            f"{c1_label} = {c1_val:.4f} V &nbsp;|&nbsp; {c2_label} = {c2_val:.4f} V</span>"
+        )
         self.reset_slice_levels = False
 
     def on_tab2_crosshair_moved(self):
@@ -4829,11 +5215,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Horizontal slice: Current vs C1 (at fixed C2)
         curr_vs_c1 = self.data_current_ch1[idx_c2, :]
-        self.t2_hslice_curve.setData(self.c1_coords, curr_vs_c1)
+        update_current_slice(self.t2_hslice_win, self.t2_hslice_curve, self.c1_coords, curr_vs_c1, self.data_measured_mask[idx_c2, :])
 
         # Vertical slice: Current vs C2 (at fixed C1)
         curr_vs_c2 = self.data_current_ch1[:, idx_c1]
-        self.t2_vslice_curve.setData(self.c2_coords, curr_vs_c2)
+        update_current_slice(self.t2_vslice_win, self.t2_vslice_curve, self.c2_coords, curr_vs_c2, self.data_measured_mask[:, idx_c1])
 
     def on_tab3_crosshair_moved(self):
         """Update Tab 3 slices when its crosshair is dragged."""
@@ -4849,14 +5235,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Horizontal slice: Current vs C1 (at fixed C2)
         curr_vs_c1 = self.data_current_ch2[idx_c2, :]
-        self.t3_hslice_curve.setData(self.c1_coords, curr_vs_c1)
+        update_current_slice(self.t3_hslice_win, self.t3_hslice_curve, self.c1_coords, curr_vs_c1, self.data_measured_mask[idx_c2, :])
 
         # Vertical slice: Current vs C2 (at fixed C1)
         curr_vs_c2 = self.data_current_ch2[:, idx_c1]
-        self.t3_vslice_curve.setData(self.c2_coords, curr_vs_c2)
+        update_current_slice(self.t3_vslice_win, self.t3_vslice_curve, self.c2_coords, curr_vs_c2, self.data_measured_mask[:, idx_c1])
 
     # --- HDF5 Data Storage Saving ---
     def save_sweep_data(self, file_path=None):
+        if getattr(self, "plotter_mode", False):
+            return
         """Save the measured dataset (spectra and currents) to a structured HDF5 file."""
         if isinstance(file_path, bool):
             file_path = None
@@ -4866,11 +5254,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         try:
-            data_dir = os.path.join(parent_dir, "data")
-            os.makedirs(data_dir, exist_ok=True)
+            data_dir = measurement_data_dir(
+                parent_dir, getattr(self, "measurement_started_at", None)
+            )
             
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            default_filename = f"gate_sweep_{timestamp}.h5"
+            default_filename = self.default_sweep_filename()
+            default_filename = dated_measurement_filename(default_filename, getattr(self, "measurement_started_at", None))
 
             if file_path is None:
                 filename, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -4880,10 +5270,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 if not filename:
                     return
+                filename = dated_measurement_path(filename, getattr(self, "measurement_started_at", None))
             else:
                 filename = file_path
 
             with h5py.File(filename, "w") as f:
+                f.attrs["device_modes"] = json.dumps(getattr(self, "measurement_device_modes", {}))
+                f.attrs["filename_central_wavelength_nm"] = self.filename_wavelength_box.value()
+                f.attrs["filename_wavelength_source"] = "manual"
                 # Save coordinates and grid geometry
                 f.create_dataset("c1_coords", data=self.c1_coords)
                 f.create_dataset("c2_coords", data=self.c2_coords)
@@ -4892,7 +5286,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 f.create_dataset("energy_axis", data=self.energy_axis)
 
                 # Save measured datasets
+                f.create_dataset("wavelength_axis", data=self.wavelength_axis)
                 f.create_dataset("spectra", data=self.data_spectra)
+                if getattr(self, "data_raw_spectra", None) is not None and self.data_raw_spectra.size > 0:
+                    f.create_dataset("raw_intensities", data=self.data_raw_spectra)
                 f.create_dataset("current_ch1", data=self.data_current_ch1)
                 f.create_dataset("current_ch2", data=self.data_current_ch2)
                 f.create_dataset("measured_volt_ch1", data=self.data_measured_volt_ch1)
@@ -4926,6 +5323,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 f.attrs["coeff_b"] = self.coeff_b.value()
                 f.attrs["coeff_c"] = self.coeff_c.value()
                 f.attrs["coeff_d"] = self.coeff_d.value()
+                limits = getattr(self, 'measurement_current_compliance', {})
+                for axis in (1, 2):
+                    f.attrs[f'current_compliance_ch{axis}_A'] = limits.get(axis, self._compliance_setting(axis))
                 # Store full value_storage JSON as a dataset for full state recovery
                 try:
                     storage_path = os.path.join(parent_dir, "value_storage")
@@ -4954,6 +5354,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 f.attrs["exposure_time"] = self.exposure_box.value()
                 f.attrs["settling_time"] = self.settling_box.value()
                 f.attrs["timestamp"] = timestamp
+                f.attrs["measurement_started_at"] = measurement_start_text(
+                    getattr(self, "measurement_started_at", None)
+                )
 
             self.status_lbl.setText(f"Status: Saved {os.path.basename(filename)}")
             if file_path is None:
@@ -4968,15 +5371,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 print(f"Auto-save failed: {e}")
 
     def trigger_autosave(self, was_interrupted=False):
+        if getattr(self, "plotter_mode", False):
+            return
         if getattr(self, "_autosaved_this_run", False):
             return
         if not np.any(self.data_measured_mask):
             return
-        autosave_dir = os.path.join(parent_dir, "data", "autosave")
-        os.makedirs(autosave_dir, exist_ok=True)
+        autosave_dir = measurement_data_dir(
+            parent_dir, getattr(self, "measurement_started_at", None), autosave=True
+        )
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         suffix = "_interrupted" if was_interrupted else ""
-        filename = f"autosave_gate_sweep_{timestamp}{suffix}.h5"
+        filename = f"autosave_gate_sweep_{timestamp[-6:]}{suffix}.h5"
+        filename = dated_measurement_filename(filename, getattr(self, "measurement_started_at", None))
         file_path = os.path.join(autosave_dir, filename)
         try:
             self.save_sweep_data(file_path=file_path)
@@ -4992,7 +5399,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.sweep_worker and self.sweep_worker.isRunning():
             self.sweep_worker.stop()
             self.sweep_worker.wait()
+        if self.ramp_worker and self.ramp_worker.isRunning():
+            self.ramp_worker.stop()
+            self.ramp_worker.wait()
         self.save_storage()
+        from gui_safety import uninstall_parameter_wheel_guard
+        uninstall_parameter_wheel_guard(self)
         event.accept()
 
 

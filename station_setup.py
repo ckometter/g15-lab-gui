@@ -30,7 +30,7 @@ from drivers.thorlabs_pm100d import ThorlabsPM100D
 
 # Spectrometer configuration switch
 # Options: 'lightfieldG15', 'wingspecG15', 'lightfieldG11', 'winspecG11'
-SPECTROMETER_TYPE = 'winspecG15'
+SPECTROMETER_TYPE = 'lightfieldG11'
 
 
 # Configuration details for each spectrometer
@@ -46,7 +46,7 @@ SPECTROMETER_CONFIGS = {
         'pyro_uri': 'PYRO:WinSpec@phd-exile-phys.ethz.ch:9091'
     },
     'lightfieldG11': {
-        'server_ip': "10.236.10.143",  # this is the Nirvana computer --- might need to update if device PC reboots
+        'server_ip': "10.236.10.143",  # NIRvana in G9; confirm address after PC/network changes
         'port': 65432,
         'pyro_uri': None
     },
@@ -59,15 +59,15 @@ SPECTROMETER_CONFIGS = {
 
 # Default dictionary of simulated devices
 simulated_devices = {
-    'smu': True,
-    'monochromator': True,
+    'smu': False,
+    'monochromator': False,
     'rotator1': True,
     'rotator2': True,
     'rotator3': True,
-    'camera': True,
-    'piezo150': True,
-    'piezo300': True,
-    'magnet': True,
+    'camera': False,
+    'piezo150': False,
+    'piezo300': False,
+    'magnet': False,
     'powermeter': True
 }
 
@@ -113,7 +113,7 @@ def initialize_station(simulated: bool = False, simulated_devices: dict = None, 
         resolved_type = 'wingspecG15'
 
     spec_cfg = SPECTROMETER_CONFIGS.get(resolved_type, SPECTROMETER_CONFIGS['lightfieldG15'])
-    spec_ip = spec_cfg.get('server_ip') or 'G15-Pylon.dhcp-int.phys.ethz.ch'
+    spec_ip = spec_cfg.get('server_ip') or 'DESKTOP-LSQKIT5.dhcp-int-phys.ethz.ch'
     spec_port = spec_cfg.get('port') or 50920
     spec_uri = spec_cfg.get('pyro_uri')
 

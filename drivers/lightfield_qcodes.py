@@ -173,9 +173,9 @@ class LightFieldQCoDeSInstrument(Instrument):
 
 # Example Usage (run directly to test)
 if __name__ == '__main__':
-    # Replace with the actual IP address of the server PC running LightField
-    SERVER_IP = "G15-Pylon.dhcp-int.phys.ethz.ch" 
-    
+    # Replace with the actual hostname/IP of the server PC running LightField
+    SERVER_IP = "DESKTOP-LSQKIT5.dhcp-int-phys.ethz.ch"
+
     # Initialize the instrument on the client PC
     lf_instrument = LightFieldQCoDeSInstrument(name="lightfield_client", host_ip=SERVER_IP)
     

@@ -1,3 +1,4 @@
+from scanner_safety import move_scanner, validate_map_scanner_targets
 import os
 import sys
 import json
@@ -7,19 +8,24 @@ import h5py
 from PyQt6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 try:
-    from .utils import EnhancedViewBox, calculate_expected_duration
+    from .utils import EnhancedViewBox, calculate_expected_duration, configure_plot_axes
 except ImportError:
     import sys
     import os
     _measurements_dir = os.path.dirname(os.path.abspath(__file__))
     if _measurements_dir not in sys.path:
         sys.path.insert(0, _measurements_dir)
-    from utils import EnhancedViewBox, calculate_expected_duration
+    from utils import EnhancedViewBox, calculate_expected_duration, configure_plot_axes
 
 # Ensure parent directory is in path for importing station_setup
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
+
+from gate_safety import GateRampCancelled, validate_gate_voltage, validate_map_gate_targets
+from measurement_data_paths import dated_measurement_filename, dated_measurement_path
+from measurement_data_paths import measurement_data_dir, measurement_start_text, new_measurement_start, measurement_device_modes
+from measurement_acquisition import acquire_sweep_spectrum
 
 pg.setConfigOption('background', '#ffffff')
 pg.setConfigOption('foreground', '#1e293b')
@@ -138,7 +144,7 @@ class PLMapWorker(QtCore.QThread):
     Emits `point_measured` with (ix, iy, x_val, y_val, spectrum).
     Emits `progress_updated` with (current, total).
     """
-    point_measured = QtCore.pyqtSignal(int, int, float, float, np.ndarray, float, float, float, float, float)
+    point_measured = QtCore.pyqtSignal(int, int, float, float, np.ndarray, float, float, float, float, float, np.ndarray)
     progress_updated = QtCore.pyqtSignal(int, int)
     finished = QtCore.pyqtSignal()
     error = QtCore.pyqtSignal(str)
@@ -179,41 +185,51 @@ class PLMapWorker(QtCore.QThread):
         self.mutex.unlock()
 
     def set_piezo(self, axis, val):
+        if not move_scanner(getattr(self.station, 'piezo300', None), {axis: val},
+                            keep_running=self.check_pause_and_stop):
+            raise GateRampCancelled('Map scanner ramp stopped.')
+
+    def check_pause_and_stop(self):
+        self.mutex.lock()
         try:
-            if hasattr(self.station, 'piezo300'):
-                if hasattr(self.station.piezo300, 'set_voltage'):
-                    self.station.piezo300.set_voltage(axis, val)
-                else:
-                    param = getattr(self.station.piezo300, f'voltage_ch{axis}', None)
-                    if param:
-                        param(val)
-        except Exception as e:
-            print(f"Error setting ANC300 axis {axis}: {e}")
+            while self._is_paused and self._running:
+                self.pause_cond.wait(self.mutex)
+            return self._running
+        finally:
+            self.mutex.unlock()
+
+    def preflight_gate_scan(self, x_vals, y_vals):
+        validate_map_scanner_targets(getattr(self.station, 'piezo300', None), self.params, x_vals, y_vals)
+        channels = validate_map_gate_targets(self.params, x_vals, y_vals)
+        if channels:
+            smu = getattr(self.station, 'smu', None)
+            if smu is None:
+                raise RuntimeError('A gate scan requires a connected SMU.')
+            for number in sorted(channels):
+                channel = getattr(smu, f'ch{number}')
+                if channel.source_mode() != 'VOLT':
+                    raise RuntimeError(f'Channel {number} must be in voltage-source mode for a gate scan.')
+                validate_gate_voltage(channel.volt(), number)
+            if not self.check_pause_and_stop():
+                raise GateRampCancelled('Map stopped before gate preparation.')
+            smu.enforce_current_compliance()
 
     def set_smu_volt(self, ch, val):
+        validate_gate_voltage(val, ch)
+        if not self.check_pause_and_stop():
+            raise GateRampCancelled('Map stopped before gate ramp.')
+        channel = getattr(self.station.smu, f'ch{ch}')
+        self.mutex.lock()
         try:
-            if hasattr(self.station, 'smu'):
-                channel = getattr(self.station.smu, f'ch{ch}', None)
-                if channel:
-                    if getattr(self.station.smu, "simulated", False):
-                        channel.set_r.volt(val)
-                    else:
-                        max_retries = 3
-                        for attempt in range(1, max_retries + 1):
-                            try:
-                                channel.set_r.volt(val)
-                                break
-                            except Exception as ex:
-                                if attempt == max_retries:
-                                    raise ex
-                                print(f"PLMapWorker: Retrying SMU{ch} set voltage (attempt {attempt+1}/{max_retries}) due to error: {ex}")
-                                try:
-                                    channel.parent.visa_handle.clear()
-                                except Exception:
-                                    pass
-                                time.sleep(0.1)
-        except Exception as e:
-            print(f"Error setting SMU channel {ch}: {e}")
+            if not self._running:
+                raise GateRampCancelled('Map stopped before gate ramp.')
+            channel.ramp_stop_requested = False
+        finally:
+            self.mutex.unlock()
+        # A failed/cancelled ramp must propagate and prevent acquisition.
+        channel.set_r.volt(val)
+        if channel.ramp_stop_requested or not self.check_pause_and_stop():
+            raise GateRampCancelled('Map gate ramp cancelled.')
 
     def set_magnet(self, val):
         try:
@@ -223,6 +239,7 @@ class PLMapWorker(QtCore.QThread):
             print(f"Error setting magnet field: {e}")
 
     def apply_sweep_values(self, px, vx, py, vy):
+        piezo_updated = False
         # 1. Magnet (B)
         if px == "B":
             self.set_magnet(vx)
@@ -232,12 +249,18 @@ class PLMapWorker(QtCore.QThread):
         # 2. Attocubes (Position X, Position Y)
         if px == "position X":
             self.set_piezo(1, vx)
+            piezo_updated = True
         if py == "position X":
             self.set_piezo(1, vy)
+            piezo_updated = True
             
         if px == "position Y":
+            if piezo_updated:
+                time.sleep(0.02)
             self.set_piezo(2, vx)
         if py == "position Y":
+            if piezo_updated:
+                time.sleep(0.02)
             self.set_piezo(2, vy)
             
         # 3. SMU Channels (V1, V2)
@@ -287,6 +310,9 @@ class PLMapWorker(QtCore.QThread):
                         smu.return_to_local()
                     except Exception:
                         pass
+        except GateRampCancelled as e:
+            if self._running:
+                self.error.emit(str(e))
         except Exception as e:
             self.error.emit(str(e))
         finally:
@@ -305,6 +331,7 @@ class PLMapWorker(QtCore.QThread):
 
             x_vals = np.linspace(x_start, x_end, x_pts)
             y_vals = np.linspace(y_start, y_end, y_pts)
+            self.preflight_gate_scan(x_vals, y_vals)
             total = x_pts * y_pts
             cnt = 0
 
@@ -329,6 +356,9 @@ class PLMapWorker(QtCore.QThread):
                     do_average   = str(single_data.get("average",      vs.get("average",      "No"))) == "Yes"
                 except Exception as e:
                     print(f"PLMapWorker: could not read value_storage ({e}), using defaults")
+
+            # Use the same frame count as the preallocated data array.
+            num_spectra = int(self.params.get("num_spectra", num_spectra))
 
             if camera:
                 try:
@@ -363,8 +393,8 @@ class PLMapWorker(QtCore.QThread):
                     # Apply physical values for chosen sweep parameter
                     self.apply_sweep_values(x_param, xv, y_param, yv)
 
-                    # Settling time delay
-                    settling_time = self.params.get('settling_time', 0.05)
+                    # Settling time delay (0.1 s delay after setting voltages before taking spectrum)
+                    settling_time = self.params.get('settling_time', 0.1)
                     if settling_time > 0:
                         sleep_end = time.time() + settling_time
                         while time.time() < sleep_end:
@@ -376,40 +406,21 @@ class PLMapWorker(QtCore.QThread):
                                 self.mutex.unlock()
                                 return
                             self.mutex.unlock()
-                            time.sleep(0.05)
+                            time.sleep(0.01)
 
-                    # Acquire spectrum
-                    spectrum = None
-                    if camera:
-                        try:
-                            res = camera.remote_lf.get_spectrum()
-                            if res is not None:
-                                intensities, _ = res
-                                intensities_arr = np.array(intensities, dtype=float)
-                                if intensities_arr.ndim == 2:
-                                    if do_average or accum_method == "Average":
-                                        intensities_arr = np.mean(intensities_arr, axis=0)
-                                    else:
-                                        intensities_arr = np.sum(intensities_arr, axis=0)
-                                spectrum = intensities_arr
-                                # Match shape to pixels if needed
-                                if len(spectrum) != pixels:
-                                    x_old = np.linspace(0, 1, len(spectrum))
-                                    x_new = np.linspace(0, 1, pixels)
-                                    spectrum = np.interp(x_new, x_old, spectrum)
-                        except Exception as e:
-                            if self._running:
-                                print(f"PLMapWorker error acquiring spectrum: {e}")
-                            spectrum = None
+                    if not self.check_pause_and_stop():
+                        return
 
-                    if spectrum is None:
-                        # Simulated spectrum: shifting peak + noise
-                        peak_center = mono_wl + 5.0 * np.sin(xv / 10.0) + 5.0 * np.cos(yv / 10.0)
-                        peak_width = 1.5
-                        amplitude = 1000.0 * (1.0 + np.exp(-((xv - (x_start + x_end) / 2.0)**2 + (yv - (y_start + y_end) / 2.0)**2) / 100.0))
-                        base_counts = np.random.poisson(lam=100, size=pixels).astype(float)
-                        signal = amplitude * np.exp(-((wl_axis - peak_center) / peak_width) ** 2)
-                        spectrum = base_counts + signal
+                    try:
+                        spectrum, raw_frames = acquire_sweep_spectrum(
+                            camera, pixels=pixels, frames=num_spectra,
+                            average=do_average or accum_method == "Average",
+                            wavelengths=wl_axis,
+                        )
+                    except Exception:
+                        if not self._running:
+                            return
+                        raise
 
                     # Read SMU currents and voltages if SMU is present
                     curr_ch1, meas_v1 = 0.0, 0.0
@@ -440,9 +451,12 @@ class PLMapWorker(QtCore.QThread):
                             except Exception:
                                 pass
 
-                    self.point_measured.emit(ix, iy, xv, yv, spectrum, meas_v1, meas_v2, curr_ch1, curr_ch2, meas_b)
+                    self.point_measured.emit(ix, iy, xv, yv, spectrum, meas_v1, meas_v2, curr_ch1, curr_ch2, meas_b, raw_frames)
                     cnt += 1
                     self.progress_updated.emit(cnt, total)
+        except GateRampCancelled as e:
+            if self._running:
+                self.error.emit(str(e))
         except Exception as e:
             self.error.emit(str(e))
 
@@ -650,6 +664,7 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         except Exception:
             self.wavelengths = np.linspace(500, 600, 512)
         self.data_spectra = None
+        self.data_raw_spectra = None
         self.data_measured_v1 = None
         self.data_measured_v2 = None
         self.data_measured_b = None
@@ -1097,7 +1112,7 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         """Helper to create a HistogramLUTItem matching the Dual-Gate Sweep style."""
         hist = pg.HistogramLUTItem(gradientPosition='left')
         hist.setImageItem(image_item)
-        hist.gradient.loadPreset('thermal')
+        hist.gradient.loadPreset('viridis')
         
         hist.layout.removeItem(hist.gradient)
         hist.layout.removeItem(hist.vb)
@@ -1207,15 +1222,7 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         except Exception as e:
             print(f"Could not get wavelengths cache: {e}")
             
-        if wavelengths is None:
-            try:
-                res = self.station.camera.remote_lf.get_spectrum()
-                if res is not None and len(res) >= 2 and len(res[0]) >= 1:
-                    num_pixels = len(res[0][0])
-                    if len(res[1]) > 0:
-                        wavelengths = np.array(res[1])
-            except Exception as e:
-                print(f"Could not fetch test spectrum for pixel count: {e}")
+
                 
         if wavelengths is None:
             # Fallback to manual calibration around center wavelength
@@ -1239,7 +1246,7 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
             'coeff_b': b,
             'coeff_c': c,
             'coeff_d': d,
-            'settling_time': self.value_storage.get("shared", {}).get("settling_time", self.value_storage.get("settling_time", 0.05)) if isinstance(self.value_storage, dict) else 0.05,
+            'settling_time': self.value_storage.get("shared", {}).get("settling_time", self.value_storage.get("settling_time", 0.1)) if isinstance(self.value_storage, dict) else 0.1,
             'c1_name': getattr(self, 'c1_name', 'Vc1'),
             'c2_name': getattr(self, 'c2_name', 'Vc2'),
             'num_pixels': num_pixels,
@@ -1270,8 +1277,21 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
             self.integration_h_region.setRegion((200.0, 1500.0))
             self.integration_h_region.blockSignals(False)
 
+        # Load num_spectra from value_storage
+        num_spectra = 1
+        try:
+            storage_path = os.path.join(parent_dir, "value_storage")
+            if os.path.exists(storage_path):
+                with open(storage_path, "r") as f_vs:
+                    vs = json.load(f_vs)
+                single_data = vs.get("single_spectra", {})
+                num_spectra = int(single_data.get("num_spectra", vs.get("num_spectra", 1)))
+        except Exception:
+            num_spectra = 1
+
         # Clear/initialize spectrum arrays
         self.data_spectra = np.zeros((len(self.y_coords), len(self.x_coords), num_pixels))
+        self.data_raw_spectra = np.zeros((len(self.y_coords), len(self.x_coords), num_spectra, num_pixels))
         self.data_measured_v1 = np.zeros((len(self.y_coords), len(self.x_coords)))
         self.data_measured_v2 = np.zeros((len(self.y_coords), len(self.x_coords)))
         self.data_measured_b = np.zeros((len(self.y_coords), len(self.x_coords)))
@@ -1428,11 +1448,14 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         self.sweep_initial_v2 = init_v2
         self.sweep_initial_b = init_b
         self.sweep_start_time = time.time()
+        self.measurement_started_at = new_measurement_start(self.sweep_start_time)
+        self.measurement_device_modes = measurement_device_modes(self.station)
         self.total_paused_time = 0.0
         self.pause_start_time = None
 
         self.lbl_expected_end.setText("Expected End: (waiting for measurements)")
 
+        params["num_spectra"] = self.data_raw_spectra.shape[2]
         self.sweep_worker = PLMapWorker(self.station, params)
         self.sweep_worker.point_measured.connect(self._on_point_measured)
         self.sweep_worker.progress_updated.connect(self._on_progress_updated)
@@ -1620,8 +1643,10 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         self.lbl_status.setText("Status: Idle")
         QtCore.QTimer.singleShot(500, self.resume_status_worker)
 
-    def _on_point_measured(self, ix, iy, xv, yv, spectrum, meas_v1, meas_v2, curr_ch1, curr_ch2, meas_b):
+    def _on_point_measured(self, ix, iy, xv, yv, spectrum, meas_v1, meas_v2, curr_ch1, curr_ch2, meas_b, raw_frames):
         self.data_spectra[iy, ix, :] = spectrum
+        if getattr(self, "data_raw_spectra", None) is not None:
+            self.data_raw_spectra[iy, ix, :, :] = raw_frames
         self.data_measured_v1[iy, ix] = meas_v1
         self.data_measured_v2[iy, ix] = meas_v2
         self.data_measured_b[iy, ix] = meas_b
@@ -1766,8 +1791,8 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
             return
             
         self.trigger_autosave(was_interrupted=True)
-        QtWidgets.QMessageBox.critical(self, "Sweep Error", msg)
         self.is_running = False
+        QtWidgets.QMessageBox.critical(self, "Sweep Error", msg)
         self.btn_start.setEnabled(True)
         self.btn_pause.setEnabled(False)
         self.btn_reset.setEnabled(True)
@@ -1888,10 +1913,12 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         try:
             # Ensure the full value_storage (including shared and all sections) is up‑to‑date
             self.save_storage()
-            data_dir = os.path.join(parent_dir, "data")
-            os.makedirs(data_dir, exist_ok=True)
+            data_dir = measurement_data_dir(
+                parent_dir, getattr(self, "measurement_started_at", None)
+            )
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            default_name = f"vector_map_{timestamp}.h5"
+            default_name = f"vector_map_{timestamp[-6:]}.h5"
+            default_name = dated_measurement_filename(default_name, getattr(self, "measurement_started_at", None))
             if file_path is None:
                 filename, _ = QtWidgets.QFileDialog.getSaveFileName(
                     self,
@@ -1901,14 +1928,22 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
                 )
                 if not filename:
                     return
+                filename = dated_measurement_path(filename, getattr(self, "measurement_started_at", None))
             else:
                 filename = file_path
 
             with h5py.File(filename, "w") as f:
+                f.attrs["device_modes"] = json.dumps(getattr(self, "measurement_device_modes", {}))
+                f.attrs["measurement_started_at"] = measurement_start_text(
+                    getattr(self, "measurement_started_at", None)
+                )
                 f.create_dataset("x_coords", data=self.x_coords)
                 f.create_dataset("y_coords", data=self.y_coords)
                 f.create_dataset("wavelengths", data=self.wavelengths)
+                f.create_dataset("wavelength_axis", data=self.wavelengths)
                 f.create_dataset("spectra", data=self.data_spectra)
+                if getattr(self, "data_raw_spectra", None) is not None and self.data_raw_spectra.size > 0:
+                    f.create_dataset("raw_intensities", data=self.data_raw_spectra)
                 f.create_dataset("measured_v1", data=self.data_measured_v1)
                 f.create_dataset("measured_v2", data=self.data_measured_v2)
                 if self.data_measured_b is not None and self.data_measured_b.size > 0:
@@ -1970,11 +2005,13 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
             return
         if not np.any(self.data_measured_mask):
             return
-        autosave_dir = os.path.join(parent_dir, "data", "autosave")
-        os.makedirs(autosave_dir, exist_ok=True)
+        autosave_dir = measurement_data_dir(
+            parent_dir, getattr(self, "measurement_started_at", None), autosave=True
+        )
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         suffix = "_interrupted" if was_interrupted else ""
-        filename = f"autosave_vector_map_{timestamp}{suffix}.h5"
+        filename = f"autosave_vector_map_{timestamp[-6:]}{suffix}.h5"
+        filename = dated_measurement_filename(filename, getattr(self, "measurement_started_at", None))
         file_path = os.path.join(autosave_dir, filename)
         try:
             self.save_data(file_path=file_path)
@@ -1995,12 +2032,13 @@ class PhotoluminescenceMapWindow(QtWidgets.QWidget):
         for attr_name in dir(self):
             attr = getattr(self, attr_name, None)
             if isinstance(attr, pg.PlotWidget):
+                configure_plot_axes(attr)
                 attr.setBackground('#ffffff')
                 attr.getAxis('left').setPen(pg.mkPen('#334155'))
                 attr.getAxis('bottom').setPen(pg.mkPen('#334155'))
                 attr.getAxis('left').setTextPen(pg.mkPen('#334155'))
                 attr.getAxis('bottom').setTextPen(pg.mkPen('#334155'))
-                attr.showGrid(x=True, y=True, alpha=0.15)
+                attr.showGrid(x=False, y=False)
 
     def load_storage(self):
         storage_path = os.path.join(parent_dir, "value_storage")

@@ -12,7 +12,7 @@ import h5py
 from PyQt6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 try:
-    from .utils import EnhancedViewBox, calculate_expected_duration
+    from .utils import EnhancedViewBox, calculate_expected_duration, configure_plot_axes, update_current_slice
 except ImportError:
     # If run directly as a script, ensure measurements directory is in path
     import sys
@@ -20,7 +20,7 @@ except ImportError:
     _measurements_dir = os.path.dirname(os.path.abspath(__file__))
     if _measurements_dir not in sys.path:
         sys.path.insert(0, _measurements_dir)
-    from utils import EnhancedViewBox, calculate_expected_duration
+    from utils import EnhancedViewBox, calculate_expected_duration, configure_plot_axes, update_current_slice
 
 # Ensure parent directory is in path for imports
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -28,6 +28,10 @@ if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
 from station_setup import initialize_station
+from gate_safety import GateRampCancelled, validate_gate_voltage, validate_gate_targets
+from measurement_acquisition import acquire_sweep_spectrum
+from measurement_data_paths import dated_measurement_filename, dated_measurement_path
+from measurement_data_paths import measurement_data_dir, measurement_start_text, new_measurement_start, measurement_device_modes
 
 # Setup pyqtgraph themes (Light Theme)
 pg.setConfigOption('background', '#ffffff')
@@ -114,11 +118,27 @@ class CollapsibleSection(QtWidgets.QWidget):
             self.header.setText(f"▶ {title_text}")
 
 
+def control_to_gate_voltages(control, ch1_coefficient, ch2_coefficient):
+    """Solve control = a*CH1 + b*CH2 with -b*CH1 + a*CH2 = 0.
+
+    This fixes one reproducible gate path without a second user control.
+    Shared DGS coefficients and former fixed-coordinate values do not apply.
+    """
+    a, b = float(ch1_coefficient), float(ch2_coefficient)
+    norm_squared = a * a + b * b
+    if not math.isfinite(norm_squared) or norm_squared <= 0:
+        raise ValueError('Control variable coefficients must be finite and at least one must be nonzero.')
+    control = np.asarray(control, dtype=float)
+    if not np.isfinite(control).all():
+        raise ValueError('Control variable values must be finite.')
+    return control * (a / norm_squared), control * (b / norm_squared)
+
+
 class BVSweepWorker(QtCore.QThread):
     """
     Background worker thread that runs the B/V sweep measurement.
     """
-    point_measured = QtCore.pyqtSignal(int, int, float, float, float, float, np.ndarray, float, float, float, float, float)
+    point_measured = QtCore.pyqtSignal(int, int, float, float, float, float, np.ndarray, float, float, float, float, float, np.ndarray)
     progress_updated = QtCore.pyqtSignal(int, int, float) # current, total, expected_remaining_seconds
     status_updated = QtCore.pyqtSignal(str)
     voltage_updated = QtCore.pyqtSignal(float, float)
@@ -161,6 +181,30 @@ class BVSweepWorker(QtCore.QThread):
         self.pause_cond.wakeAll()
         self.mutex.unlock()
 
+    def check_pause_and_stop(self):
+        self.mutex.lock()
+        try:
+            while self._is_paused and self._is_running:
+                self.pause_cond.wait(self.mutex)
+            return self._is_running
+        finally:
+            self.mutex.unlock()
+
+    def ramp_gate(self, channel, target):
+        validate_gate_voltage(target, channel.channel_num)
+        if not self.check_pause_and_stop():
+            raise GateRampCancelled('B/V sweep stopped before gate ramp.')
+        self.mutex.lock()
+        try:
+            if not self._is_running:
+                raise GateRampCancelled('B/V sweep stopped before gate ramp.')
+            channel.ramp_stop_requested = False
+        finally:
+            self.mutex.unlock()
+        channel.set_r.volt(target)
+        if channel.ramp_stop_requested or not self.check_pause_and_stop():
+            raise GateRampCancelled('B/V gate ramp cancelled.')
+
     def run(self):
         smu = getattr(self.station, "smu", None)
         try:
@@ -172,6 +216,9 @@ class BVSweepWorker(QtCore.QThread):
                         smu.return_to_local()
                     except Exception:
                         pass
+        except GateRampCancelled as e:
+            if self._is_running:
+                self.error_occurred.emit(str(e))
         except Exception as e:
             self.error_occurred.emit(str(e))
         finally:
@@ -187,17 +234,24 @@ class BVSweepWorker(QtCore.QThread):
             rotator1 = getattr(self.station, "rotator1", None)
             rotator2 = getattr(self.station, "rotator2", None)
 
-            # Coefficients
-            a = self.params['a']
-            b = self.params['b']
-            c = self.params['c']
-            d = self.params['d']
+            ch1_coefficient = self.params['control_coeff_ch1']
+            ch2_coefficient = self.params['control_coeff_ch2']
 
             # Voltage sweep parameters
             v_start = self.params['v_start']
             v_end = self.params['v_end']
             v_pts = self.params['v_pts']
-            v_fixed = self.params['v_fixed']
+
+            # Preflight the COMPLETE control-variable path before changing
+            # gates, magnet, rotators or camera, including later sweep points.
+            v_arr = np.linspace(v_start, v_end, v_pts) if v_pts > 1 else np.array([v_start])
+            validate_gate_targets(*control_to_gate_voltages(v_arr, ch1_coefficient, ch2_coefficient))
+            for channel in (smu.ch1, smu.ch2):
+                if channel.source_mode() != 'VOLT':
+                    raise RuntimeError('Both SMU channels must be in voltage-source mode for a gate scan.')
+                validate_gate_voltage(channel.volt(), channel.channel_num)
+            if not self.check_pause_and_stop():
+                return
 
             # Magnetic sweep parameters
             b_start = self.params['b_start']
@@ -222,8 +276,6 @@ class BVSweepWorker(QtCore.QThread):
             num_spectra = 1
             accum_method = "Sum"
             do_average = False
-            comp1 = 0.01
-            comp2 = 0.01
             mag_rate = 0.5
             storage_path = os.path.join(parent_dir, "value_storage")
             if os.path.exists(storage_path):
@@ -235,14 +287,25 @@ class BVSweepWorker(QtCore.QThread):
                     accum_method = str(single_data.get("accum_method", vs.get("accum_method", "Sum")))
                     do_average = str(single_data.get("average", vs.get("average", "No"))) == "Yes"
                     
-                    dg_data = vs.get("dual_gate", {})
-                    comp1 = float(dg_data.get("v1_compliance", vs.get("v1_compliance", 0.01)))
-                    comp2 = float(dg_data.get("v2_compliance", vs.get("v2_compliance", 0.01)))
-                    
                     pos_data = vs.get("position", {})
                     mag_rate = float(pos_data.get("magnet_ramp_rate", 0.0083))
                 except Exception as e:
                     print(f"BVSweepWorker: error reading value_storage ({e})")
+
+            # Use the same frame count as the preallocated data array.
+            num_spectra = int(self.params.get("num_spectra", num_spectra))
+
+            # Confirm fixed gate protection before changing any measurement device.
+            smu.enforce_current_compliance()
+
+            self.mutex.lock()
+            try:
+                if not self._is_running:
+                    return
+                smu.ch1.ramp_stop_requested = False
+                smu.ch2.ramp_stop_requested = False
+            finally:
+                self.mutex.unlock()
 
             # Configure magnet sweep rate
             if magnet is not None:
@@ -251,12 +314,10 @@ class BVSweepWorker(QtCore.QThread):
                 except Exception as e:
                     print(f"BVSweepWorker: Error setting magnet sweep rate: {e}")
 
-            # Explicitly configure SMU mode, compliance, and turn outputs ON
-            smu.ch1.source_mode("VOLT")
-            smu.ch2.source_mode("VOLT")
-            smu.ch1.curr_limit(comp1)
-            smu.ch2.curr_limit(comp2)
+            # Mode was checked before other device changes; enabling is ramped.
             smu.ch1.output(True)
+            if not self.check_pause_and_stop():
+                return
             smu.ch2.output(True)
 
             camera.exposure_time(exposure_time)
@@ -286,7 +347,7 @@ class BVSweepWorker(QtCore.QThread):
 
 
             # Sweep configuration
-            if variable_order == "Hold B, scan V":
+            if variable_order in ("Hold B, scan Control", "Hold B, scan V"):
                 outer_arr = b_arr
                 inner_arr = v_arr
                 is_b_outer = True
@@ -356,20 +417,13 @@ class BVSweepWorker(QtCore.QThread):
 
             def _ramp_smu(chan, target):
                 """Ramp SMU channel using driver's software ramp."""
-                chan.ramp_stop_requested = False
-                try:
-                    chan.set_r.volt(target)
-                except Exception as e:
-                    print(f"BVSweepWorker: Error in _ramp_smu: {e}")
+                self.ramp_gate(chan, target)
 
             def _cleanup_on_abort():
-                """Safely ramp down instruments on user abort/reset."""
+                """Hold gate setpoints on Stop; keep existing magnet cleanup."""
                 magnet.hold()
-                if end_ramp_ground:
-                    _ramp_smu(smu.ch1, 0.0)
-                    _ramp_smu(smu.ch2, 0.0)
-                    smu.ch1.output(False)
-                    smu.ch2.output(False)
+                # end_ramp_ground applies only to successful completion. Stop
+                # must neither restart a ramp nor disconnect gates suddenly.
                 try:
                     smu.return_to_local()
                 except Exception:
@@ -383,16 +437,18 @@ class BVSweepWorker(QtCore.QThread):
                         self.status_updated.emit(f"Status: Aborted. Leaving B-field at {curr_f:.4f} T.")
                     except Exception:
                         self.status_updated.emit("Status: Aborted. Leaving B-field intact.")
-                if getattr(magnet, "SWITCH_HEATER_FITTED", False) and end_ramp_zero:
-                    try:
-                        magnet.switch_heater('off')
-                        self.status_updated.emit("Status: Aborted. Ramping leads to zero...")
-                        magnet.target_field_param(0.0)
-                        magnet.goto_set()
-                        while magnet.is_sweeping():
-                            self.msleep(100)
-                        magnet.hold()
-                    except Exception:
+                # Disable switch heater and take leads to zero if switch heater is fitted (Disabled: persistent mode cannot be enabled)
+                # if getattr(magnet, "SWITCH_HEATER_FITTED", False) and end_ramp_zero:
+                #     try:
+                #         magnet.switch_heater('off')
+                #         self.status_updated.emit("Status: Aborted. Ramping leads to zero...")
+                #         magnet.target_field_param(0.0)
+                #         magnet.goto_set()
+                #         while magnet.is_sweeping():
+                #             self.msleep(100)
+                #         magnet.hold()
+                #     except Exception:
+                #         pass
                         pass
 
             # Initial magnet ramp to first B point (if needed)
@@ -455,32 +511,13 @@ class BVSweepWorker(QtCore.QThread):
                         if rotator2:
                             rotator2.angle(base_rot2 + offset)
 
-                    # 2. Transform voltage coordinates to physical voltages
-                    # Vc1 = C1 (voltage), Vc2 = C2 (fixed voltage)
-                    v1 = a * voltage + b * v_fixed
-                    v2 = c * voltage + d * v_fixed
+                    # 2. Solve the recorded control equation for both channels.
+                    v1, v2 = control_to_gate_voltages(voltage, ch1_coefficient, ch2_coefficient)
 
                     # Ramp physical voltages
                     self.voltage_updated.emit(v1, v2)
-                    # Gradually ramp voltages to avoid timeout on large steps
-                    # Gradually ramp voltages using driver's software ramp
-                    def _ramp(chan, target):
-                        chan.ramp_stop_requested = False
-                        max_retries = 3
-                        for attempt in range(1, max_retries + 1):
-                            try:
-                                chan.set_r.volt(target)
-                                break
-                            except Exception as ex:
-                                if attempt == max_retries:
-                                    raise ex
-                                try:
-                                    chan.parent.visa_handle.clear()
-                                except Exception:
-                                    pass
-                                time.sleep(0.1)
-                    _ramp(smu.ch1, v1)
-                    _ramp(smu.ch2, v2)
+                    self.ramp_gate(smu.ch1, v1)
+                    self.ramp_gate(smu.ch2, v2)
 
                     # 3. Wait settling time
                     if settling_time > 0:
@@ -499,26 +536,21 @@ class BVSweepWorker(QtCore.QThread):
                             self.mutex.unlock()
                             time.sleep(0.05)
 
+                    if not self.check_pause_and_stop():
+                        _cleanup_on_abort()
+                        return
+
                     # 4. Acquire spectrum
-                    self.status_updated.emit(f"Status: Acquiring spectrum ({num_spectra}x)...")
-                    spectrum = None
                     try:
-                        res = camera.remote_lf.get_spectrum()
-                        if res is not None:
-                            intensities, _ = res
-                            intensities_arr = np.array(intensities, dtype=float)
-                            if intensities_arr.ndim == 2:
-                                if do_average or accum_method == "Average":
-                                    intensities_arr = np.mean(intensities_arr, axis=0)
-                                else:
-                                    intensities_arr = np.sum(intensities_arr, axis=0)
-                            spectrum = intensities_arr
-                    except Exception as e:
-                        if self._is_running:
-                            print(f"BVSweepWorker error fetching spectrum: {e}")
-                    
-                    if spectrum is None:
-                        spectrum = np.zeros(num_pixels)
+                        spectrum, raw_frames = acquire_sweep_spectrum(
+                            camera, pixels=num_pixels, frames=num_spectra,
+                            average=do_average or accum_method == "Average",
+                            wavelengths=self.params.get('wl_axis'),
+                        )
+                    except Exception:
+                        if not self._is_running:
+                            return
+                        raise
 
                     # Read currents
                     try:
@@ -566,7 +598,7 @@ class BVSweepWorker(QtCore.QThread):
                     
                     remaining_seconds = pts_time + remaining_b_time
 
-                    self.point_measured.emit(idx_v, idx_b, voltage, b_field, v1, v2, spectrum, curr_ch1, curr_ch2, meas_v1, meas_v2, meas_b)
+                    self.point_measured.emit(idx_v, idx_b, voltage, b_field, v1, v2, spectrum, curr_ch1, curr_ch2, meas_v1, meas_v2, meas_b, raw_frames)
                     self.progress_updated.emit(point_count, total_points, remaining_seconds)
 
             # Ramp back to zero or ground if configured at normal completion
@@ -591,20 +623,25 @@ class BVSweepWorker(QtCore.QThread):
                 except Exception:
                     self.status_updated.emit("Status: Sweep finished. Leaving B-field intact.")
 
-            # Disable switch heater and take leads to zero if switch heater is fitted
-            if getattr(magnet, "SWITCH_HEATER_FITTED", False) and end_ramp_zero:
-                try:
-                    self.status_updated.emit("Status: Turning switch heater OFF...")
-                    magnet.switch_heater('off')
-                    self.status_updated.emit("Status: Ramping leads to zero...")
-                    magnet.target_field_param(0.0)
-                    magnet.goto_set()
-                    while magnet.is_sweeping():
-                        self.msleep(100)
-                    magnet.hold()
-                except Exception as e:
-                    print(f"BVSweepWorker: Error in switch heater cleanup: {e}")
+            # Disable switch heater and take leads to zero if switch heater is fitted (Disabled: persistent mode cannot be enabled)
+            # if getattr(magnet, "SWITCH_HEATER_FITTED", False) and end_ramp_zero:
+            #     try:
+            #         self.status_updated.emit("Status: Turning switch heater OFF...")
+            #         magnet.switch_heater('off')
+            #         self.status_updated.emit("Status: Ramping leads to zero...")
+            #         magnet.target_field_param(0.0)
+            #         magnet.goto_set()
+            #         while magnet.is_sweeping():
+            #             self.msleep(100)
+            #         magnet.hold()
+            #     except Exception as e:
+            #         print(f"BVSweepWorker: Error in switch heater cleanup: {e}")
 
+        except GateRampCancelled as e:
+            if self._is_running:
+                self.error_occurred.emit(str(e))
+            elif '_cleanup_on_abort' in locals():
+                _cleanup_on_abort()
         except Exception as e:
             self.error_occurred.emit(str(e))
 
@@ -846,7 +883,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.station = station
         self._embed = embed
-        self.setWindowTitle("Magnetic Field vs Voltage Sweep Spectrometer")
+        self.setWindowTitle("Magnetic Field vs Control Variable Sweep Spectrometer")
         self.setMinimumSize(1280, 850)
 
         # Application states
@@ -870,6 +907,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.v2_grid = np.array([])
 
         self.data_spectra = np.array([])
+        self.data_raw_spectra = np.array([])
         self.data_current_ch1 = np.array([])
         self.data_current_ch2 = np.array([])
         self.data_measured_v1 = np.array([])
@@ -903,8 +941,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
             "v_start": -0.05,
             "v_end": 0.05,
             "v_pts": 21,
-            "v_fixed": 0.0,
-            "variable_order": "Hold B, scan V",
+            "variable_order": "Hold B, scan Control",
             "serpentine": True,
             "settling_time": 0.05,
             "exposure_time": 0.1,
@@ -912,14 +949,10 @@ class BVSweepWindow(QtWidgets.QMainWindow):
             "faraday_rot": 0.0,
             "end_ramp_zero": True,
             "end_ramp_ground": True,
-            "coeff_a": 1.0,
-            "coeff_b": 0.0,
-            "coeff_c": 0.0,
-            "coeff_d": 1.0
+            "control_coeff_ch1": 1.0,
+            "control_coeff_ch2": 0.0,
         }
         self.stored_settings = defaults.copy()
-        self.stored_settings["c1_name"] = "V1"
-        self.stored_settings["c2_name"] = "V2"
         if os.path.exists(storage_path):
             try:
                 with open(storage_path, "r") as f:
@@ -928,29 +961,22 @@ class BVSweepWindow(QtWidgets.QMainWindow):
                 bv_data = raw_data.get("bv_sweep", {})
                 self.stored_settings["settling_time"] = shared_data.get("settling_time", raw_data.get("settling_time", defaults["settling_time"]))
                 self.stored_settings["exposure_time"] = shared_data.get("exposure_time", raw_data.get("exposure_time", defaults["exposure_time"]))
-                self.stored_settings["c1_name"] = shared_data.get("c1_name", "V1")
-                self.stored_settings["c2_name"] = shared_data.get("c2_name", "V2")
                 for key in defaults:
                     if key not in ("settling_time", "exposure_time"):
-                        if key in ("coeff_a", "coeff_b", "coeff_c", "coeff_d"):
-                            legacy_key = f"bv_coeff_{key[-1]}"
-                            self.stored_settings[key] = shared_data.get(key, bv_data.get(legacy_key, raw_data.get(legacy_key, defaults[key])))
-                        else:
-                            self.stored_settings[key] = bv_data.get(key, raw_data.get(key, defaults[key]))
+                        self.stored_settings[key] = bv_data.get(key, raw_data.get(key, defaults[key]))
             except Exception as e:
                 print(f"Error loading value_storage: {e}")
+        self.stored_settings['variable_order'] = {
+            'Hold B, scan V': 'Hold B, scan Control',
+            'Hold V, scan B': 'Hold Control, scan B',
+        }.get(self.stored_settings['variable_order'], self.stored_settings['variable_order'])
         self.value_storage = self.stored_settings.copy()
 
     def save_storage(self, *args):
         storage_path = os.path.join(parent_dir, "value_storage")
-        if hasattr(self, "coeff_a"):
-            self.stored_settings["coeff_a"] = self.coeff_a.value()
-        if hasattr(self, "coeff_b"):
-            self.stored_settings["coeff_b"] = self.coeff_b.value()
-        if hasattr(self, "coeff_c"):
-            self.stored_settings["coeff_c"] = self.coeff_c.value()
-        if hasattr(self, "coeff_d"):
-            self.stored_settings["coeff_d"] = self.coeff_d.value()
+        if hasattr(self, "control_coeff_ch1"):
+            self.stored_settings["control_coeff_ch1"] = self.control_coeff_ch1.value()
+            self.stored_settings["control_coeff_ch2"] = self.control_coeff_ch2.value()
         try:
             current_data = {}
             if os.path.exists(storage_path):
@@ -964,12 +990,6 @@ class BVSweepWindow(QtWidgets.QMainWindow):
             
             current_data["shared"]["settling_time"] = self.settling_box.value()
             current_data["shared"]["exposure_time"] = self.exposure_box.value()
-            current_data["shared"]["c1_name"] = self.stored_settings.get("c1_name", "V1")
-            current_data["shared"]["c2_name"] = self.stored_settings.get("c2_name", "V2")
-            current_data["shared"]["coeff_a"] = self.stored_settings.get("coeff_a", 1.0)
-            current_data["shared"]["coeff_b"] = self.stored_settings.get("coeff_b", 0.0)
-            current_data["shared"]["coeff_c"] = self.stored_settings.get("coeff_c", 0.0)
-            current_data["shared"]["coeff_d"] = self.stored_settings.get("coeff_d", 1.0)
             camera = getattr(self.station, "camera", None)
             current_data["shared"]["spectrometer"] = getattr(camera, "spectrometer_type", "lightfieldG15")
             
@@ -980,7 +1000,8 @@ class BVSweepWindow(QtWidgets.QMainWindow):
             current_data["bv_sweep"]["v_start"] = self.v_start.value()
             current_data["bv_sweep"]["v_end"] = self.v_end.value()
             current_data["bv_sweep"]["v_pts"] = self.v_pts.value()
-            current_data["bv_sweep"]["v_fixed"] = self.v_fixed.value()
+            current_data["bv_sweep"]["control_coeff_ch1"] = self.control_coeff_ch1.value()
+            current_data["bv_sweep"]["control_coeff_ch2"] = self.control_coeff_ch2.value()
             current_data["bv_sweep"]["variable_order"] = self.variable_order.currentText()
             current_data["bv_sweep"]["serpentine"] = self.serpentine.isChecked()
             current_data["bv_sweep"]["faraday_comp"] = self.faraday_comp.isChecked()
@@ -1010,6 +1031,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
                     current_data["bv_sweep"].pop("bv_coeff_b", None)
                     current_data["bv_sweep"].pop("bv_coeff_c", None)
                     current_data["bv_sweep"].pop("bv_coeff_d", None)
+            current_data["bv_sweep"].pop("v_fixed", None)
 
             self.value_storage = current_data["bv_sweep"]
             with open(storage_path, "w") as f:
@@ -1048,12 +1070,8 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.v_pts.setValue(self.stored_settings.get("v_pts", 21))
         self.v_pts.blockSignals(False)
 
-        self.v_fixed.blockSignals(True)
-        self.v_fixed.setValue(self.stored_settings.get("v_fixed", 0.0))
-        self.v_fixed.blockSignals(False)
-
         self.variable_order.blockSignals(True)
-        self.variable_order.setCurrentText(self.stored_settings.get("variable_order", "Hold B, scan V"))
+        self.variable_order.setCurrentText(self.stored_settings.get("variable_order", "Hold B, scan Control"))
         self.variable_order.blockSignals(False)
 
         self.serpentine.blockSignals(True)
@@ -1084,21 +1102,10 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.end_ramp_ground.setChecked(self.stored_settings.get("end_ramp_ground", True))
         self.end_ramp_ground.blockSignals(False)
 
-        self.coeff_a.blockSignals(True)
-        self.coeff_a.setValue(self.stored_settings.get("coeff_a", 1.0))
-        self.coeff_a.blockSignals(False)
-
-        self.coeff_b.blockSignals(True)
-        self.coeff_b.setValue(self.stored_settings.get("coeff_b", 0.0))
-        self.coeff_b.blockSignals(False)
-
-        self.coeff_c.blockSignals(True)
-        self.coeff_c.setValue(self.stored_settings.get("coeff_c", 0.0))
-        self.coeff_c.blockSignals(False)
-
-        self.coeff_d.blockSignals(True)
-        self.coeff_d.setValue(self.stored_settings.get("coeff_d", 1.0))
-        self.coeff_d.blockSignals(False)
+        for key in ('control_coeff_ch1', 'control_coeff_ch2'):
+            widget = getattr(self, key)
+            with QtCore.QSignalBlocker(widget):
+                widget.setValue(self.stored_settings[key])
 
         self.update_step_calculations()
         self.update_variable_names()
@@ -1226,7 +1233,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         layout.addWidget(sec)
 
     def setup_voltage_sweep_menu(self, layout):
-        sec = CollapsibleSection("2. Voltage sweep")
+        sec = CollapsibleSection("2. Control variable sweep")
         grid = QtWidgets.QGridLayout(sec.content)
         grid.setSpacing(6)
 
@@ -1258,67 +1265,25 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.v_step_lbl.setStyleSheet("font-weight: bold; color: #475569;")
         grid.addWidget(self.v_step_lbl, 3, 1)
 
-        self.lbl_v_fixed = QtWidgets.QLabel("V2 Fixed (V):")
-        grid.addWidget(self.lbl_v_fixed, 4, 0)
-        self.v_fixed = QtWidgets.QDoubleSpinBox()
-        self.v_fixed.setRange(-210.0, 210.0)
-        self.v_fixed.setDecimals(4)
-        self.v_fixed.setValue(self.stored_settings.get("v_fixed", 0.0))
-        self.v_fixed.editingFinished.connect(self.save_storage)
-        grid.addWidget(self.v_fixed, 4, 1)
-
-        # Reset buttons row
-        btn_layout = QtWidgets.QHBoxLayout()
-        self.btn_ch1_only = QtWidgets.QPushButton("Channel 1 only")
-        self.btn_ch1_only.clicked.connect(self.reset_to_ch1_only)
-        self.btn_ch2_only = QtWidgets.QPushButton("Channel 2 only")
-        self.btn_ch2_only.clicked.connect(self.reset_to_ch2_only)
-        btn_layout.addWidget(self.btn_ch1_only)
-        btn_layout.addWidget(self.btn_ch2_only)
-        grid.addLayout(btn_layout, 5, 0, 1, 2)
-
-        # Basis exchange parameters
-        f1_layout = QtWidgets.QHBoxLayout()
-        self.lbl_vc1_eq_start = QtWidgets.QLabel("Voltage 1 = ")
-        f1_layout.addWidget(self.lbl_vc1_eq_start)
-        self.coeff_a = QtWidgets.QDoubleSpinBox()
-        self.coeff_a.setRange(-100.0, 100.0)
-        self.coeff_a.setDecimals(4)
-        self.coeff_a.setValue(self.stored_settings.get("coeff_a", 1.0))
-        self.coeff_a.editingFinished.connect(self.on_sweep_range_changed)
-        f1_layout.addWidget(self.coeff_a)
-        self.lbl_vc1_eq_mid = QtWidgets.QLabel(" * V1_swept + ")
-        f1_layout.addWidget(self.lbl_vc1_eq_mid)
-        self.coeff_b = QtWidgets.QDoubleSpinBox()
-        self.coeff_b.setRange(-100.0, 100.0)
-        self.coeff_b.setDecimals(4)
-        self.coeff_b.setValue(self.stored_settings.get("coeff_b", 0.0))
-        self.coeff_b.editingFinished.connect(self.on_sweep_range_changed)
-        f1_layout.addWidget(self.coeff_b)
-        self.lbl_vc1_eq_end = QtWidgets.QLabel(" * V2_fixed")
-        f1_layout.addWidget(self.lbl_vc1_eq_end)
-        grid.addLayout(f1_layout, 6, 0, 1, 2)
-
-        f2_layout = QtWidgets.QHBoxLayout()
-        self.lbl_vc2_eq_start = QtWidgets.QLabel("Voltage 2 = ")
-        f2_layout.addWidget(self.lbl_vc2_eq_start)
-        self.coeff_c = QtWidgets.QDoubleSpinBox()
-        self.coeff_c.setRange(-100.0, 100.0)
-        self.coeff_c.setDecimals(4)
-        self.coeff_c.setValue(self.stored_settings.get("coeff_c", 0.0))
-        self.coeff_c.editingFinished.connect(self.on_sweep_range_changed)
-        f2_layout.addWidget(self.coeff_c)
-        self.lbl_vc2_eq_mid = QtWidgets.QLabel(" * V1_swept + ")
-        f2_layout.addWidget(self.lbl_vc2_eq_mid)
-        self.coeff_d = QtWidgets.QDoubleSpinBox()
-        self.coeff_d.setRange(-100.0, 100.0)
-        self.coeff_d.setDecimals(4)
-        self.coeff_d.setValue(self.stored_settings.get("coeff_d", 1.0))
-        self.coeff_d.editingFinished.connect(self.on_sweep_range_changed)
-        f2_layout.addWidget(self.coeff_d)
-        self.lbl_vc2_eq_end = QtWidgets.QLabel(" * V2_fixed")
-        f2_layout.addWidget(self.lbl_vc2_eq_end)
-        grid.addLayout(f2_layout, 7, 0, 1, 2)
+        formula = QtWidgets.QHBoxLayout()
+        formula.addWidget(QtWidgets.QLabel("Control variable ="))
+        for key, suffix in (('control_coeff_ch1', '× CH1 +'), ('control_coeff_ch2', '× CH2')):
+            coefficient = QtWidgets.QDoubleSpinBox()
+            coefficient.setRange(-100.0, 100.0)
+            coefficient.setDecimals(4)
+            coefficient.setValue(self.stored_settings[key])
+            coefficient.setAccessibleName('Control variable ' + suffix.split()[1] + ' coefficient')
+            coefficient.setToolTip('CH1 = a × Control / (a² + b²); CH2 = b × Control / (a² + b²). '
+                                   'The other independent combination stays at zero. '
+                                   'For a = b = 0.5, both channel voltages equal Control.')
+            coefficient.editingFinished.connect(self.on_sweep_range_changed)
+            setattr(self, key, coefficient)
+            formula.addWidget(coefficient)
+            formula.addWidget(QtWidgets.QLabel(suffix))
+        grid.addLayout(formula, 4, 0, 1, 2)
+        self.control_mapping_status = QtWidgets.QLabel()
+        self.control_mapping_status.setWordWrap(True)
+        grid.addWidget(self.control_mapping_status, 5, 0, 1, 2)
 
         layout.addWidget(sec)
 
@@ -1329,8 +1294,8 @@ class BVSweepWindow(QtWidgets.QMainWindow):
 
         grid.addWidget(QtWidgets.QLabel("Variable Order:"), 0, 0)
         self.variable_order = QtWidgets.QComboBox()
-        self.variable_order.addItems(["Hold B, scan V", "Hold V, scan B"])
-        self.variable_order.setCurrentText(self.stored_settings.get("variable_order", "Hold B, scan V"))
+        self.variable_order.addItems(["Hold B, scan Control", "Hold Control, scan B"])
+        self.variable_order.setCurrentText(self.stored_settings.get("variable_order", "Hold B, scan Control"))
         self.variable_order.currentTextChanged.connect(self.on_sweep_range_changed)
         grid.addWidget(self.variable_order, 0, 1)
 
@@ -1437,20 +1402,6 @@ class BVSweepWindow(QtWidgets.QMainWindow):
 
         layout.addWidget(panel)
 
-    def reset_to_ch1_only(self):
-        self.coeff_a.setValue(1.0)
-        self.coeff_b.setValue(0.0)
-        self.coeff_c.setValue(0.0)
-        self.coeff_d.setValue(0.0)
-        self.on_sweep_range_changed()
-
-    def reset_to_ch2_only(self):
-        self.coeff_a.setValue(0.0)
-        self.coeff_b.setValue(0.0)
-        self.coeff_c.setValue(1.0)
-        self.coeff_d.setValue(0.0)
-        self.on_sweep_range_changed()
-
     def update_step_calculations(self):
         # Magnetic Field Sweep step
         b_s = self.b_start.value()
@@ -1472,48 +1423,27 @@ class BVSweepWindow(QtWidgets.QMainWindow):
 
     def update_variable_names(self):
         b_name = self.b_coord_name.text().strip() or "B"
-        c1_name = self.stored_settings.get("c1_name", "V1")
-        c2_name = self.stored_settings.get("c2_name", "V2")
-
-        # Dynamic formula labels
-        if hasattr(self, 'lbl_v_fixed'):
-            self.lbl_v_fixed.setText(f"{c2_name} Fixed (V):")
-        if hasattr(self, 'lbl_vc1_eq_start'):
-            self.lbl_vc1_eq_start.setText("Voltage 1 = ")
-        if hasattr(self, 'lbl_vc1_eq_mid'):
-            self.lbl_vc1_eq_mid.setText(f" * {c1_name}_swept + ")
-        if hasattr(self, 'lbl_vc1_eq_end'):
-            self.lbl_vc1_eq_end.setText(f" * {c2_name}_fixed")
-        if hasattr(self, 'lbl_vc2_eq_start'):
-            self.lbl_vc2_eq_start.setText("Voltage 2 = ")
-        if hasattr(self, 'lbl_vc2_eq_mid'):
-            self.lbl_vc2_eq_mid.setText(f" * {c1_name}_swept + ")
-        if hasattr(self, 'lbl_vc2_eq_end'):
-            self.lbl_vc2_eq_end.setText(f" * {c2_name}_fixed")
-
-        # Format axes label strings
-        c1_label = f"V1 ({c1_name})" if c1_name.lower() != "v1" else "V1"
 
         # Update axes in plots
         if hasattr(self, 'gatemap_win'):
             self.gatemap_win.setLabel('left', f"Magnetic Field ({b_name})", units='T')
-            self.gatemap_win.setLabel('bottom', f"Voltage ({c1_label})", units='V')
+            self.gatemap_win.setLabel('bottom', 'Control variable', units='V')
         if hasattr(self, 'vslice_win'):
             self.vslice_win.setLabel('left', f"Magnetic Field ({b_name})", units='T')
         if hasattr(self, 'hslice_win'):
-            self.hslice_win.setLabel('left', f"Voltage ({c1_label})", units='V')
+            self.hslice_win.setLabel('left', 'Control variable', units='V')
         if hasattr(self, 't2_heatmap_win'):
             self.t2_heatmap_win.setLabel('left', f"Magnetic Field ({b_name})", units='T')
-            self.t2_heatmap_win.setLabel('bottom', f"Voltage ({c1_label})", units='V')
+            self.t2_heatmap_win.setLabel('bottom', 'Control variable', units='V')
         if hasattr(self, 't2_hslice_win'):
-            self.t2_hslice_win.setLabel('bottom', f"Voltage ({c1_label})", units='V')
+            self.t2_hslice_win.setLabel('bottom', 'Control variable', units='V')
         if hasattr(self, 't2_vslice_win'):
             self.t2_vslice_win.setLabel('bottom', f"Magnetic Field ({b_name})", units='T')
         if hasattr(self, 't3_heatmap_win'):
             self.t3_heatmap_win.setLabel('left', f"Magnetic Field ({b_name})", units='T')
-            self.t3_heatmap_win.setLabel('bottom', f"Voltage ({c1_label})", units='V')
+            self.t3_heatmap_win.setLabel('bottom', 'Control variable', units='V')
         if hasattr(self, 't3_hslice_win'):
-            self.t3_hslice_win.setLabel('bottom', f"Voltage ({c1_label})", units='V')
+            self.t3_hslice_win.setLabel('bottom', 'Control variable', units='V')
         if hasattr(self, 't3_vslice_win'):
             self.t3_vslice_win.setLabel('bottom', f"Magnetic Field ({b_name})", units='T')
 
@@ -1528,18 +1458,21 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         b_n = self.b_pts.value()
         self.b_coords = np.linspace(b_s, b_e, b_n) if b_n > 1 else np.array([b_s])
 
-        a = self.coeff_a.value()
-        b = self.coeff_b.value()
-        c = self.coeff_c.value()
-        d = self.coeff_d.value()
-        v_fixed = self.v_fixed.value()
-
-        self.v1_grid = np.zeros((b_n, v_n))
-        self.v2_grid = np.zeros((b_n, v_n))
-        for j, b_val in enumerate(self.b_coords):
-            for i, v_val in enumerate(self.v_coords):
-                self.v1_grid[j, i] = a * v_val + b * v_fixed
-                self.v2_grid[j, i] = c * v_val + d * v_fixed
+        shape = (b_n, v_n)
+        try:
+            v1, v2 = control_to_gate_voltages(
+                self.v_coords, self.control_coeff_ch1.value(), self.control_coeff_ch2.value())
+            self.v1_grid = np.broadcast_to(v1, shape).copy()
+            self.v2_grid = np.broadcast_to(v2, shape).copy()
+            validate_gate_targets(self.v1_grid, self.v2_grid)
+            self.control_mapping_status.clear()
+            self.control_mapping_status.hide()
+        except ValueError as error:
+            self.v1_grid = np.full(shape, np.nan)
+            self.v2_grid = np.full(shape, np.nan)
+            self.control_mapping_status.setText(str(error))
+            self.control_mapping_status.setStyleSheet('color: #b91c1c;')
+            self.control_mapping_status.show()
 
     def on_sweep_range_changed(self):
         self.update_step_calculations()
@@ -1562,7 +1495,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.gatemap_img.setOpts(axisOrder='row-major')
         self.gatemap_win.addItem(self.gatemap_img)
         self.gatemap_win.setLabel('left', 'Magnetic Field', units='T')
-        self.gatemap_win.setLabel('bottom', 'Voltage (V1)', units='V')
+        self.gatemap_win.setLabel('bottom', 'Control variable', units='V')
 
         self.gatemap_colorbar = self.setup_histogram_lut(self.gatemap_win, self.gatemap_img, interactive=False)
 
@@ -1623,7 +1556,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.hslice_img = pg.ImageItem()
         self.hslice_img.setOpts(axisOrder='row-major')
         self.hslice_win.addItem(self.hslice_img)
-        self.hslice_win.setLabel('left', 'Voltage (V1)', units='V')
+        self.hslice_win.setLabel('left', 'Control variable', units='V')
         self.hslice_win.setLabel('bottom', 'Energy', units='eV')
         self.hslice_colorbar = self.setup_histogram_lut(self.hslice_win, self.hslice_img, interactive=True)
 
@@ -1652,7 +1585,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.spectrum_curve = self.spectrum_win.plot(pen=pg.mkPen('#7c3aed', width=2))
         self.spectrum_win.setLabel('left', 'Counts')
         self.spectrum_win.setLabel('bottom', 'Energy', units='eV')
-        self.spectrum_win.showGrid(x=True, y=True, alpha=0.3)
+        self.spectrum_win.showGrid(x=False, y=False)
 
         self.spectrum_v_region = pg.LinearRegionItem(
             orientation='vertical',
@@ -1692,7 +1625,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.t2_heatmap_img.setOpts(axisOrder='row-major')
         self.t2_heatmap_win.addItem(self.t2_heatmap_img)
         self.t2_heatmap_win.setLabel('left', 'Magnetic Field', units='T')
-        self.t2_heatmap_win.setLabel('bottom', 'Voltage (V1)', units='V')
+        self.t2_heatmap_win.setLabel('bottom', 'Control variable', units='V')
 
         self.t2_colorbar = self.setup_histogram_lut(self.t2_heatmap_win, self.t2_heatmap_img, interactive=True)
 
@@ -1732,7 +1665,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.t2_vslice_curve = self.t2_vslice_win.plot(pen=pg.mkPen('#d97706', width=2))
         self.t2_vslice_win.setLabel('left', 'Current', units='A')
         self.t2_vslice_win.setLabel('bottom', 'Magnetic Field', units='T')
-        self.t2_vslice_win.showGrid(x=True, y=True, alpha=0.3)
+        self.t2_vslice_win.showGrid(x=False, y=False)
         layout.addWidget(self.t2_vslice_win, 0, 1)
 
         # Horizontal Slice (Bottom Left)
@@ -1742,8 +1675,8 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.t2_hslice_win.getViewBox().enableAutoRange(axis='y', enable=True)
         self.t2_hslice_curve = self.t2_hslice_win.plot(pen=pg.mkPen('#2563eb', width=2))
         self.t2_hslice_win.setLabel('left', 'Current', units='A')
-        self.t2_hslice_win.setLabel('bottom', 'Voltage (V1)', units='V')
-        self.t2_hslice_win.showGrid(x=True, y=True, alpha=0.3)
+        self.t2_hslice_win.setLabel('bottom', 'Control variable', units='V')
+        self.t2_hslice_win.showGrid(x=False, y=False)
         layout.addWidget(self.t2_hslice_win, 1, 0)
 
         # Empty (Bottom Right)
@@ -1764,7 +1697,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.t3_heatmap_img.setOpts(axisOrder='row-major')
         self.t3_heatmap_win.addItem(self.t3_heatmap_img)
         self.t3_heatmap_win.setLabel('left', 'Magnetic Field', units='T')
-        self.t3_heatmap_win.setLabel('bottom', 'Voltage (V1)', units='V')
+        self.t3_heatmap_win.setLabel('bottom', 'Control variable', units='V')
 
         self.t3_colorbar = self.setup_histogram_lut(self.t3_heatmap_win, self.t3_heatmap_img, interactive=True)
 
@@ -1804,7 +1737,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.t3_vslice_curve = self.t3_vslice_win.plot(pen=pg.mkPen('#d97706', width=2))
         self.t3_vslice_win.setLabel('left', 'Current', units='A')
         self.t3_vslice_win.setLabel('bottom', 'Magnetic Field', units='T')
-        self.t3_vslice_win.showGrid(x=True, y=True, alpha=0.3)
+        self.t3_vslice_win.showGrid(x=False, y=False)
         layout.addWidget(self.t3_vslice_win, 0, 1)
 
         # Horizontal Slice (Bottom Left)
@@ -1814,8 +1747,8 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.t3_hslice_win.getViewBox().enableAutoRange(axis='y', enable=True)
         self.t3_hslice_curve = self.t3_hslice_win.plot(pen=pg.mkPen('#2563eb', width=2))
         self.t3_hslice_win.setLabel('left', 'Current', units='A')
-        self.t3_hslice_win.setLabel('bottom', 'Voltage (V1)', units='V')
-        self.t3_hslice_win.showGrid(x=True, y=True, alpha=0.3)
+        self.t3_hslice_win.setLabel('bottom', 'Control variable', units='V')
+        self.t3_hslice_win.showGrid(x=False, y=False)
         layout.addWidget(self.t3_hslice_win, 1, 0)
 
         # Empty (Bottom Right)
@@ -1825,7 +1758,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
     def setup_histogram_lut(self, plot_win, image_item, interactive=True):
         hist = pg.HistogramLUTItem(gradientPosition='left')
         hist.setImageItem(image_item)
-        hist.gradient.loadPreset('thermal')
+        hist.gradient.loadPreset('viridis')
         
         hist.layout.removeItem(hist.gradient)
         hist.layout.removeItem(hist.vb)
@@ -1976,10 +1909,10 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.reset_plot_scaling(reset_spectrum=False)
 
         # 2. Scale interactive colorbars to full data range (min to max of the active slice/current data)
-        self.vslice_colorbar.gradient.loadPreset('thermal')
-        self.hslice_colorbar.gradient.loadPreset('thermal')
-        self.t2_colorbar.gradient.loadPreset('thermal')
-        self.t3_colorbar.gradient.loadPreset('thermal')
+        self.vslice_colorbar.gradient.loadPreset('viridis')
+        self.hslice_colorbar.gradient.loadPreset('viridis')
+        self.t2_colorbar.gradient.loadPreset('viridis')
+        self.t3_colorbar.gradient.loadPreset('viridis')
 
         if self.vslice_img.image is not None and self.vslice_img.image.size > 0:
             vslice_data = self.vslice_img.image
@@ -2014,17 +1947,23 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         # 3. Reset Y-axis for 1D slice curves and spectrum curve using manual scaling helper
         def manually_scale_y(plot_win, curve):
             y_data = curve.yData
+            if y_data is not None:
+                y_data = np.asarray(y_data)[np.isfinite(y_data)]
             if y_data is not None and len(y_data) > 0:
                 y_min = np.min(y_data)
                 y_max = np.max(y_data)
                 y_range = y_max - y_min
                 if y_range <= 0:
-                    y_range = 1.0
+                    y_range = max(abs(y_min) * .1, 1e-12) if plot_win.getAxis('left').labelUnits == 'A' else 1.0
                 plot_win.getViewBox().setRange(yRange=(y_min - 0.05 * y_range, y_max + 0.05 * y_range), padding=0)
 
+        self.t2_hslice_win.getViewBox()._current_user_zoom = False
         manually_scale_y(self.t2_hslice_win, self.t2_hslice_curve)
+        self.t2_vslice_win.getViewBox()._current_user_zoom = False
         manually_scale_y(self.t2_vslice_win, self.t2_vslice_curve)
+        self.t3_hslice_win.getViewBox()._current_user_zoom = False
         manually_scale_y(self.t3_hslice_win, self.t3_hslice_curve)
+        self.t3_vslice_win.getViewBox()._current_user_zoom = False
         manually_scale_y(self.t3_vslice_win, self.t3_vslice_curve)
         manually_scale_y(self.spectrum_win, self.spectrum_curve)
 
@@ -2115,15 +2054,15 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         if not np.any(self.data_measured_mask): return
         idx_v = np.argmin(np.abs(self.v_coords - self.cross2_v.value()))
         idx_b = np.argmin(np.abs(self.b_coords - self.cross2_h.value()))
-        self.t2_hslice_curve.setData(self.v_coords, self.data_current_ch1[idx_b, :])
-        self.t2_vslice_curve.setData(self.b_coords, self.data_current_ch1[:, idx_v])
+        update_current_slice(self.t2_hslice_win, self.t2_hslice_curve, self.v_coords, self.data_current_ch1[idx_b, :], self.data_measured_mask[idx_b, :])
+        update_current_slice(self.t2_vslice_win, self.t2_vslice_curve, self.b_coords, self.data_current_ch1[:, idx_v], self.data_measured_mask[:, idx_v])
 
     def on_tab3_crosshair_moved(self):
         if not np.any(self.data_measured_mask): return
         idx_v = np.argmin(np.abs(self.v_coords - self.cross3_v.value()))
         idx_b = np.argmin(np.abs(self.b_coords - self.cross3_h.value()))
-        self.t3_hslice_curve.setData(self.v_coords, self.data_current_ch2[idx_b, :])
-        self.t3_vslice_curve.setData(self.b_coords, self.data_current_ch2[:, idx_v])
+        update_current_slice(self.t3_hslice_win, self.t3_hslice_curve, self.v_coords, self.data_current_ch2[idx_b, :], self.data_measured_mask[idx_b, :])
+        update_current_slice(self.t3_vslice_win, self.t3_vslice_curve, self.b_coords, self.data_current_ch2[:, idx_v], self.data_measured_mask[:, idx_v])
 
     def refresh_slice_plots(self, v_val, b_val):
         if not np.any(self.data_measured_mask): return
@@ -2246,12 +2185,13 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         for attr_name in dir(self):
             attr = getattr(self, attr_name, None)
             if isinstance(attr, pg.PlotWidget):
+                configure_plot_axes(attr)
                 attr.setBackground('#ffffff')
                 attr.getAxis('left').setPen(pg.mkPen('#334155'))
                 attr.getAxis('bottom').setPen(pg.mkPen('#334155'))
                 attr.getAxis('left').setTextPen(pg.mkPen('#334155'))
                 attr.getAxis('bottom').setTextPen(pg.mkPen('#334155'))
-                attr.showGrid(x=True, y=True, alpha=0.15)
+                attr.showGrid(x=False, y=False)
 
     def set_inputs_enabled(self, enabled: bool):
         self.b_coord_name.setEnabled(enabled)
@@ -2261,13 +2201,8 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.v_start.setEnabled(enabled)
         self.v_end.setEnabled(enabled)
         self.v_pts.setEnabled(enabled)
-        self.v_fixed.setEnabled(enabled)
-        self.coeff_a.setEnabled(enabled)
-        self.coeff_b.setEnabled(enabled)
-        self.coeff_c.setEnabled(enabled)
-        self.coeff_d.setEnabled(enabled)
-        self.btn_ch1_only.setEnabled(enabled)
-        self.btn_ch2_only.setEnabled(enabled)
+        self.control_coeff_ch1.setEnabled(enabled)
+        self.control_coeff_ch2.setEnabled(enabled)
         self.variable_order.setEnabled(enabled)
         self.serpentine.setEnabled(enabled)
         self.settling_box.setEnabled(enabled)
@@ -2290,6 +2225,22 @@ class BVSweepWindow(QtWidgets.QMainWindow):
 
         if self.is_running: return
 
+        # Reject undefined or out-of-range gate paths before contacting devices.
+        try:
+            values = np.linspace(self.v_start.value(), self.v_end.value(), self.v_pts.value())
+            validate_gate_targets(*control_to_gate_voltages(
+                values, self.control_coeff_ch1.value(), self.control_coeff_ch2.value()))
+            self.update_coordinates_from_ui()
+        except ValueError as error:
+            QtWidgets.QMessageBox.warning(self, 'Invalid control variable sweep', str(error))
+            return
+        self.measurement_control = {
+            'control_coeff_ch1': self.control_coeff_ch1.value(),
+            'control_coeff_ch2': self.control_coeff_ch2.value(),
+            'v_coords': self.v_coords.copy(), 'b_coords': self.b_coords.copy(),
+            'v1_grid': self.v1_grid.copy(), 'v2_grid': self.v2_grid.copy(),
+        }
+
         self.reset_slice_levels = True
 
         self._autosaved_this_run = False
@@ -2306,7 +2257,6 @@ class BVSweepWindow(QtWidgets.QMainWindow):
                 smu.write('*CLS')
             except Exception:
                 pass
-        self.update_coordinates_from_ui()
         v_len = len(self.v_coords)
         b_len = len(self.b_coords)
 
@@ -2338,8 +2288,21 @@ class BVSweepWindow(QtWidgets.QMainWindow):
             pixels_arr = np.arange(num_pixels)
             wavelengths = mono_wl + (pixels_arr - num_pixels // 2) * 0.05
 
+        # Load num_spectra from value_storage
+        num_spectra = 1
+        try:
+            storage_path = os.path.join(parent_dir, "value_storage")
+            if os.path.exists(storage_path):
+                with open(storage_path, "r") as f_vs:
+                    vs = json.load(f_vs)
+                single_data = vs.get("single_spectra", {})
+                num_spectra = int(single_data.get("num_spectra", vs.get("num_spectra", 1)))
+        except Exception:
+            num_spectra = 1
+
         # Allocate arrays
         self.data_spectra = np.zeros((b_len, v_len, num_pixels))
+        self.data_raw_spectra = np.zeros((b_len, v_len, num_spectra, num_pixels))
         self.data_current_ch1 = np.zeros((b_len, v_len))
         self.data_current_ch2 = np.zeros((b_len, v_len))
         self.data_measured_v1 = np.zeros((b_len, v_len))
@@ -2358,6 +2321,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         energy_raw = 1239.84193 / wavelengths
         self.energy_sort_idx = np.argsort(energy_raw)
         self.energy_axis = energy_raw[self.energy_sort_idx]
+        self.wavelength_axis = wavelengths[self.energy_sort_idx]
 
         self.reset_plot_scaling(reset_spectrum=True)
         self.set_inputs_enabled(False)
@@ -2427,16 +2391,13 @@ class BVSweepWindow(QtWidgets.QMainWindow):
             prev_v1 = 0.0
             prev_v2 = 0.0
 
-        a = self.coeff_a.value()
-        b = self.coeff_b.value()
-        c = self.coeff_c.value()
-        d = self.coeff_d.value()
-        v_fixed = self.v_fixed.value()
+        ch1_coefficient = self.control_coeff_ch1.value()
+        ch2_coefficient = self.control_coeff_ch2.value()
 
         # Generate sequence of points
         v_points = []
         b_points = []
-        is_b_outer = (self.variable_order.currentText() == "Hold B, scan V")
+        is_b_outer = (self.variable_order.currentText() == "Hold B, scan Control")
         serpentine = self.serpentine.isChecked()
 
         if is_b_outer:
@@ -2456,8 +2417,7 @@ class BVSweepWindow(QtWidgets.QMainWindow):
                 voltage = val_inner if is_b_outer else val_outer
                 b_val = val_outer if is_b_outer else val_inner
                 
-                v1_target = a * voltage + b * v_fixed
-                v2_target = c * voltage + d * v_fixed
+                v1_target, v2_target = control_to_gate_voltages(voltage, ch1_coefficient, ch2_coefficient)
                 v_points.append((v1_target, v2_target))
                 b_points.append(b_val)
 
@@ -2495,6 +2455,8 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.sweep_initial_v2 = prev_v2
         self.sweep_initial_b = curr_b
         self.sweep_start_time = time.time()
+        self.measurement_started_at = new_measurement_start(self.sweep_start_time)
+        self.measurement_device_modes = measurement_device_modes(self.station)
         self.total_paused_time = 0.0
         self.pause_start_time = None
 
@@ -2502,14 +2464,11 @@ class BVSweepWindow(QtWidgets.QMainWindow):
 
         # Construct params dictionary
         params = {
-            'a': self.coeff_a.value(),
-            'b': self.coeff_b.value(),
-            'c': self.coeff_c.value(),
-            'd': self.coeff_d.value(),
+            'control_coeff_ch1': ch1_coefficient,
+            'control_coeff_ch2': ch2_coefficient,
             'v_start': self.v_start.value(),
             'v_end': self.v_end.value(),
             'v_pts': self.v_pts.value(),
-            'v_fixed': self.v_fixed.value(),
             'b_start': self.b_start.value(),
             'b_end': self.b_end.value(),
             'b_pts': self.b_pts.value(),
@@ -2521,9 +2480,11 @@ class BVSweepWindow(QtWidgets.QMainWindow):
             'faraday_rot': self.faraday_rot.value(),
             'end_ramp_zero': self.end_ramp_zero.isChecked(),
             'end_ramp_ground': self.end_ramp_ground.isChecked(),
-            'num_pixels': num_pixels
+            'num_pixels': num_pixels,
+            'wl_axis': wavelengths,
         }
 
+        params["num_spectra"] = self.data_raw_spectra.shape[2]
         self.sweep_worker = BVSweepWorker(self.station, params)
         self.sweep_worker.point_measured.connect(self.on_point_measured)
         self.sweep_worker.progress_updated.connect(self.on_progress_updated)
@@ -2616,9 +2577,12 @@ class BVSweepWindow(QtWidgets.QMainWindow):
         self.lbl_expected_end.setText("Expected End: --:--:--")
         self.lbl_status.setText("Status: Sweep Reset Complete")
 
-    def on_point_measured(self, idx_v, idx_b, v_val, b_val, v1, v2, spectrum, curr_ch1, curr_ch2, meas_v1, meas_v2, meas_b):
+    def on_point_measured(self, idx_v, idx_b, v_val, b_val, v1, v2, spectrum, curr_ch1, curr_ch2, meas_v1, meas_v2, meas_b, raw_frames):
         sorted_spectrum = spectrum[self.energy_sort_idx]
+        sorted_raw_frames = raw_frames[:, self.energy_sort_idx]
         self.data_spectra[idx_b, idx_v, :] = sorted_spectrum
+        if getattr(self, "data_raw_spectra", None) is not None:
+            self.data_raw_spectra[idx_b, idx_v, :, :] = sorted_raw_frames
         self.data_current_ch1[idx_b, idx_v] = curr_ch1
         self.data_current_ch2[idx_b, idx_v] = curr_ch2
         self.data_measured_v1[idx_b, idx_v] = meas_v1
@@ -2765,10 +2729,12 @@ class BVSweepWindow(QtWidgets.QMainWindow):
             return
 
         try:
-            data_dir = os.path.join(parent_dir, "data")
-            os.makedirs(data_dir, exist_ok=True)
+            data_dir = measurement_data_dir(
+                parent_dir, getattr(self, "measurement_started_at", None)
+            )
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            default_filename = f"bv_sweep_{timestamp}.h5"
+            default_filename = f"bv_sweep_{timestamp[-6:]}.h5"
+            default_filename = dated_measurement_filename(default_filename, getattr(self, "measurement_started_at", None))
 
             if file_path is None:
                 filename, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -2777,17 +2743,22 @@ class BVSweepWindow(QtWidgets.QMainWindow):
                     "HDF5 files (*.h5);;All files (*.*)"
                 )
                 if not filename: return
+                filename = dated_measurement_path(filename, getattr(self, "measurement_started_at", None))
             else:
                 filename = file_path
 
             import h5py
             with h5py.File(filename, "w") as f:
-                f.create_dataset("v_coords", data=self.v_coords)
-                f.create_dataset("b_coords", data=self.b_coords)
-                f.create_dataset("v1_grid", data=self.v1_grid)
-                f.create_dataset("v2_grid", data=self.v2_grid)
+                f.attrs["device_modes"] = json.dumps(getattr(self, "measurement_device_modes", {}))
+                control = getattr(self, 'measurement_control', {})
+                for name in ('v_coords', 'b_coords', 'v1_grid', 'v2_grid'):
+                    f.create_dataset(name, data=control.get(name, getattr(self, name)))
                 f.create_dataset("energy_axis", data=self.energy_axis)
+                if getattr(self, "wavelength_axis", None) is not None:
+                    f.create_dataset("wavelength_axis", data=self.wavelength_axis)
                 f.create_dataset("spectra", data=self.data_spectra)
+                if getattr(self, "data_raw_spectra", None) is not None and self.data_raw_spectra.size > 0:
+                    f.create_dataset("raw_intensities", data=self.data_raw_spectra)
                 f.create_dataset("current_ch1", data=self.data_current_ch1)
                 f.create_dataset("current_ch2", data=self.data_current_ch2)
                 f.create_dataset("measured_v1", data=self.data_measured_v1)
@@ -2816,10 +2787,10 @@ class BVSweepWindow(QtWidgets.QMainWindow):
                         ref_grp.create_dataset("raw_intensities", data=ref_raw)
 
                 # Metadata
-                f.attrs["coeff_a"] = self.coeff_a.value()
-                f.attrs["coeff_b"] = self.coeff_b.value()
-                f.attrs["coeff_c"] = self.coeff_c.value()
-                f.attrs["coeff_d"] = self.coeff_d.value()
+                f.attrs['control_variable_definition'] = 'Control = a*CH1 + b*CH2'
+                f.attrs['control_coeff_ch1'] = control.get('control_coeff_ch1', self.control_coeff_ch1.value())
+                f.attrs['control_coeff_ch2'] = control.get('control_coeff_ch2', self.control_coeff_ch2.value())
+                f.attrs['control_gate_mapping'] = 'CH1=a*Control/(a*a+b*b); CH2=b*Control/(a*a+b*b)'
                 # Store full value_storage JSON as a dataset for full state recovery
                 try:
                     storage_path = os.path.join(parent_dir, "value_storage")
@@ -2843,10 +2814,12 @@ class BVSweepWindow(QtWidgets.QMainWindow):
                         meta_grp.create_dataset("central_wavelength", data=central_wavelength)
                 except Exception as e:
                     print(f"Failed to embed value_storage in HDF5: {e}")
-                f.attrs["v_fixed"] = self.v_fixed.value()
                 f.attrs["faraday_comp"] = self.faraday_comp.isChecked()
                 f.attrs["faraday_rot"] = self.faraday_rot.value()
                 f.attrs["timestamp"] = timestamp
+                f.attrs["measurement_started_at"] = measurement_start_text(
+                    getattr(self, "measurement_started_at", None)
+                )
 
                 # Duplicate value_storage handling removed; full value_storage already stored as attribute above.
                 self.lbl_status.setText(f"Status: Saved {os.path.basename(filename)}")
@@ -2866,11 +2839,13 @@ class BVSweepWindow(QtWidgets.QMainWindow):
             return
         if not np.any(self.data_measured_mask):
             return
-        autosave_dir = os.path.join(parent_dir, "data", "autosave")
-        os.makedirs(autosave_dir, exist_ok=True)
+        autosave_dir = measurement_data_dir(
+            parent_dir, getattr(self, "measurement_started_at", None), autosave=True
+        )
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         suffix = "_interrupted" if was_interrupted else ""
-        filename = f"autosave_bv_sweep_{timestamp}{suffix}.h5"
+        filename = f"autosave_bv_sweep_{timestamp[-6:]}{suffix}.h5"
+        filename = dated_measurement_filename(filename, getattr(self, "measurement_started_at", None))
         file_path = os.path.join(autosave_dir, filename)
         try:
             self.save_sweep_data(file_path=file_path)

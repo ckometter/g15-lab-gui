@@ -1,5 +1,10 @@
 import Pyro4
 import numpy as np
+import threading
+import time
+import uuid
+from drivers.nirvana_control_client import NIRvanaControlClient
+from datetime import datetime
 from qcodes.instrument import Instrument
 from qcodes.parameters import ArrayParameter
 
@@ -76,7 +81,7 @@ class SimulatedLightFieldWrapper:
     def get_wavelengths_cache(self):
         if self._cached_wavelengths is not None:
             return self._cached_wavelengths
-        self._cached_wavelengths = np.linspace(700.0, 820.0, 512).tolist()
+        self._cached_wavelengths = np.linspace(self.wavelength - 60, self.wavelength + 60, 512).tolist()
         return self._cached_wavelengths
 
     def abort_acquisition(self):
@@ -149,6 +154,12 @@ class PyroProxyWrapper:
             return self.set_shutter_control
         elif name == 'set_target_temperature':
             return self.set_target_temperature
+        elif name == 'set_exposure_time':
+            return self.set_exposure_time
+        elif name == 'set_num_frames':
+            return self.set_num_frames
+        elif name == 'set_wavelength':
+            return self.set_wavelength
         
         # Forward everything else to the real proxy
         return getattr(object.__getattribute__(self, '_proxy'), name)
@@ -166,7 +177,8 @@ class PyroProxyWrapper:
             'get_status', 'start_preview', 'stop_preview',
             'get_latest_preview_data', 'get_wavelengths_cache',
             'abort_acquisition', 'get_spectrum', 'set_grating',
-            'set_shutter_control', 'set_target_temperature'
+            'set_shutter_control', 'set_target_temperature',
+            'set_exposure_time', 'set_num_frames', 'set_wavelength'
         ]
 
     def __enter__(self):
@@ -179,19 +191,16 @@ class PyroProxyWrapper:
     def set_grating(self, val):
         proxy = object.__getattribute__(self, '_proxy')
         if isinstance(val, str):
-            if '][0][' in val:
-                g_val = 1
-            elif '][1][' in val:
-                g_val = 1
-            elif '][2][' in val:
-                g_val = 2
-            else:
-                try:
-                    g_val = int(val)
-                except ValueError:
-                    g_val = 1
+            known = {"[hol,1500][0][0]": 3, "[750  nm,1200][1][0]": 1,
+                     "[1.0  \u00e6m,300][2][0]": 2}
+            try:
+                g_val = known[val] if val in known else int(val)
+            except ValueError:
+                raise ValueError(f"Unknown WinSpec grating: {val!r}") from None
         else:
             g_val = int(val)
+        if g_val not in (1, 2, 3):
+            raise ValueError(f"Unknown WinSpec grating: {val!r}")
         proxy.grating = g_val
 
     def set_shutter_control(self, val):
@@ -201,6 +210,18 @@ class PyroProxyWrapper:
     def set_target_temperature(self, val):
         proxy = object.__getattribute__(self, '_proxy')
         proxy.target_temperature = float(val)
+
+    def set_exposure_time(self, val):
+        proxy = object.__getattribute__(self, '_proxy')
+        proxy.exposure_time = float(val)
+
+    def set_num_frames(self, val):
+        proxy = object.__getattribute__(self, '_proxy')
+        proxy.num_frames = int(val)
+
+    def set_wavelength(self, val):
+        proxy = object.__getattribute__(self, '_proxy')
+        proxy.wavelength = float(val)
 
     def get_status(self):
         proxy = object.__getattribute__(self, '_proxy')
@@ -266,11 +287,10 @@ class PyroProxyWrapper:
         proxy = object.__getattribute__(self, '_proxy')
         if hasattr(proxy, "get_focus_data"):
             try:
-                data = proxy.get_focus_data()
-                if data is not None:
-                    return data
+                return proxy.get_focus_data()
             except Exception as e:
-                print(f"Wrapper: get_focus_data failed, falling back: {e}")
+                print(f"Wrapper: get_focus_data failed: {e}")
+                return None
                 
         try:
             # We call get_spectrum(wlen=False)
@@ -359,13 +379,24 @@ class PyroProxyWrapper:
         return spectra_arr.tolist()
 
 class NIRvanaSocketWrapper:
-    def __init__(self, server_ip, port):
+    def __init__(self, server_ip, port, *, enable_controls=False):
         self.server_ip = server_ip
         self.port = port
         self._exposure_time = 0.1  # seconds
         self._num_frames = 1
         self._cached_wavelengths = None
         self._active_socket = None
+        self._acquisition_lock = threading.Lock()
+        self.controls = NIRvanaControlClient(server_ip, int(port) + 1)
+        self.controls_enabled = enable_controls
+        self._preview_mode = None
+        self._preview_token = None
+        self._preview_sequence = None
+        self._last_preview_frame = 0
+        self.acquisition_health = {
+            "state": "unverified", "last_success": None,
+            "details": "No spectrum received in this session.",
+        }
 
     def get_exposure_time(self):
         return self._exposure_time
@@ -392,54 +423,110 @@ class NIRvanaSocketWrapper:
         pass
 
     def get_status(self):
-        grating = 'NIRvana Fixed'
-        wlens = self.get_wavelengths_cache()
-        if wlens is not None and len(wlens) > 1:
-            avg_step = float(np.mean(np.diff(wlens)))
-            if avg_step > 0.35:
-                grating = "[150][0][0]"  # 150 g/mm
-            elif avg_step > 0.18:
-                grating = "[1.0  \u00e6m,300][2][0]"  # 300 g/mm
-            elif avg_step > 0.08:
-                grating = "[600][0][0]"  # 600 g/mm
-            elif avg_step > 0.04:
-                grating = "[750  nm,1200][1][0]"  # 1200 g/mm
-            else:
-                grating = "[hol,1500][0][0]"  # 1500 g/mm
-
-        return {
-            'success': True,
-            'temp': -80.0,
-            'target_temp': -80.0,
-            'status': 1,
-            'gain': 1.0,
-            'grating': grating,
-            'exposure': self._exposure_time,
-            'wl': 1100.0,
-            'shutter': 'N/A',
-            'num_frames': self._num_frames
+        status = {
+            'success': True, 'status_source': 'local_settings',
+            'temp': None, 'target_temp': None, 'status': None, 'gain': None,
+            'grating': None, 'wl': None, 'shutter': None, 'capabilities': {},
         }
+        if self.controls_enabled:
+            try:
+                status.update(self.controls.get_status())
+            except RuntimeError as exc:
+                status['control_error'] = str(exc)
+        else:
+            status['capabilities'] = {'preview': True, 'grating': False, 'wavelength': False}
+            status['preview_mode'] = 'acquisition'
+        # These are the settings for the NEXT acquisition, not the previous file.
+        status.update(exposure=self._exposure_time, num_frames=self._num_frames)
+        return status
+
+    def _set_spectrometer(self, method, value):
+        if not self.controls_enabled:
+            raise RuntimeError("Set the grating/wavelength in LightField; this server provides acquisition only.")
+        if not self._acquisition_lock.acquire(blocking=False):
+            raise RuntimeError("NIRvana is busy acquiring/previewing; stop it before changing settings.")
+        try:
+            self._cached_wavelengths = None
+            return getattr(self.controls, method)(value)
+        finally:
+            self._acquisition_lock.release()
+
+    def set_grating(self, value):
+        return self._set_spectrometer('set_grating', value)
+
+    def set_wavelength(self, value):
+        return self._set_spectrometer('set_wavelength', value)
 
     def start_preview(self):
-        pass
+        if not self._acquisition_lock.acquire(blocking=False):
+            raise RuntimeError("NIRvana is busy. Finish its current operation first.")
+        self._cached_wavelengths = None
+        if not self.controls_enabled:
+            # The unchanged server supports ordinary acquisitions only. Hold the
+            # camera lock for the live session and request one frame at a time.
+            self._preview_mode = 'acquisition'
+            return
+        self._preview_mode = 'native'
+        self._preview_token = uuid.uuid4().hex
+        self._preview_sequence = None
+        self._cached_wavelengths = None
+        self._last_preview_frame = time.monotonic()
+        try:
+            self.controls.request('start_preview', token=self._preview_token,
+                                  exposure_time=self._exposure_time * 1000, timeout=5)
+        except Exception:
+            # Best effort cleanup also covers a lost reply after Preview succeeded.
+            try:
+                self.stop_preview()
+            except Exception:
+                pass  # Preserve the startup error; the server also expires abandoned previews.
+            raise
 
     def stop_preview(self):
-        pass
+        if self._preview_mode == 'acquisition':
+            self._preview_mode = None
+            self._acquisition_lock.release()
+            return
+        if self._preview_token is None:
+            return
+        try:
+            self.controls.request('stop_preview', token=self._preview_token, timeout=5)
+        finally:
+            self._preview_token = None
+            self._preview_mode = None
+            self._acquisition_lock.release()
 
     def get_latest_preview_data(self):
-        res = self.get_spectrum()
-        if res is not None:
-            intensities, _ = res
-            intensities_arr = np.array(intensities)
-            if intensities_arr.ndim == 2:
-                return intensities_arr[0].tolist()
-            return intensities_arr.tolist()
-        return None
+        if self._preview_mode == 'acquisition':
+            intensities, _ = self._acquire({
+                'command': 'start_acquisition',
+                'exposure_time': self._exposure_time * 1000,
+                'num_frames': 1,
+            })
+            return intensities[0]
+        if self._preview_token is None:
+            raise RuntimeError("Start NIRvana live preview first.")
+        response = self.controls.request('get_preview', token=self._preview_token)
+        frame = response.get('frame')
+        if frame is None or frame['sequence'] == self._preview_sequence:
+            if time.monotonic() - self._last_preview_frame > max(30, 3 * self._exposure_time):
+                raise RuntimeError("No new LightField preview frame received; check the device PC.")
+            return None
+        wavelengths = np.asarray(frame['wavelengths'], dtype=float)
+        intensities = np.asarray(frame['intensities'], dtype=float)
+        if (wavelengths.ndim != 1 or intensities.shape != wavelengths.shape
+                or not wavelengths.size or not np.all(np.isfinite(wavelengths))
+                or not np.all(np.isfinite(intensities)) or np.any(wavelengths <= 0)):
+            raise ValueError("Invalid NIRvana live frame/calibration.")
+        self._preview_sequence = frame['sequence']
+        self._last_preview_frame = time.monotonic()
+        self._cached_wavelengths = wavelengths.tolist()
+        return intensities.tolist()
 
     def get_wavelengths_cache(self):
         if self._cached_wavelengths is not None:
             return self._cached_wavelengths
-        return np.linspace(1049.17, 1130.78, 640).tolist()
+        return None  # Calibration is only known after receiving a spectrum.
 
     def abort_acquisition(self):
         sock = self._active_socket
@@ -455,73 +542,108 @@ class NIRvanaSocketWrapper:
                 pass
 
     def get_spectrum(self, *args, **kwargs):
-        import socket
-        import json
-        from io import StringIO
-        import pandas as pd
-        
+        # The GUI uses seconds; Kilian's server requires milliseconds.
         spec_params = {
             "command": "start_acquisition",
-            "exposure_time": self._exposure_time * 1e3,  # convert to ms
+            "exposure_time": self._exposure_time * 1e3,
             "num_frames": self._num_frames
         }
-        
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._active_socket = sock
+        if not self._acquisition_lock.acquire(blocking=False):
+            raise RuntimeError("NIRvana is already acquiring or being verified. Wait for it to finish.")
         try:
-            sock.settimeout(10*60)
-            sock.connect((self.server_ip, self.port))
-            sock.sendall(json.dumps(spec_params).encode('utf-8'))
-            
-            chunks = []
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                
-            data_str = b''.join(chunks).decode('utf-8')
-            if not data_str.strip():
-                return None
-                
-            df = pd.read_csv(StringIO(data_str), engine='python')
-            df['Frame'] = df['Frame'].astype(int) - 1
-            
-            def parse_wavelength(x):
-                try: return float(x)
-                except: return np.nan
-            df['Wavelength'] = df['Wavelength'].apply(parse_wavelength)
-            df['Intensity'] = df['Intensity'].astype(np.int32)
-            
-            num_frames = df['Frame'].max() + 1
-            num_wavelengths = df['Wavelength'].nunique()
-            df = df.sort_values(['Frame', 'Wavelength'])
-            
-            intensity_array = df['Intensity'].to_numpy().reshape((num_frames, num_wavelengths))
-            wavelength_array = df[df['Frame'] == 0]['Wavelength'].to_numpy()
-            
-            self._cached_wavelengths = wavelength_array.tolist()
-            return intensity_array.tolist(), wavelength_array.tolist()
-            
-        except Exception as e:
-            print(f"NIRvanaSocketWrapper error: {e}")
-            return None
+            return self._acquire(spec_params)
         finally:
-            try:
-                sock.close()
-            except Exception:
-                pass
+            self._acquisition_lock.release()
+
+    def _set_health(self, state, details, **values):
+        # Replace the snapshot atomically; the GUI only reads it, with no network polling.
+        self.acquisition_health = {
+            **self.acquisition_health, "state": state, "details": details, **values,
+        }
+
+    def verify_acquisition(self):
+        """Check two complete request/acquire/export/receive cycles while idle.
+
+        Test requests leave the user's local exposure/frame settings unchanged.
+        No extra command, heartbeat, or retry is sent to the lab server.
+        """
+        if not self._acquisition_lock.acquire(blocking=False):
+            raise RuntimeError("NIRvana is busy. Finish the measurement before checking it.")
+        try:
+            previous_wavelengths = None
+            for check in (1, 2):
+                self._set_health("checking", f"Acquiring test spectrum {check}/2 (50 ms, one frame).")
+                _, wavelengths = self._acquire(
+                    {"command": "start_acquisition", "exposure_time": 50.0, "num_frames": 1},
+                    checking=True,
+                )
+                if previous_wavelengths is not None and wavelengths != previous_wavelengths:
+                    raise ValueError("Wavelength calibration changed between the two test spectra.")
+                previous_wavelengths = wavelengths
+            details = (
+                f"Two consecutive test spectra received from {self.server_ip}:{self.port}.\n"
+                f"Each: 50 ms, one frame, {len(wavelengths)} pixels.\n"
+                f"Wavelength range: {wavelengths[0]:.3f} to {wavelengths[-1]:.3f} nm.\n"
+                "CSV structure, numeric values, frame count and wavelength grids validated.\n"
+                "Test spectra are not saved as measurement data. Local measurement settings unchanged."
+            )
+            self._set_health("verified", details)
+            return details
+        except Exception as exc:
+            self._set_health("failed", str(exc))
+            raise
+        finally:
+            self._acquisition_lock.release()
+
+    def _acquire(self, spec_params, *, checking=False):
+        import NIRvana_send_trigger as trig
+
+        if not checking:
+            self._set_health("acquiring", "Waiting for a complete spectrum from NIRvana.")
+
+        try:
+            # The server can spend 140 s waiting for CSV export. A startup check
+            # gets 180 s; normal acquisitions retain the lab client's 600 s timeout.
+            timeout = {"acquisition_timeout_s": 180} if checking else {}
+            wavelengths, intensities = trig.trigger(
+                spec_params,
+                device_ip=self.server_ip,
+                port=self.port,
+                on_socket=lambda sock: setattr(self, "_active_socket", sock),
+                **timeout,
+            )
+            self._cached_wavelengths = wavelengths.tolist()
+            self._set_health(
+                "checking" if checking else "verified",
+                f"Received {len(intensities)} frame(s), {len(wavelengths)} pixels.",
+                last_success=datetime.now().astimezone().isoformat(timespec="seconds"),
+            )
+            # The measurement routines expect (intensities, wavelengths).
+            return intensities.tolist(), wavelengths.tolist()
+        except Exception as exc:
+            self._set_health("failed", str(exc))
+            raise
+        finally:
             self._active_socket = None
 
 class NIRvanaMonoWrapper:
-    def __init__(self):
-        self._wavelength = 1100.0
+    def __init__(self, server_ip=None, port=65432, *, enable_controls=False):
+        self.controls_enabled = enable_controls
+        self.controls = NIRvanaControlClient(server_ip, int(port) + 1) if server_ip else None
 
     def get_wavelength(self):
-        return self._wavelength
+        if not self.controls_enabled:
+            raise RuntimeError("Wavelength is set in LightField; the acquisition server has no remote wavelength readback.")
+        if self.controls is None:
+            raise RuntimeError("NIRvana control endpoint is not configured.")
+        return self.controls.get_wavelength()
 
     def set_wavelength(self, val):
-        self._wavelength = float(val)
+        if not self.controls_enabled:
+            raise RuntimeError("Set wavelength in LightField; the acquisition server has no remote wavelength control.")
+        if self.controls is None:
+            raise RuntimeError("NIRvana control endpoint is not configured.")
+        return self.controls.set_wavelength(val)
 
 class RemoteCCDImage(ArrayParameter):
     def __init__(self, name, instrument, shape=(512, 512), **kwargs):
@@ -536,7 +658,7 @@ class ClientLightFieldCamera(Instrument):
     QCoDeS client driver for the Princeton Instruments Camera 
     exposed by the unified LightField Pyro4 server.
     """
-    def __init__(self, name, server_ip="G15-Pylon.dhcp-int.phys.ethz.ch", port=50920, pyro_uri=None, spectrometer_type="lightfieldG15", simulated=False, **kwargs):
+    def __init__(self, name, server_ip="DESKTOP-LSQKIT5.dhcp-int-phys.ethz.ch", port=50920, pyro_uri=None, spectrometer_type="lightfieldG15", simulated=False, nirvana_controls=False, **kwargs):
         super().__init__(name, **kwargs)
         self.spectrometer_type = spectrometer_type
         self.simulated = simulated
@@ -548,7 +670,7 @@ class ClientLightFieldCamera(Instrument):
             print(f"Initialized ClientLightFieldCamera '{name}' in Simulation Mode.")
         else:
             if spectrometer_type == 'lightfieldG11':
-                self.remote_lf = NIRvanaSocketWrapper(server_ip, port)
+                self.remote_lf = NIRvanaSocketWrapper(server_ip, port, enable_controls=nirvana_controls)
             else:
                 Pyro4.config.SERIALIZER = 'pickle'
                 Pyro4.config.PICKLE_PROTOCOL_VERSION = 2
@@ -588,6 +710,7 @@ class ClientLightFieldCamera(Instrument):
     def _set_exposure_time(self, val):
         if self.simulated:
             self._exposure_time = float(val)
+            self.remote_lf.exposure_time = self._exposure_time
         else:
             remote_set(self.remote_lf, 'exposure_time', val, 'set_exposure_time')
 
@@ -599,6 +722,7 @@ class ClientLightFieldCamera(Instrument):
     def _set_num_frames(self, val):
         if self.simulated:
             self._num_frames = int(val)
+            self.remote_lf.num_frames = self._num_frames
         else:
             remote_set(self.remote_lf, 'num_frames', val, 'set_num_frames')
 
@@ -618,22 +742,25 @@ class ClientLightFieldCamera(Instrument):
                 res = self.remote_lf.get_spectrum(wlen=True)
             else:
                 res = self.remote_lf.get_spectrum()
-            intensities, wavelengths = res
-            
-            intensities_arr = np.array(intensities)
-            if intensities_arr.ndim == 3:
-                # WinSpec returns 3D array (ROI, frames, pixels)
-                intensities_arr = np.mean(intensities_arr[0], axis=0)
-            elif intensities_arr.ndim == 2:
-                intensities_arr = np.mean(intensities_arr, axis=0)
-            
-            # Interpolate intensities to 512 points to match the GUI shape
-            if len(intensities_arr) != 512:
-                x_old = np.linspace(0, 1, len(intensities_arr))
-                x_new = np.linspace(0, 1, 512)
-                intensities_512 = np.interp(x_new, x_old, intensities_arr)
+            if res is None:
+                print(f"ClientLightFieldCamera Warning: Remote spectrometer '{self.spectrometer_type}' returned None. Verify camera hardware and server script on {self.remote_lf.server_ip if hasattr(self.remote_lf, 'server_ip') else 'remote host'}.")
+                intensities_512 = np.zeros(512)
             else:
-                intensities_512 = intensities_arr
+                intensities, wavelengths = res
+                intensities_arr = np.array(intensities)
+                if intensities_arr.ndim == 3:
+                    # WinSpec returns 3D array (ROI, frames, pixels)
+                    intensities_arr = np.mean(intensities_arr[0], axis=0)
+                elif intensities_arr.ndim == 2:
+                    intensities_arr = np.mean(intensities_arr, axis=0)
+                
+                # Interpolate intensities to 512 points to match the GUI shape
+                if len(intensities_arr) != 512:
+                    x_old = np.linspace(0, 1, len(intensities_arr))
+                    x_new = np.linspace(0, 1, 512)
+                    intensities_512 = np.interp(x_new, x_old, intensities_arr)
+                else:
+                    intensities_512 = intensities_arr
             
         # Return a 2D image matrix of shape (512, 512) where each row is intensities_512 / 512.
         # When GUI does np.sum(img, axis=0), it gets exactly intensities_512.
@@ -653,7 +780,10 @@ class ClientLightFieldCamera(Instrument):
         if self.simulated:
             return
         try:
-            if self.spectrometer_type in ['wingspecG15', 'winspecG11', 'wingspecG11', 'winspecG15']:
+            if self.spectrometer_type == 'lightfieldG11':
+                # Closes the client receive socket; the protocol has no server abort command.
+                self.remote_lf.abort_acquisition()
+            elif self.spectrometer_type in ['wingspecG15', 'winspecG11', 'wingspecG11', 'winspecG15']:
                 # Release the main proxy connection to close the active socket and free the thread
                 if hasattr(self.remote_lf, "abort_acquisition"):
                     self.remote_lf.abort_acquisition()
@@ -674,7 +804,7 @@ class ClientLightFieldMonochromator(Instrument):
     QCoDeS client driver for the Acton SpectraPro Spectrometer
     exposed by the unified LightField Pyro4 server.
     """
-    def __init__(self, name, server_ip="G15-Pylon.dhcp-int.phys.ethz.ch", port=50920, pyro_uri=None, spectrometer_type="lightfieldG15", simulated=False, **kwargs):
+    def __init__(self, name, server_ip="DESKTOP-LSQKIT5.dhcp-int-phys.ethz.ch", port=50920, pyro_uri=None, spectrometer_type="lightfieldG15", simulated=False, nirvana_controls=False, **kwargs):
         super().__init__(name, **kwargs)
         self.simulated = simulated
         
@@ -683,7 +813,7 @@ class ClientLightFieldMonochromator(Instrument):
             print(f"Initialized ClientLightFieldMonochromator '{name}' in Simulation Mode.")
         else:
             if spectrometer_type == 'lightfieldG11':
-                self.remote_lf = NIRvanaMonoWrapper()
+                self.remote_lf = NIRvanaMonoWrapper(server_ip, port, enable_controls=nirvana_controls)
             else:
                 Pyro4.config.SERIALIZER = 'pickle'
                 Pyro4.config.PICKLE_PROTOCOL_VERSION = 2

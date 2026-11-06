@@ -1,3 +1,4 @@
+from scanner_safety import move_scanner, validate_map_scanner_targets
 import os
 import sys
 import json
@@ -8,19 +9,23 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
 try:
-    from .utils import EnhancedViewBox, calculate_expected_duration
+    from .utils import EnhancedViewBox, calculate_expected_duration, configure_plot_axes
 except ImportError:
     import sys
     import os
     _measurements_dir = os.path.dirname(os.path.abspath(__file__))
     if _measurements_dir not in sys.path:
         sys.path.insert(0, _measurements_dir)
-    from utils import EnhancedViewBox, calculate_expected_duration
+    from utils import EnhancedViewBox, calculate_expected_duration, configure_plot_axes
 
 # Ensure parent directory is in path for importing station_setup
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
+
+from gate_safety import GateRampCancelled, validate_gate_voltage, validate_map_gate_targets
+from measurement_data_paths import dated_measurement_filename, dated_measurement_path
+from measurement_data_paths import measurement_data_dir, measurement_start_text, new_measurement_start, measurement_device_modes
 
 pg.setConfigOption('background', '#ffffff')
 pg.setConfigOption('foreground', '#1e293b')
@@ -178,42 +183,51 @@ class ScalarMapWorker(QtCore.QThread):
         self.mutex.unlock()
 
     def set_piezo(self, axis, val):
+        if not move_scanner(getattr(self.station, 'piezo300', None), {axis: val},
+                            keep_running=self.check_pause_and_stop):
+            raise GateRampCancelled('Map scanner ramp stopped.')
+
+    def check_pause_and_stop(self):
+        self.mutex.lock()
         try:
-            if hasattr(self.station, 'piezo300'):
-                if hasattr(self.station.piezo300, 'set_voltage'):
-                    self.station.piezo300.set_voltage(axis, val)
-                else:
-                    param = getattr(self.station.piezo300, f'voltage_ch{axis}', None)
-                    if param:
-                        param(val)
-        except Exception as e:
-            print(f"Error setting ANC300 axis {axis}: {e}")
+            while self._is_paused and self._running:
+                self.pause_cond.wait(self.mutex)
+            return self._running
+        finally:
+            self.mutex.unlock()
+
+    def preflight_gate_scan(self, x_vals, y_vals):
+        validate_map_scanner_targets(getattr(self.station, 'piezo300', None), self.params, x_vals, y_vals)
+        channels = validate_map_gate_targets(self.params, x_vals, y_vals)
+        if channels:
+            smu = getattr(self.station, 'smu', None)
+            if smu is None:
+                raise RuntimeError('A gate scan requires a connected SMU.')
+            for number in sorted(channels):
+                channel = getattr(smu, f'ch{number}')
+                if channel.source_mode() != 'VOLT':
+                    raise RuntimeError(f'Channel {number} must be in voltage-source mode for a gate scan.')
+                validate_gate_voltage(channel.volt(), number)
+            if not self.check_pause_and_stop():
+                raise GateRampCancelled('Map stopped before gate preparation.')
+            smu.enforce_current_compliance()
 
     def set_smu_volt(self, ch, val):
+        validate_gate_voltage(val, ch)
+        if not self.check_pause_and_stop():
+            raise GateRampCancelled('Map stopped before gate ramp.')
+        channel = getattr(self.station.smu, f'ch{ch}')
+        self.mutex.lock()
         try:
-            if hasattr(self.station, 'smu'):
-                channel = getattr(self.station.smu, f'ch{ch}', None)
-                if channel:
-                    if getattr(self.station.smu, "simulated", False):
-                        channel.set_r.volt(val)
-                    else:
-                        max_retries = 3
-                        for attempt in range(1, max_retries + 1):
-                            try:
-                                channel.set_r.volt(val)
-                                break
-                            except Exception as ex:
-                                if attempt == max_retries:
-                                    raise ex
-                                print(f"ScalarMapWorker: Retrying SMU{ch} set voltage (attempt {attempt+1}/{max_retries}) due to error: {ex}")
-                                try:
-                                    channel.parent.visa_handle.clear()
-                                # except:
-                                except Exception:
-                                    pass
-                                time.sleep(0.1)
-        except Exception as e:
-            print(f"Error setting SMU channel {ch}: {e}")
+            if not self._running:
+                raise GateRampCancelled('Map stopped before gate ramp.')
+            channel.ramp_stop_requested = False
+        finally:
+            self.mutex.unlock()
+        # A failed/cancelled ramp must propagate and prevent acquisition.
+        channel.set_r.volt(val)
+        if channel.ramp_stop_requested or not self.check_pause_and_stop():
+            raise GateRampCancelled('Map gate ramp cancelled.')
 
     def set_magnet(self, val):
         try:
@@ -223,6 +237,7 @@ class ScalarMapWorker(QtCore.QThread):
             print(f"Error setting magnet field: {e}")
 
     def apply_sweep_values(self, px, vx, py, vy):
+        piezo_updated = False
         # 1. Magnet (B)
         if px == "B":
             self.set_magnet(vx)
@@ -232,12 +247,18 @@ class ScalarMapWorker(QtCore.QThread):
         # 2. Attocubes (Position X, Position Y)
         if px == "position X":
             self.set_piezo(1, vx)
+            piezo_updated = True
         if py == "position X":
             self.set_piezo(1, vy)
+            piezo_updated = True
             
         if px == "position Y":
+            if piezo_updated:
+                time.sleep(0.02)
             self.set_piezo(2, vx)
         if py == "position Y":
+            if piezo_updated:
+                time.sleep(0.02)
             self.set_piezo(2, vy)
             
         # 3. SMU Channels (V1, V2)
@@ -287,6 +308,9 @@ class ScalarMapWorker(QtCore.QThread):
                         smu.return_to_local()
                     except Exception:
                         pass
+        except GateRampCancelled as e:
+            if self._running:
+                self.error.emit(str(e))
         except Exception as e:
             self.error.emit(str(e))
         finally:
@@ -304,6 +328,7 @@ class ScalarMapWorker(QtCore.QThread):
 
         x_vals = np.linspace(x_start, x_end, x_pts)
         y_vals = np.linspace(y_start, y_end, y_pts)
+        self.preflight_gate_scan(x_vals, y_vals)
         total = x_pts * y_pts
         cnt = 0
 
@@ -325,8 +350,8 @@ class ScalarMapWorker(QtCore.QThread):
                 # Apply physical values for chosen sweep parameter
                 self.apply_sweep_values(x_param, xv, y_param, yv)
 
-                # Settling time delay
-                settling_time = self.params.get('settling_time', 0.05)
+                # Settling time delay (0.1 s default)
+                settling_time = self.params.get('settling_time', 0.1)
                 if settling_time > 0:
                     sleep_end = time.time() + settling_time
                     while time.time() < sleep_end:
@@ -337,7 +362,10 @@ class ScalarMapWorker(QtCore.QThread):
                             self.mutex.unlock()
                             return
                         self.mutex.unlock()
-                        time.sleep(0.05)
+                        time.sleep(0.01)
+
+                if not self.check_pause_and_stop():
+                    return
 
                 # Acquire power value
                 power_val = None
@@ -838,7 +866,7 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
     def setup_histogram_lut(self, plot_win, image_item, interactive=True):
         hist = pg.HistogramLUTItem(gradientPosition='left')
         hist.setImageItem(image_item)
-        hist.gradient.loadPreset('thermal')
+        hist.gradient.loadPreset('viridis')
         
         hist.layout.removeItem(hist.gradient)
         hist.layout.removeItem(hist.vb)
@@ -1084,7 +1112,7 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
             'coeff_b': b,
             'coeff_c': c,
             'coeff_d': d,
-            'settling_time': self.value_storage.get("shared", {}).get("settling_time", self.value_storage.get("settling_time", 0.05)) if isinstance(self.value_storage, dict) else 0.05,
+            'settling_time': self.value_storage.get("shared", {}).get("settling_time", self.value_storage.get("settling_time", 0.1)) if isinstance(self.value_storage, dict) else 0.1,
             'c1_name': getattr(self, 'c1_name', 'Vc1'),
             'c2_name': getattr(self, 'c2_name', 'Vc2'),
         }
@@ -1125,6 +1153,8 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
         # Estimate remaining time
         self.sweep_total_duration = len(self.x_coords) * len(self.y_coords) * (params['settling_time'] + 0.05)
         self.sweep_start_time = time.time()
+        self.measurement_started_at = new_measurement_start(self.sweep_start_time)
+        self.measurement_device_modes = measurement_device_modes(self.station)
         self.total_paused_time = 0.0
         self.pause_start_time = None
         self.lbl_expected_end.setText("Expected End: Calculating...")
@@ -1373,11 +1403,12 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
     # --- Save / AutoSave ---
     def trigger_autosave(self, was_interrupted=False):
         try:
-            autosave_dir = os.path.join(parent_dir, "data", "autosave")
-            os.makedirs(autosave_dir, exist_ok=True)
+            autosave_dir = measurement_data_dir(
+                parent_dir, getattr(self, "measurement_started_at", None), autosave=True
+            )
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             suffix = "_interrupted" if was_interrupted else ""
-            auto_path = os.path.join(autosave_dir, f"autosave_scalar_map_{timestamp}{suffix}.h5")
+            auto_path = os.path.join(autosave_dir, dated_measurement_filename(f"autosave_scalar_map_{timestamp[-6:]}{suffix}.h5", getattr(self, "measurement_started_at", None)))
             self.save_data(file_path=auto_path)
         except Exception as e:
             print(f"ScalarMapWindow Autosave failed: {e}")
@@ -1392,10 +1423,12 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
 
         try:
             self.save_storage()
-            data_dir = os.path.join(parent_dir, "data")
-            os.makedirs(data_dir, exist_ok=True)
+            data_dir = measurement_data_dir(
+                parent_dir, getattr(self, "measurement_started_at", None)
+            )
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            default_name = f"scalar_map_{timestamp}.h5"
+            default_name = f"scalar_map_{timestamp[-6:]}.h5"
+            default_name = dated_measurement_filename(default_name, getattr(self, "measurement_started_at", None))
             if file_path is None:
                 filename, _ = QtWidgets.QFileDialog.getSaveFileName(
                     self,
@@ -1405,10 +1438,15 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
                 )
                 if not filename:
                     return
+                filename = dated_measurement_path(filename, getattr(self, "measurement_started_at", None))
             else:
                 filename = file_path
 
             with h5py.File(filename, "w") as f:
+                f.attrs["device_modes"] = json.dumps(getattr(self, "measurement_device_modes", {}))
+                f.attrs["measurement_started_at"] = measurement_start_text(
+                    getattr(self, "measurement_started_at", None)
+                )
                 f.create_dataset("x_coords", data=self.x_coords)
                 f.create_dataset("y_coords", data=self.y_coords)
                 f.create_dataset("power", data=self.data_power)
@@ -1450,12 +1488,13 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
         for attr_name in dir(self):
             attr = getattr(self, attr_name, None)
             if isinstance(attr, pg.PlotWidget):
+                configure_plot_axes(attr)
                 attr.setBackground('#ffffff')
                 attr.getAxis('left').setPen(pg.mkPen('#334155'))
                 attr.getAxis('bottom').setPen(pg.mkPen('#334155'))
                 attr.getAxis('left').setTextPen(pg.mkPen('#334155'))
                 attr.getAxis('bottom').setTextPen(pg.mkPen('#334155'))
-                attr.showGrid(x=True, y=True, alpha=0.15)
+                attr.showGrid(x=False, y=False)
 
     def load_storage(self):
         storage_path = os.path.join(parent_dir, "value_storage")

@@ -1,6 +1,52 @@
 import pyqtgraph as pg
 from PyQt6 import QtCore
 
+
+def configure_plot_axes(plot):
+    """Adaptive numeric ticks, with voltage labels consistently expressed in V.
+
+    Formatting only: leave data, ranges, view links and hardware untouched.
+    Current and power axes retain their useful nA/uA and nW/uW prefixes.
+    """
+    for side in ('bottom', 'left'):
+        axis = plot.getAxis(side)
+        axis.setTicks(None)
+        axis.setTickSpacing()  # Recompute spacing for each visible range.
+        axis.setTickDensity(1.5)
+        axis.setStyle(autoExpandTextSpace=True, autoReduceTextSpace=True,
+                      hideOverlappingLabels=True)
+        if axis.labelUnits == 'V':
+            # In pyqtgraph 0.14 disabling auto-prefixes still recalculates once.
+            # Clear any previous mV scale as well as preventing future changes.
+            axis.setSIPrefixEnableRanges(())
+            axis.enableAutoSIPrefix(False)
+
+
+def update_current_slice(plot, curve, coordinates, currents, measured):
+    """Draw only acquired points and scale current axes in their actual units."""
+    import numpy as np
+    x, y = np.asarray(coordinates), np.asarray(currents)
+    valid = np.asarray(measured, dtype=bool) & np.isfinite(x) & np.isfinite(y)
+    curve.setData(x, np.where(valid, y, np.nan), connect='finite')
+    vb = plot.getViewBox()
+    # Older reset code disables autoRange after setting a manual Y range.
+    # Fit on each update until the user explicitly zooms/pans the plot.
+    if not getattr(vb, '_current_zoom_connected', False):
+        vb._current_user_zoom = getattr(vb, '_current_user_zoom', False)
+        vb._current_zoom_connected = True
+        vb.sigRangeChangedManually.connect(lambda axes: setattr(vb, '_current_user_zoom', True))
+    if vb._current_user_zoom or not np.any(valid):
+        return
+    x0, x1 = float(np.min(x)), float(np.max(x))
+    if x0 == x1:
+        padding = max(abs(x0) * .01, .01)
+        x0, x1 = x0 - padding, x1 + padding
+    y0, y1 = float(np.min(y[valid])), float(np.max(y[valid]))
+    padding = max((y1 - y0) * .05, abs(y0) * .05, abs(y1) * .05, 1e-12)
+    vb.update_bounds(x0, x1, None, None)
+    vb.setRange(xRange=(x0, x1), yRange=(y0 - padding, y1 + padding), padding=0)
+
+
 class EnhancedViewBox(pg.ViewBox):
     """Custom ViewBox to provide axis‑specific mouse‑wheel zooming with limits.
 
@@ -110,6 +156,8 @@ class EnhancedViewBox(pg.ViewBox):
         # Update view
         self.setXRange(new_x0, new_x1, padding=0)
         self.setYRange(new_y0, new_y1, padding=0)
+        axes = [True, False] if is_bottom else [False, True] if is_left else [True, True]
+        self.sigRangeChangedManually.emit(axes)
         ev.accept()
 
 

@@ -2,9 +2,74 @@ import os
 import json
 import math
 from PyQt6 import QtWidgets, QtCore, QtGui
+from scanner_safety import ScannerSettings
+from measurements.position_motion import PositionMotionControls
+
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+class SwitchHeaterWorker(QtCore.QThread):
+    progress = QtCore.pyqtSignal(float, float, float)
+    status = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, magnet, target_state, parent=None):
+        super().__init__(parent)
+        self.magnet = magnet
+        self.target_state = target_state # 'on' or 'off'
+        self.stop_requested = False
+
+    def stop(self):
+        self.stop_requested = True
+
+    def run(self):
+        try:
+            self.stop_requested = False
+            if self.target_state == 'on':
+                # Check switch heater state
+                heater = self.magnet._get_switch_heater()
+                if heater.startswith('off'):
+                    output_f = self.magnet._get_output_field()
+                    persistent_f = self.magnet._get_persistent_magnet_field()
+                    # If leads do not match coil field, match them first
+                    if not math.isclose(output_f, persistent_f, abs_tol=0.01):
+                        self.status.emit("Matching leads to coil...")
+                        self.magnet._set_target_field(persistent_f)
+                        self.magnet.goto_set()
+                        self.msleep(1000)
+                        while self.magnet._get_is_sweeping() and not self.stop_requested:
+                            self.msleep(100)
+                            current_f = self.magnet._get_output_field()
+                            try: volts = self.magnet.voltage()
+                            except Exception: volts = 0.0
+                            try: amps = self.magnet.current()
+                            except Exception: amps = 0.0
+                            self.progress.emit(current_f, volts, amps)
+                        self.magnet.hold()
+                    
+                    if self.stop_requested:
+                        self.magnet.hold()
+                        self.finished.emit()
+                        return
+                        
+                    self.status.emit("Turning switch heater on...")
+                    self.magnet._set_switch_heater('on')
+            else:
+                # Turning OFF
+                # We can only turn off if field is at zero
+                current_field = self.magnet._get_output_field()
+                if abs(current_field) < 0.0005:
+                    self.status.emit("Turning switch heater off...")
+                    self.magnet._set_switch_heater('off')
+                else:
+                    raise RuntimeError(f"Cannot turn off switch heater: field is not at zero ({current_field:.4f} T).")
+
+            self.finished.emit()
+        except Exception as e:
+            self.error.emit(str(e))
 
 class MagnetRampWorker(QtCore.QThread):
-    progress = QtCore.pyqtSignal(float)
+    progress = QtCore.pyqtSignal(float, float, float)
     status = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal()
     error = QtCore.pyqtSignal(str)
@@ -36,9 +101,15 @@ class MagnetRampWorker(QtCore.QThread):
                         self.status.emit("Matching leads to coil...")
                         self.magnet._set_target_field(persistent_f)
                         self.magnet.goto_set()
+                        self.msleep(1000)
                         while self.magnet._get_is_sweeping() and not self.stop_requested:
                             self.msleep(100)
-                            self.progress.emit(self.magnet._get_output_field())
+                            current_f = self.magnet._get_output_field()
+                            try: volts = self.magnet.voltage()
+                            except Exception: volts = 0.0
+                            try: amps = self.magnet.current()
+                            except Exception: amps = 0.0
+                            self.progress.emit(current_f, volts, amps)
                         self.magnet.hold()
                     
                     if self.stop_requested:
@@ -53,20 +124,25 @@ class MagnetRampWorker(QtCore.QThread):
             self.status.emit(f"Ramping to {self.target_field:.4f} T...")
             self.magnet._set_target_field(self.target_field)
             self.magnet.goto_set()
+            self.msleep(1000)
 
             # Loop while sweeping
             while self.magnet._get_is_sweeping() and not self.stop_requested:
                 self.msleep(200)
                 current_val = self.magnet._get_output_field()
-                self.progress.emit(current_val)
+                try: volts = self.magnet.voltage()
+                except Exception: volts = 0.0
+                try: amps = self.magnet.current()
+                except Exception: amps = 0.0
+                self.progress.emit(current_val, volts, amps)
 
             # Hold magnet
             self.magnet.hold()
 
-            # Turn off heater if fitting
-            if getattr(self.magnet, 'SWITCH_HEATER_FITTED', False) and not self.stop_requested:
-                self.status.emit("Turning switch heater off...")
-                self.magnet._set_switch_heater('off')
+            # Turn off heater if fitting (Disabled: persistent mode cannot be enabled)
+            # if getattr(self.magnet, 'SWITCH_HEATER_FITTED', False) and not self.stop_requested:
+            #     self.status.emit("Turning switch heater off...")
+            #     self.magnet._set_switch_heater('off')
 
             self.finished.emit()
         except Exception as e:
@@ -92,7 +168,7 @@ QPushButton:pressed {
 }
 """
 
-class PositionTab(QtWidgets.QWidget):
+class PositionTab(PositionMotionControls, QtWidgets.QWidget):
     """Measurement tab providing stepper and scanner controls.
 
     Left panel: Stepper (X/Y/Z) with directional buttons arranged
@@ -108,26 +184,33 @@ class PositionTab(QtWidgets.QWidget):
         self.magnet_controller = getattr(station, 'magnet', None)
         self.magnet_ramping = False
         self.magnet_worker = None
+        self._scanner_states = {}
+        self._scanner_command_error = ""
+        self.scanner_worker = None
+        self.stepper_worker = None
+        self._stepper_error = ''
         self.setup_ui()
         self.load_storage()
 
         # Initialize magnet UI values
         if self.magnet_controller is not None:
             try:
-                current_field = self.magnet_controller.field()
-                self.magnet_live_field_lbl.setText(f"B = {current_field:.4f} T")
-                
                 target_f = self.magnet_controller.target_field_param()
+                self.magnet_setpoint.blockSignals(True)
                 self.magnet_setpoint.setValue(target_f)
-                
-                rate = self.magnet_controller.field_sweep_rate() / 60.0
-                self.magnet_ramp_rate.setValue(rate)
+                self.magnet_setpoint.blockSignals(False)
             except Exception as e:
-                print(f"Error reading initial magnet values: {e}")
+                print(f"Error reading initial target field: {e}")
+            self.poll_magnet_parameters()
         else:
-            self.magnet_live_field_lbl.setText("B = No Magnet")
+            self.magnet_live_field_lbl.setText("No Magnet")
+            self.magnet_volt_lbl.setText("N/A")
+            self.magnet_amp_lbl.setText("N/A")
+            self.magnet_mode_combo.setEnabled(False)
             self.magnet_setpoint.setEnabled(False)
             self.magnet_ramp_rate.setEnabled(False)
+            self.magnet_zero_btn.setEnabled(False)
+            self.magnet_heater_btn.setEnabled(False)
 
         # Setup polling timer (every 1 second) to refresh actual voltages on sample
         self.polling_timer = QtCore.QTimer(self)
@@ -143,32 +226,72 @@ class PositionTab(QtWidgets.QWidget):
         self.active_direction = 0
         self.is_continuous_moving = False
 
+    def refresh_scanner_readbacks(self):
+        controller = self.scanner_controller
+        lock = getattr(controller, 'comm_lock', None)
+        if lock is not None and not lock.acquire(blocking=False):
+            return
+        try:
+            messages = []
+            for axis, number in (('x', 1), ('y', 2)):
+                label = getattr(self, f'v{axis}_label')
+                spin = getattr(self, f'v{axis}_set_spin')
+                negative, positive = ((self.s_btn_left, self.s_btn_right) if axis == 'x'
+                                      else (self.s_btn_down, self.s_btn_up))
+                try:
+                    if controller is None:
+                        raise RuntimeError('not connected')
+                    state = controller.get_axis_status(number)
+                    offset = float(state['offset'])
+                    output = float(state['output'])
+                    if not math.isfinite(offset) or not math.isfinite(output) or not 0 <= offset <= 150:
+                        raise ValueError('invalid voltage readback')
+                    self._scanner_states[axis] = state
+                    label.setText(f"V{axis}: {offset:.3f} V")
+                    label.setToolTip(f"Controller DC offset: {offset:.3f} V; measured output: {output:.3f} V; mode: {state['mode']}")
+                    if not spin.hasFocus() and not self.scanner_moving():
+                        spin.blockSignals(True)
+                        spin.setValue(offset)
+                        spin.blockSignals(False)
+                    offset_ready = state['mode'] == 'off'
+                    ready = offset_ready and not self.scanner_moving()
+                    spin.setEnabled(ready)
+                    settings = getattr(controller, 'scanner_settings', ScannerSettings())
+                    negative.setEnabled(ready and offset > settings.minimum)
+                    positive.setEnabled(ready and offset < settings.maximum)
+                    mode_text = "offset enabled" if offset_ready else f"mode {state['mode']}"
+                    messages.append(f"{axis.upper()}: output {output:.3f} V, {mode_text}")
+                    if not offset_ready:
+                        messages.append(f"{axis.upper()} is not in offset mode; controls disabled")
+                except Exception as exc:
+                    self._scanner_states.pop(axis, None)
+                    label.setText(f"V{axis}: unavailable")
+                    label.setToolTip(str(exc))
+                    spin.setEnabled(False)
+                    spin.lineEdit().setText('Unavailable')
+                    negative.setEnabled(False)
+                    positive.setEnabled(False)
+                    messages.append(f"{axis.upper()}: {exc}")
+            prefix = 'SIMULATED ANC300' if getattr(controller, 'simulated', False) else 'ANC300 readback'
+            self.scanner_status.setText(prefix + '\n' + '\n'.join(messages)
+                                        + ('\n' + self._scanner_command_error if self._scanner_command_error else ''))
+        finally:
+            if lock is not None:
+                lock.release()
+
     def poll_voltages(self):
-        # Poll scanner voltages
-        if self.scanner_controller is None or getattr(self.scanner_controller, 'simulated', True):
-            # No real scanner, skip voltage polling
-            pass
-        else:
-            try:
-                vx = self.scanner_controller.get_voltage(1)
-                self.vx_label.setText(f"Vx: {vx:.3f} V")
-            except Exception as e:
-                self.vx_label.setText("Vx: Error")
-                print(f"Error polling Vx: {e}")
-            try:
-                vy = self.scanner_controller.get_voltage(2)
-                self.vy_label.setText(f"Vy: {vy:.3f} V")
-            except Exception as e:
-                self.vy_label.setText("Vy: Error")
-                print(f"Error polling Vy: {e}")
+        self.refresh_scanner_readbacks()
+        self.refresh_stepper_coordinates()
+        if self.stepper_moving():
+            return
         # Poll stepper frequencies and amplitudes
         if self.stepper_controller is None:
-            self.sf1_label.setText("Fx: Error")
-            self.sf2_label.setText("Fy: Error")
-            self.sf3_label.setText("Fz: Error")
-            self.am1_label.setText("Ax: Error")
-            self.am2_label.setText("Ay: Error")
-            self.am3_label.setText("Az: Error")
+            self.sf1_label.setText("Fx: N/A")
+            self.sf2_label.setText("Fy: N/A")
+            self.sf3_label.setText("Fz: N/A")
+            self.am1_label.setText("Ax: N/A")
+            self.am2_label.setText("Ay: N/A")
+            self.am3_label.setText("Az: N/A")
         else:
             is_sim = getattr(self.stepper_controller, 'simulated', False)
             axis_chars = {1: 'x', 2: 'y', 3: 'z'}
@@ -179,9 +302,12 @@ class PositionTab(QtWidgets.QWidget):
                         label.setText(f"F{ch}: Simulation")
                     else:
                         freq = getattr(self.stepper_controller, f'frequency_ch{axis}')()
-                        label.setText(f"F{ch}: {freq:.0f} Hz")
+                        if freq > 0:
+                            label.setText(f"F{ch}: {freq:.0f} Hz")
+                        else:
+                            label.setText(f"F{ch}: Off")
                 except Exception:
-                    label.setText(f"F{ch}: Error")
+                    label.setText(f"F{ch}: unavailable")
             for axis, label in zip([1, 2, 3], [self.am1_label, self.am2_label, self.am3_label]):
                 try:
                     ch = axis_chars[axis]
@@ -189,25 +315,87 @@ class PositionTab(QtWidgets.QWidget):
                         label.setText(f"A{ch}: Simulation")
                     else:
                         amp = getattr(self.stepper_controller, f'voltage_ch{axis}')()
-                        label.setText(f"A{ch}: {amp:.1f} V")
+                        if amp > 0:
+                            label.setText(f"A{ch}: {amp:.1f} V")
+                        else:
+                            label.setText(f"A{ch}: Off")
                 except Exception:
-                    label.setText(f"A{ch}: Error")
+                    label.setText(f"A{ch}: unavailable")
 
-        # Poll magnet field if not currently ramping
+        # Poll magnet parameters every 3 ticks (3 seconds) to avoid freezing the GUI
         if self.magnet_controller is not None and not self.magnet_ramping:
-            try:
-                current_field = self.magnet_controller.field()
-                self.magnet_live_field_lbl.setText(f"B = {current_field:.4f} T")
-            except Exception as e:
-                self.magnet_live_field_lbl.setText("B = Error")
-                print(f"Error polling magnet field: {e}")
+            if not hasattr(self, 'magnet_poll_counter'):
+                self.magnet_poll_counter = 0
+            self.magnet_poll_counter += 1
+            if self.magnet_poll_counter >= 3:
+                self.magnet_poll_counter = 0
+                self.poll_magnet_parameters()
+
+    def poll_magnet_parameters(self):
+        if self.magnet_controller is None:
+            return
+        try:
+            current_field = self.magnet_controller.field()
+            self.magnet_live_field_lbl.setText(f"{current_field:.4f} T")
+            
+            voltage = self.magnet_controller.voltage()
+            self.magnet_volt_lbl.setText(f"{voltage:.4f} V")
+            
+            current = self.magnet_controller.current()
+            self.magnet_amp_lbl.setText(f"{current:.4f} A")
+            
+            mode = self.magnet_controller.control_mode()
+            self.magnet_mode_combo.blockSignals(True)
+            self.magnet_mode_combo.setCurrentText(mode)
+            self.magnet_mode_combo.blockSignals(False)
+            
+            rate = self.magnet_controller.field_sweep_rate() / 60.0
+            self.magnet_ramp_rate.blockSignals(True)
+            self.magnet_ramp_rate.setValue(rate)
+            self.magnet_ramp_rate.blockSignals(False)
+            
+            # Activity readback — display only, no automatic commands
+            activity = self.magnet_controller.activity()
+            if activity == 'clamped':
+                self.magnet_activity_lbl.setText("CLAMPED ⚠")
+                self.magnet_activity_lbl.setStyleSheet("color: #dc2626; font-weight: bold;")
+            else:
+                self.magnet_activity_lbl.setText(activity)
+                self.magnet_activity_lbl.setStyleSheet("color: #000000; font-weight: bold;")
+
+            # Switch heater status button update
+            heater_status = self.magnet_controller.switch_heater()
+            self.magnet_heater_btn.setStyleSheet("font-weight: bold; min-height: 25px;")
+            if 'no switch heater' in heater_status:
+                self.magnet_heater_btn.setText("No Heater")
+                self.magnet_heater_btn.setEnabled(False)
+            elif 'on' in heater_status:
+                self.magnet_heater_btn.setText("ON")
+                if abs(current_field) < 0.0005:
+                    self.magnet_heater_btn.setEnabled(True)
+                else:
+                    self.magnet_heater_btn.setEnabled(False)
+            else:
+                self.magnet_heater_btn.setText("OFF")
+                self.magnet_heater_btn.setEnabled(True)
+        except Exception as e:
+            print(f"Error polling magnet parameters: {e}")
+            self.magnet_live_field_lbl.setText("Error")
+            self.magnet_volt_lbl.setText("Error")
+            self.magnet_amp_lbl.setText("Error")
 
     def setup_ui(self):
         # Main layout containing stepper and scanner groups
-        main_layout = QtWidgets.QHBoxLayout(self)
+        outer_layout = QtWidgets.QVBoxLayout(self)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QtWidgets.QWidget()
+        main_layout = QtWidgets.QHBoxLayout(content)
+        scroll.setWidget(content)
+        outer_layout.addWidget(scroll)
 
         # ----- Stepper Group -----
-        stepper_group = QtWidgets.QGroupBox("Stepper")
+        stepper_group = QtWidgets.QGroupBox("Stepper (ANC150)")
         
         # Grid/Cross layout for XY buttons (wrapped in a fixed-size widget to keep it nicely quadratic)
         cross_widget = QtWidgets.QWidget()
@@ -277,7 +465,7 @@ class PositionTab(QtWidgets.QWidget):
             f_polled_label = getattr(self, f'sf{axis}_label')
             f_edit = QtWidgets.QLineEdit()
             f_edit.setPlaceholderText("Set Hz")
-            f_edit.setValidator(QtGui.QIntValidator(1, 8000))
+            f_edit.setValidator(QtGui.QIntValidator(1, 100))
             f_edit.setFixedWidth(55)
             f_edit.returnPressed.connect(lambda ax=axis, edit=f_edit: self.set_stepper_frequency(ax, edit))
             self.f_edits.append(f_edit)
@@ -286,7 +474,7 @@ class PositionTab(QtWidgets.QWidget):
             a_polled_label = getattr(self, f'am{axis}_label')
             a_edit = QtWidgets.QLineEdit()
             a_edit.setPlaceholderText("Set V")
-            a_edit.setValidator(QtGui.QIntValidator(0, 70))
+            a_edit.setValidator(QtGui.QIntValidator(0, 120))
             a_edit.setFixedWidth(55)
             a_edit.returnPressed.connect(lambda ax=axis, edit=a_edit: self.set_stepper_amplitude(ax, edit))
             self.a_edits.append(a_edit)
@@ -301,11 +489,12 @@ class PositionTab(QtWidgets.QWidget):
             self.stepper_params_layout.addWidget(QtWidgets.QLabel("V"), i, 5)
             
         stepper_group_layout.addLayout(self.stepper_params_layout)
+        self.build_stepper_motion_ui(stepper_group_layout)
         stepper_group_layout.addStretch() # Push everything to the top
         stepper_group.setLayout(stepper_group_layout)
 
         # ----- Scanner Group -----
-        scanner_group = QtWidgets.QGroupBox("Scanner")
+        scanner_group = QtWidgets.QGroupBox("Scanner (ANC300)")
         # XY cross layout (wrapped in a fixed-size widget to keep it nicely quadratic)
         scanner_cross_widget = QtWidgets.QWidget()
         scanner_cross_widget.setFixedSize(160, 160)
@@ -334,17 +523,66 @@ class PositionTab(QtWidgets.QWidget):
         scanner_step_layout.addWidget(self.s_step_size_edit)
         
         # Voltage display (below step size)
-        voltage_layout = QtWidgets.QVBoxLayout()
-        self.vx_label = QtWidgets.QLabel("Vx: 0.0 V")
-        self.vy_label = QtWidgets.QLabel("Vy: 0.0 V")
-        voltage_layout.addWidget(self.vx_label)
-        voltage_layout.addWidget(self.vy_label)
+        scanner_volt_layout = QtWidgets.QGridLayout()
+        scanner_volt_layout.setSpacing(6)
+
+        self.vx_label = QtWidgets.QLabel("Vx: awaiting readback")
+        self.vx_label.setStyleSheet("font-weight: bold; color: #000000;")
+        scanner_volt_layout.addWidget(self.vx_label, 0, 0)
+
+        self.vx_set_spin = QtWidgets.QDoubleSpinBox()
+        self.vx_set_spin.setRange(-10000.0, 10000.0)
+        self.vx_set_spin.setDecimals(3)
+        self.vx_set_spin.setSingleStep(0.1)
+        self.vx_set_spin.setSuffix(" V")
+        self.vx_set_spin.setKeyboardTracking(False)
+        self.vx_set_spin.lineEdit().returnPressed.connect(self.on_scanner_vx_enter)
+        scanner_volt_layout.addWidget(self.vx_set_spin, 0, 1)
+
+        self.vy_label = QtWidgets.QLabel("Vy: awaiting readback")
+        self.vy_label.setStyleSheet("font-weight: bold; color: #000000;")
+        scanner_volt_layout.addWidget(self.vy_label, 1, 0)
+
+        self.vy_set_spin = QtWidgets.QDoubleSpinBox()
+        self.vy_set_spin.setRange(-10000.0, 10000.0)
+        self.vy_set_spin.setDecimals(3)
+        self.vy_set_spin.setSingleStep(0.1)
+        self.vy_set_spin.setSuffix(" V")
+        self.vy_set_spin.setKeyboardTracking(False)
+        self.vy_set_spin.lineEdit().returnPressed.connect(self.on_scanner_vy_enter)
+        scanner_volt_layout.addWidget(self.vy_set_spin, 1, 1)
         
-        # Combine scanner layouts vertically: buttons, then step size, then voltage
+        # Reset scanner communication button
+        self.btn_reset_scanner = QtWidgets.QPushButton("🔄 Reset Scanner Comm")
+        self.btn_reset_scanner.setStyleSheet("""
+            QPushButton {
+                background-color: #f3f4f6;
+                color: #1f2937;
+                border: 1px solid #d1d5db;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #e5e7eb;
+            }
+            QPushButton:pressed {
+                background-color: #d1d5db;
+            }
+        """)
+        self.btn_reset_scanner.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.btn_reset_scanner.clicked.connect(self.on_reset_scanner_clicked)
+
+        # Combine scanner layouts vertically: buttons, step size, voltage inputs, reset button
         scanner_group_layout = QtWidgets.QVBoxLayout()
         scanner_group_layout.addWidget(scanner_cross_widget) # Buttons on top
         scanner_group_layout.addLayout(scanner_step_layout) # Then step size
-        scanner_group_layout.addLayout(voltage_layout) # Then voltage
+        scanner_group_layout.addLayout(scanner_volt_layout) # Then voltage inputs
+        self.scanner_status = QtWidgets.QLabel("Reading ANC300 voltages...")
+        self.scanner_status.setWordWrap(True)
+        scanner_group_layout.addWidget(self.scanner_status)
+        self.build_scanner_motion_ui(scanner_group_layout)
+        scanner_group_layout.addWidget(self.btn_reset_scanner) # Reset comm button
         scanner_group_layout.addStretch() # Push everything to the top
         scanner_group.setLayout(scanner_group_layout)
 
@@ -352,10 +590,11 @@ class PositionTab(QtWidgets.QWidget):
         magnet_group = QtWidgets.QGroupBox("Magnet")
         magnet_group_layout = QtWidgets.QVBoxLayout()
         
-        # Grid for Setpoint and Ramp Rate
+        # Grid for Setpoint, Ramp Rate, and Readbacks
         mag_grid = QtWidgets.QGridLayout()
         mag_grid.setSpacing(6)
         
+        # Setpoint
         mag_grid.addWidget(QtWidgets.QLabel("Setpoint (T):"), 0, 0)
         self.magnet_setpoint = QtWidgets.QDoubleSpinBox()
         self.magnet_setpoint.setRange(-15.0, 15.0)
@@ -367,33 +606,80 @@ class PositionTab(QtWidgets.QWidget):
         self.magnet_setpoint.valueChanged.connect(lambda _: self.save_storage())
         mag_grid.addWidget(self.magnet_setpoint, 0, 1)
         
+        # Ramp Rate (Read-only as requested)
         mag_grid.addWidget(QtWidgets.QLabel("Ramp Rate (T/s):"), 1, 0)
         self.magnet_ramp_rate = QtWidgets.QDoubleSpinBox()
-        self.magnet_ramp_rate.setRange(0.0001, 0.0175)
+        self.magnet_ramp_rate.setRange(0.0001, 10.0)
         self.magnet_ramp_rate.setDecimals(4)
-        self.magnet_ramp_rate.setSingleStep(0.0001)
-        self.magnet_ramp_rate.setValue(0.0083)
-        self.magnet_ramp_rate.setKeyboardTracking(False)
-        self.magnet_ramp_rate.valueChanged.connect(lambda _: self.save_storage())
+        self.magnet_ramp_rate.setReadOnly(True)
+        self.magnet_ramp_rate.setEnabled(False)
         mag_grid.addWidget(self.magnet_ramp_rate, 1, 1)
+
+        # Voltage (V) readback
+        mag_grid.addWidget(QtWidgets.QLabel("Voltage:"), 2, 0)
+        self.magnet_volt_lbl = QtWidgets.QLabel("-- V")
+        self.magnet_volt_lbl.setStyleSheet("color: #000000; font-weight: bold;")
+        mag_grid.addWidget(self.magnet_volt_lbl, 2, 1)
+
+        # Current (A) readback
+        mag_grid.addWidget(QtWidgets.QLabel("Current:"), 3, 0)
+        self.magnet_amp_lbl = QtWidgets.QLabel("-- A")
+        self.magnet_amp_lbl.setStyleSheet("color: #000000; font-weight: bold;")
+        mag_grid.addWidget(self.magnet_amp_lbl, 3, 1)
+
+        # Field (T) readback
+        mag_grid.addWidget(QtWidgets.QLabel("Field:"), 4, 0)
+        self.magnet_live_field_lbl = QtWidgets.QLabel("-- T")
+        self.magnet_live_field_lbl.setStyleSheet("color: #000000; font-weight: bold;")
+        mag_grid.addWidget(self.magnet_live_field_lbl, 4, 1)
+
+        # IPS Mode Selection
+        mag_grid.addWidget(QtWidgets.QLabel("IPS Mode:"), 5, 0)
+        self.magnet_mode_combo = QtWidgets.QComboBox()
+        self.magnet_mode_combo.addItems([
+            'Local & Locked',
+            'Remote & Locked',
+            'Local & Unlocked',
+            'Remote & Unlocked'
+        ])
+        self.magnet_mode_combo.currentTextChanged.connect(self.on_magnet_mode_changed)
+        mag_grid.addWidget(self.magnet_mode_combo, 5, 1)
+        
+        # Switch Heater Button (placed below IPS Mode, in the same style)
+        mag_grid.addWidget(QtWidgets.QLabel("Switch Heater:"), 6, 0)
+        self.magnet_heater_btn = QtWidgets.QPushButton("Heater: --")
+        self.magnet_heater_btn.clicked.connect(self.on_magnet_heater_clicked)
+        self.magnet_heater_btn.setStyleSheet("font-weight: bold; min-height: 25px;")
+        mag_grid.addWidget(self.magnet_heater_btn, 6, 1)
+
+        # Activity readback
+        mag_grid.addWidget(QtWidgets.QLabel("Activity:"), 7, 0)
+        self.magnet_activity_lbl = QtWidgets.QLabel("--")
+        self.magnet_activity_lbl.setStyleSheet("color: #000000; font-weight: bold;")
+        mag_grid.addWidget(self.magnet_activity_lbl, 7, 1)
         
         magnet_group_layout.addLayout(mag_grid)
         
-        # Magnet field display
-        self.magnet_live_field_lbl = QtWidgets.QLabel("B = -- T")
-        self.magnet_live_field_lbl.setStyleSheet("color: #000000; font-weight: bold;")
-        magnet_group_layout.addWidget(self.magnet_live_field_lbl)
-        
-        # Status Label and Stop Button
+        # Status Label
         self.magnet_status_lbl = QtWidgets.QLabel("Status: Idle")
         self.magnet_status_lbl.setStyleSheet("color: #000000; font-weight: bold; font-size: 11px;")
         magnet_group_layout.addWidget(self.magnet_status_lbl)
+        
+        # Buttons layout
+        btn_layout = QtWidgets.QHBoxLayout()
+        
+        self.magnet_zero_btn = QtWidgets.QPushButton("Go to Zero")
+        self.magnet_zero_btn.setStyleSheet("background-color: #059669; color: #ffffff; border: 1px solid #059669; font-weight: bold; min-height: 25px; border-radius: 0px;")
+        self.magnet_zero_btn.clicked.connect(self.on_magnet_zero_clicked)
+        btn_layout.addWidget(self.magnet_zero_btn)
         
         self.magnet_stop_btn = QtWidgets.QPushButton("Stop Ramp")
         self.magnet_stop_btn.setEnabled(False)
         self.magnet_stop_btn.setStyleSheet("background-color: #000000; color: #ffffff; border: 1px solid #000000; font-weight: bold; min-height: 25px; border-radius: 0px;")
         self.magnet_stop_btn.clicked.connect(self.on_magnet_stop_clicked)
-        magnet_group_layout.addWidget(self.magnet_stop_btn)
+        btn_layout.addWidget(self.magnet_stop_btn)
+        
+        magnet_group_layout.addLayout(btn_layout)
         
         magnet_group_layout.addStretch()
         magnet_group.setLayout(magnet_group_layout)
@@ -407,7 +693,6 @@ class PositionTab(QtWidgets.QWidget):
         # Add groups and sublayouts to main layout
         main_layout.addLayout(left_column_layout)
         main_layout.addWidget(scanner_group, alignment=QtCore.Qt.AlignmentFlag.AlignTop)
-        self.setLayout(main_layout)
         # Connect signals for stepper buttons (with long-press continuous move support)
         self.btn_up.pressed.connect(lambda: self.on_button_pressed(self.btn_up, 'y', +1))
         self.btn_up.released.connect(lambda: self.on_button_released(self.btn_up, 'y', +1))
@@ -433,7 +718,6 @@ class PositionTab(QtWidgets.QWidget):
         self.s_btn_left.clicked.connect(lambda: self.move_scanner('x', -1))
         self.s_btn_right.clicked.connect(lambda: self.move_scanner('x', +1))
         
-        self.load_storage()
 
 
 
@@ -443,65 +727,81 @@ class PositionTab(QtWidgets.QWidget):
         except ValueError:
             return 0.0
 
-    # ----- Placeholder hardware interaction -----
     def move_stepper(self, axis: str, direction: int):
-        if self.stepper_controller is None:
-            print("Stepper controller not initialized.")
-            return
-        # Map axis letters to driver axis numbers (1=x, 2=y, 3=z)
-        axis_map = {'x': 1, 'y': 2, 'z': 3}
-        driver_axis = axis_map.get(axis.lower())
-        if driver_axis is None:
-            print(f"Unknown axis {axis} for stepper.")
-            return
-        # A quick click triggers exactly 1 step in the specified direction
-        try:
-            self.stepper_controller.step(driver_axis, direction)
-        except Exception as e:
-            print(f"Failed to move stepper: {e}")
+        self.start_stepper_motion(targets={dict(x=1, y=2, z=3)[axis]: direction}, relative=True)
+
+    def _change_scanner_voltage(self, axis, *, target=None, delta=None):
+        self.start_scanner_motion({dict(x=1, y=2, z=3)[axis]: delta if delta is not None else target},
+                                  relative=delta is not None)
 
     def move_scanner(self, axis: str, direction: int):
-        step = self._get_step(self.s_step_size_edit)
-        if self.scanner_controller is None:
-            print("Scanner controller not initialized.")
-            return
-        # Map axis letters to driver axis numbers (1=x, 2=y, 3=z)
-        axis_map = {'x': 1, 'y': 2, 'z': 3}
-        driver_axis = axis_map.get(axis.lower())
-        if driver_axis is None:
-            print(f"Unknown axis {axis} for scanner.")
-            return
-        # Current voltage from driver (fallback to displayed value if driver missing)
         try:
-            current_volt = self.scanner_controller.get_voltage(driver_axis)
-        except Exception:
-            # Fallback: parse from label
-            try:
-                if axis == 'x':
-                    current_volt = float(self.vx_label.text().split(':')[1].split()[0])
-                else:
-                    current_volt = float(self.vy_label.text().split(':')[1].split()[0])
-            except Exception:
-                current_volt = 0.0
-        new_volt = current_volt + direction * step
-        # Clamp between 0.0 and 150.0
-        new_volt = max(0.0, min(150.0, new_volt))
-        if new_volt == current_volt:
+            step = float(self.s_step_size_edit.text())
+            if not math.isfinite(step) or step <= 0 or direction not in (-1, 1):
+                raise ValueError('Use a positive finite step size.')
+        except ValueError as exc:
+            self.scanner_status.setText(str(exc))
             return
+        self._change_scanner_voltage(axis.lower(), delta=direction * step)
+
+    def set_scanner_voltage(self, axis: str, target_volt: float):
+        self._change_scanner_voltage(axis.lower(), target=target_volt)
+
+    def on_scanner_vx_enter(self):
+        if hasattr(self, 'vx_set_spin'):
+            val = self.vx_set_spin.value()
+            self.set_scanner_voltage('x', val)
+
+    def on_scanner_vy_enter(self):
+        if hasattr(self, 'vy_set_spin'):
+            val = self.vy_set_spin.value()
+            self.set_scanner_voltage('y', val)
+
+    def on_reset_scanner_clicked(self):
+        if self.scanner_controller is None or getattr(self.scanner_controller, 'simulated', True):
+            QtWidgets.QMessageBox.information(
+                self, "Scanner Reset",
+                "Scanner controller is simulated or not initialized."
+            )
+            return
+        
         try:
-            self.scanner_controller.set_voltage(driver_axis, new_volt)
-            # Update displayed voltages and save storage only on success
-            if axis == 'x':
-                self.vx_label.setText(f"Vx: {new_volt:.3f} V")
-            elif axis == 'y':
-                self.vy_label.setText(f"Vy: {new_volt:.3f} V")
-            self.save_storage()
+            success = False
+            if hasattr(self.scanner_controller, 'reset_communication'):
+                success = self.scanner_controller.reset_communication()
+            else:
+                lock = getattr(self.scanner_controller, 'comm_lock', None)
+                if lock:
+                    with lock:
+                        if hasattr(self.scanner_controller, '_clear_input_buffer'):
+                            self.scanner_controller._clear_input_buffer()
+                        if hasattr(self.scanner_controller, 'visa_handle') and self.scanner_controller.visa_handle:
+                            try:
+                                self.scanner_controller.visa_handle.clear()
+                            except Exception:
+                                pass
+                success = True
+
+            if success:
+                # Force immediate re-poll of scanner voltages
+                self.poll_voltages()
+                QtWidgets.QMessageBox.information(
+                    self, "Scanner Reset",
+                    "Scanner communication reset successfully!"
+                )
+            else:
+                QtWidgets.QMessageBox.warning(
+                    self, "Scanner Reset",
+                    "Failed to reset scanner communication. Please check hardware connection."
+                )
         except Exception as e:
-            print(f"Failed to set scanner voltage: {e}")
+            QtWidgets.QMessageBox.critical(
+                self, "Scanner Reset Error",
+                f"Error resetting scanner communication:\n{e}"
+            )
 
     def load_storage(self):
-        storage_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "value_storage")
-        vx, vy = 0.0, 0.0
+        storage_path = os.path.join(parent_dir, "value_storage")
         magnet_setpoint = 0.0
         magnet_ramp_rate = 0.0083
         try:
@@ -509,56 +809,49 @@ class PositionTab(QtWidgets.QWidget):
                 with open(storage_path, "r") as f:
                     data = json.load(f)
                 if "position" in data:
-                    vx = data["position"].get("vx", 0.0)
-                    vy = data["position"].get("vy", 0.0)
                     magnet_setpoint = data["position"].get("magnet_setpoint", 0.0)
                     magnet_ramp_rate = data["position"].get("magnet_ramp_rate", 0.0083)
         except Exception as e:
             print(f"Error loading value_storage in PositionTab: {e}")
-        self.vx_label.setText(f"Vx: {vx:.3f} V")
-        self.vy_label.setText(f"Vy: {vy:.3f} V")
-        
+        # Saved offsets describe an old session, not the controller's present
+        # output. Opening/reloading this tab reads hardware and never sets it.
+        self.sync_scanner_settings()
+        self.refresh_scanner_readbacks()
+
         # Restore magnet UI values from storage
         self.magnet_setpoint.blockSignals(True)
         self.magnet_setpoint.setValue(magnet_setpoint)
         self.magnet_setpoint.blockSignals(False)
 
-        self.magnet_ramp_rate.blockSignals(True)
-        self.magnet_ramp_rate.setValue(magnet_ramp_rate)
-        self.magnet_ramp_rate.blockSignals(False)
-
     def save_storage(self):
-        storage_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "value_storage")
+        storage_path = os.path.join(parent_dir, "value_storage")
         try:
-            # Parse Vx and Vy from labels
-            try:
-                vx = float(self.vx_label.text().split(':')[1].split()[0])
-            except Exception:
-                vx = 0.0
-            try:
-                vy = float(self.vy_label.text().split(':')[1].split()[0])
-            except Exception:
-                vy = 0.0
-
             data = {}
             if os.path.exists(storage_path):
                 with open(storage_path, "r") as f:
                     data = json.load(f)
             if "position" not in data:
                 data["position"] = {}
-            data["position"]["vx"] = vx
-            data["position"]["vy"] = vy
+            from dataclasses import asdict
+            # Routine tab/close saves must not silently replace rejected safety
+            # settings with defaults. Only an explicit Apply repairs them.
+            if self.scanner_controller is not None and not self.scanner_controller.scanner_settings_error:
+                data["position"]["scanner_safety"] = asdict(self.scanner_controller.scanner_settings)
             data["position"]["magnet_setpoint"] = self.magnet_setpoint.value()
             data["position"]["magnet_ramp_rate"] = self.magnet_ramp_rate.value()
             with open(storage_path, "w") as f:
                 json.dump(data, f, indent=4)
+            return True
         except Exception as e:
             print(f"Error saving value_storage in PositionTab: {e}")
+            return False
 
     def reload_gui_from_storage(self):
         self.load_storage()
 
     def on_button_pressed(self, btn, axis: str, direction: int):
+        if self.stepper_moving():
+            return
         self.active_button = btn
         self.active_axis = axis
         self.active_direction = direction
@@ -581,32 +874,11 @@ class PositionTab(QtWidgets.QWidget):
             self.start_continuous_stepper(self.active_axis, self.active_direction)
 
     def start_continuous_stepper(self, axis: str, direction: int):
-        if self.stepper_controller is None:
-            print("Stepper controller not initialized for continuous move.")
-            return
-        axis_map = {'x': 1, 'y': 2, 'z': 3}
-        driver_axis = axis_map.get(axis.lower())
-        if driver_axis is None:
-            return
-        try:
-            if hasattr(self.stepper_controller, 'start_continuous'):
-                self.stepper_controller.start_continuous(driver_axis, direction)
-            else:
-                print("start_continuous method not supported by the driver.")
-        except Exception as e:
-            print(f"Failed to start continuous stepper move: {e}")
+        # Repeated single pulses keep the pseudo-coordinate countable.
+        self.start_stepper_motion(jog=(dict(x=1, y=2, z=3)[axis], direction))
 
     def stop_continuous_stepper(self, axis: str):
-        if self.stepper_controller is None:
-            return
-        axis_map = {'x': 1, 'y': 2, 'z': 3}
-        driver_axis = axis_map.get(axis.lower())
-        if driver_axis is None:
-            return
-        try:
-            self.stepper_controller.stop(driver_axis)
-        except Exception as e:
-            print(f"Failed to stop continuous stepper move: {e}")
+        self.stop_stepper_motion()
 
     def set_stepper_frequency(self, axis: int, edit: QtWidgets.QLineEdit):
         if self.stepper_controller is None:
@@ -617,13 +889,13 @@ class PositionTab(QtWidgets.QWidget):
             return
         try:
             val = int(text)
+            if not 1 <= val <= 100:
+                raise ValueError('Stepper frequency must be 1 to 100 Hz.')
             getattr(self.stepper_controller, f'frequency_ch{axis}')(val)
             edit.clear()
             edit.clearFocus()
-        except ValueError:
-            pass
         except Exception as e:
-            print(f"Failed to set stepper frequency: {e}")
+            self.stepper_status.setText(f"Failed to set stepper frequency: {e}")
 
     def set_stepper_amplitude(self, axis: int, edit: QtWidgets.QLineEdit):
         if self.stepper_controller is None:
@@ -634,13 +906,13 @@ class PositionTab(QtWidgets.QWidget):
             return
         try:
             val = float(text)
+            if not math.isfinite(val) or not 0 <= val <= 120:
+                raise ValueError('Stepper amplitude must be 0 to 120 V.')
             getattr(self.stepper_controller, f'voltage_ch{axis}')(val)
             edit.clear()
             edit.clearFocus()
-        except ValueError:
-            pass
         except Exception as e:
-            print(f"Failed to set stepper amplitude: {e}")
+            self.stepper_status.setText(f"Failed to set stepper amplitude: {e}")
 
     def on_magnet_setpoint_enter(self):
         """Triggered when user presses Enter inside the magnet setpoint spinbox."""
@@ -653,6 +925,9 @@ class PositionTab(QtWidgets.QWidget):
         self.magnet_ramping = True
         self.magnet_setpoint.setEnabled(False)
         self.magnet_ramp_rate.setEnabled(False)
+        self.magnet_mode_combo.setEnabled(False)
+        self.magnet_zero_btn.setEnabled(False)
+        self.magnet_heater_btn.setEnabled(False)
         self.magnet_stop_btn.setEnabled(True)
         self.magnet_status_lbl.setText(f"Status: Starting ramp to {target:.4f} T...")
         
@@ -663,8 +938,10 @@ class PositionTab(QtWidgets.QWidget):
         self.magnet_worker.error.connect(self.on_magnet_ramp_error)
         self.magnet_worker.start()
 
-    def on_magnet_progress(self, val):
-        self.magnet_live_field_lbl.setText(f"B = {val:.4f} T")
+    def on_magnet_progress(self, val, volts, amps):
+        self.magnet_live_field_lbl.setText(f"{val:.4f} T")
+        self.magnet_volt_lbl.setText(f"{volts:.4f} V")
+        self.magnet_amp_lbl.setText(f"{amps:.4f} A")
         target = self.magnet_setpoint.value()
         self.magnet_status_lbl.setText(f"Ramping to {target:.4f} T (Currently at {val:.4f} T)")
 
@@ -676,23 +953,25 @@ class PositionTab(QtWidgets.QWidget):
             self.magnet_status_lbl.setText("Status: Ramping stopped/interrupted.")
         else:
             self.magnet_status_lbl.setText("Status: Ramping complete.")
-            if self.magnet_controller is not None:
-                try:
-                    current_field = self.magnet_controller.field()
-                    self.magnet_live_field_lbl.setText(f"B = {current_field:.4f} T")
-                except Exception:
-                    pass
         
+        self.poll_magnet_parameters()
         self.magnet_ramping = False
         self.magnet_setpoint.setEnabled(True)
-        self.magnet_ramp_rate.setEnabled(True)
+        self.magnet_ramp_rate.setEnabled(False)
+        self.magnet_mode_combo.setEnabled(True)
+        self.magnet_zero_btn.setEnabled(True)
+        self.magnet_heater_btn.setEnabled(True)
         self.magnet_stop_btn.setEnabled(False)
 
     def on_magnet_ramp_error(self, err_msg):
         self.magnet_status_lbl.setText("Status: Ramping error.")
+        self.poll_magnet_parameters()
         self.magnet_ramping = False
         self.magnet_setpoint.setEnabled(True)
-        self.magnet_ramp_rate.setEnabled(True)
+        self.magnet_ramp_rate.setEnabled(False)
+        self.magnet_mode_combo.setEnabled(True)
+        self.magnet_zero_btn.setEnabled(True)
+        self.magnet_heater_btn.setEnabled(True)
         self.magnet_stop_btn.setEnabled(False)
         QtWidgets.QMessageBox.critical(self, "Magnet Ramping Error", f"Error ramping magnet:\n{err_msg}")
 
@@ -700,3 +979,49 @@ class PositionTab(QtWidgets.QWidget):
         if self.magnet_worker:
             self.magnet_worker.stop()
             self.magnet_status_lbl.setText("Status: Interrupting ramp...")
+
+    def on_magnet_zero_clicked(self):
+        """Action triggered by the 'Go to Zero' button."""
+        if self.magnet_controller is None:
+            return
+        self.magnet_setpoint.setValue(0.0)
+        self.on_magnet_setpoint_enter()
+
+    def on_magnet_mode_changed(self, text):
+        """Triggered when the user changes the IPS Mode combobox selection."""
+        if self.magnet_controller is None:
+            return
+        try:
+            self.magnet_controller.control_mode(text)
+            self.magnet_status_lbl.setText(f"Status: Mode set to {text}")
+        except Exception as e:
+            print(f"Error setting control mode: {e}")
+            self.magnet_status_lbl.setText("Status: Error setting mode")
+
+    def on_magnet_heater_clicked(self):
+        """Action triggered by the switch heater button."""
+        if self.magnet_controller is None:
+            return
+        
+        heater_status = self.magnet_controller.switch_heater()
+        target_state = 'off' if 'on' in heater_status else 'on'
+        
+        self.magnet_ramping = True
+        self.magnet_setpoint.setEnabled(False)
+        self.magnet_ramp_rate.setEnabled(False)
+        self.magnet_mode_combo.setEnabled(False)
+        self.magnet_zero_btn.setEnabled(False)
+        self.magnet_heater_btn.setEnabled(False)
+        self.magnet_stop_btn.setEnabled(True)
+        
+        if target_state == 'on':
+            self.magnet_status_lbl.setText("Status: Starting switch heater activation...")
+        else:
+            self.magnet_status_lbl.setText("Status: Starting switch heater shutdown...")
+            
+        self.magnet_worker = SwitchHeaterWorker(self.magnet_controller, target_state, parent=self)
+        self.magnet_worker.progress.connect(self.on_magnet_progress)
+        self.magnet_worker.status.connect(self.on_magnet_status)
+        self.magnet_worker.finished.connect(self.on_magnet_ramp_finished)
+        self.magnet_worker.error.connect(self.on_magnet_ramp_error)
+        self.magnet_worker.start()

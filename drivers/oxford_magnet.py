@@ -23,7 +23,7 @@ class OxfordMagnet(VisaInstrument):
     MAX_SWEEP_RATE_HIGH_B = 1.05
     MAX_SWEEP_RATE_LOW_B = 1.05
     MIDPOINT_B = 8  # Tesla
-    SWITCH_HEATER_FITTED = False
+    SWITCH_HEATER_FITTED = False  # This magnet (H8 state) has no controllable switch heater
     SLEEPTIME = 0.1
     TIMEOUT = 10000
 
@@ -47,8 +47,9 @@ class OxfordMagnet(VisaInstrument):
         self._sim_current_field = 0.0
         self._sim_target_field = 0.0
         self._sim_sweep_rate = 1.0  # T/min
-        self._sim_switch_heater = 'off'
+        self._sim_switch_heater = 'on'
         self._sim_persistent_field = 0.0
+        self._sim_control_mode = 'Remote & Locked'
         self._sim_activity = 'hold'
         self._sim_start_time = time.time()
         self._sim_start_field = 0.0
@@ -104,6 +105,28 @@ class OxfordMagnet(VisaInstrument):
         self.add_parameter('is_sweeping',
                            label='Is Sweeping',
                            get_cmd=self._get_is_sweeping)
+
+        self.add_parameter('voltage',
+                           label='Output Voltage',
+                           unit='V',
+                           get_cmd=self._get_voltage)
+
+        self.add_parameter('current',
+                           label='Output Current',
+                           unit='A',
+                           get_cmd=self._get_current)
+
+        self.add_parameter('control_mode',
+                           label='Control Mode',
+                           get_cmd=self._get_control_mode,
+                           set_cmd=self._set_control_mode)
+
+        # Ensure instrument is in a remotely-operable state at startup
+        if not self.simulated:
+            try:
+                self.ensure_operable()
+            except Exception as e:
+                log.warning(f"Could not ensure operable state at startup: {e}")
 
     def get_idn(self) -> dict:
         if getattr(self, 'simulated', False):
@@ -173,8 +196,30 @@ class OxfordMagnet(VisaInstrument):
                 except Exception:
                     pass
                 raise e
+            
             if res.startswith('?'):
-                raise RuntimeError('Error raised by magnet: ' + res)
+                # If command rejected, check if we are in Local mode and auto-switch to Remote and retry
+                if cmd != 'C1' and not cmd.startswith('C'):
+                    try:
+                        self.visa_handle.write('X')
+                        time.sleep(self.SLEEPTIME)
+                        x_res = self.visa_handle.read()
+                        idx = x_res.find('C')
+                        if idx != -1 and idx + 1 < len(x_res) and x_res[idx+1] in ('0', '2'):
+                            log.warning("Detected Local mode upon command rejection. Automatically switching to Remote mode...")
+                            self.visa_handle.write('C1')
+                            time.sleep(self.SLEEPTIME)
+                            self.visa_handle.read()
+                            
+                            # Retry the original command
+                            self.visa_handle.write(cmd)
+                            time.sleep(self.SLEEPTIME)
+                            res = self.visa_handle.read()
+                    except Exception as ex:
+                        log.error(f"Failed to auto-switch to Remote mode: {ex}")
+                
+                if res.startswith('?'):
+                    raise RuntimeError('Error raised by magnet: ' + res)
 
     # Parameter getter/setter methods
     def _get_output_field(self) -> float:
@@ -214,36 +259,57 @@ class OxfordMagnet(VisaInstrument):
             return
         self._write(f'T{val}')
 
+    def _parse_status_digit(self, char: str) -> int:
+        res = self._query('X')
+        idx = res.find(char)
+        if idx != -1 and idx + 1 < len(res):
+            try:
+                return int(res[idx+1])
+            except ValueError:
+                pass
+        raise ValueError(f"Character {char} not found or index out of range in status string: {res}")
+
     def _get_switch_heater(self) -> str:
         if self.simulated:
             return self._sim_switch_heater
-        if not self.SWITCH_HEATER_FITTED:
-            return 'no switch heater'
-        res = self._query('X')
-        state = int(res[8])
+        try:
+            state = self._parse_status_digit('H')
+        except Exception:
+            state = 8
         return {0: 'off (magnet at zero)',
                 1: 'on',
                 2: 'off (magnet at field)',
                 4: 'fault (heater off, switch open)',
-                5: 'fault (heater on, switch closed)'}.get(state, 'unknown')
+                5: 'fault (heater on, switch closed)',
+                8: 'no switch heater'}.get(state, 'unknown')
 
     def _set_switch_heater(self, val: str) -> None:
+        if val == 'off':
+            try:
+                current_field = self._get_output_field()
+            except Exception:
+                current_field = 0.0
+            if abs(current_field) >= 0.0005:
+                log.warning(f"Attempted to turn off switch heater, but field is not at zero ({current_field:.4f} T). Command ignored.")
+                return
         if self.simulated:
             self._sim_switch_heater = val
             return
         if not self.SWITCH_HEATER_FITTED:
             return
-        map_ = {'off': 0, 'on': 1}
+        # H2 = heater on (no PSU=magnet current check required via GPIB)
+        # H0 = heater off
+        map_ = {'off': 0, 'on': 2}
         if val in ['on', 'off']:
             self._write(f'H{map_[val]}')
             self.output_handle.write('Changing switch heater... ')
             time.sleep(self.MIN_SWITCH_HEATER_WAIT_TIME)
             t0 = time.time()
             while (not self._get_switch_heater().startswith(val) and
-                   time.time() <= t0 + self.TIMEOUT):
+                   time.time() <= t0 + 30.0):
                 time.sleep(.1)
             self.output_handle.write('Done.\n')
-            if time.time() > t0 + self.TIMEOUT:
+            if time.time() > t0 + 30.0:
                 log.warning('Wait while changing switch heater timed out.')
         else:
             raise ValueError("Value must be 'on' or 'off'.")
@@ -252,22 +318,94 @@ class OxfordMagnet(VisaInstrument):
         if self.simulated:
             self._update_simulated_sweep()
             return self._sim_activity
-        res = self._query('X')
-        pos4 = int(res[4])
+        try:
+            pos4 = self._parse_status_digit('A')
+        except Exception:
+            pos4 = 0
         return {0: 'hold', 1: 'to set point', 2: 'to zero', 4: 'clamped'}.get(pos4, 'unknown')
 
     def _get_is_sweeping(self) -> bool:
         if self.simulated:
             self._update_simulated_sweep()
             return self._sim_activity in ['to set point', 'to zero']
-        res = self._query('X')
-        val = int(res[11])
+        try:
+            res = self._query('X')
+            idx = res.find('M')
+            if idx != -1 and idx + 2 < len(res):
+                val = int(res[idx+2])
+            else:
+                val = 0
+        except Exception:
+            val = 0
         if val == 0:
             return False
         elif val in [1, 2, 3]:
             return True
         else:
-            raise IOError(f'Unexpected output from device: {res}')
+            return False
+
+    def _get_voltage(self) -> float:
+        if self.simulated:
+            return 0.5 if self._sim_activity in ['to set point', 'to zero'] else 0.0
+        res = self._query('R1')  # R1 = output voltage (V)
+        return float(res[1:])
+
+    def _get_current(self) -> float:
+        if self.simulated:
+            self._update_simulated_sweep()
+            return self._sim_current_field * 11.5
+        res = self._query('R2')  # R2 = output current (A)
+        return float(res[1:])
+
+    def _get_control_mode(self) -> str:
+        if self.simulated:
+            return self._sim_control_mode
+        try:
+            state = self._parse_status_digit('C')
+        except Exception:
+            state = 1  # default fallback to Remote & Locked
+        return {0: 'Local & Locked',
+                1: 'Remote & Locked',
+                2: 'Local & Unlocked',
+                3: 'Remote & Unlocked'}.get(state, 'unknown')
+
+    def _set_control_mode(self, val: str) -> None:
+        if self.simulated:
+            self._sim_control_mode = val
+            return
+        map_ = {
+            'Local & Locked': 0,
+            'Remote & Locked': 1,
+            'Local & Unlocked': 2,
+            'Remote & Unlocked': 3
+        }
+        if val in map_:
+            self._write(f'C{map_[val]}')
+        else:
+            raise ValueError(f"Invalid control mode: {val}")
+
+    def ensure_operable(self):
+        """Ensure the instrument is in Remote mode and not clamped.
+        Call this before any ramp command to handle A4 (clamped) and C0 (local) states.
+        """
+        if self.simulated:
+            return
+        try:
+            res = self._query('X')
+            # Check control mode — if local, switch to remote
+            idx_c = res.find('C')
+            if idx_c != -1 and idx_c + 1 < len(res) and res[idx_c+1] in ('0', '2'):
+                log.info("Instrument is in Local mode. Switching to Remote & Unlocked...")
+                self._write('C3')
+                time.sleep(0.2)
+            # Check activity — if clamped (A4), send Hold first
+            idx_a = res.find('A')
+            if idx_a != -1 and idx_a + 1 < len(res) and res[idx_a+1] == '4':
+                log.info("Instrument is clamped. Sending Hold (A0) to unclamp...")
+                self._write('A0')
+                time.sleep(0.3)
+        except Exception as e:
+            log.warning(f"ensure_operable: {e}")
 
     def hold(self):
         if self.simulated:
@@ -286,6 +424,7 @@ class OxfordMagnet(VisaInstrument):
             rate = self._sim_sweep_rate / 60.0  # T/s
             self._sim_sweep_duration = abs(self._sim_start_field) / rate if rate > 0 else 0.0
             return
+        self.ensure_operable()
         self._write('A2')
 
     def goto_set(self):
@@ -298,6 +437,7 @@ class OxfordMagnet(VisaInstrument):
             dist = abs(self._sim_target_field - self._sim_start_field)
             self._sim_sweep_duration = dist / rate if rate > 0 else 0.0
             return
+        self.ensure_operable()
         self._write('A1')
 
     def clamp(self):
@@ -306,10 +446,9 @@ class OxfordMagnet(VisaInstrument):
             return
         self._write('A4')
 
-    # Simulation helper to update B-field over time
     def _update_simulated_sweep(self):
         if self._sim_activity == 'to set point':
-            dt = (time.time() - self._sim_start_time) * 30.0
+            dt = (time.time() - self._sim_start_time)
             if self._sim_sweep_duration <= 0 or dt >= self._sim_sweep_duration:
                 self._sim_current_field = self._sim_target_field
                 self._sim_activity = 'hold'
@@ -319,7 +458,7 @@ class OxfordMagnet(VisaInstrument):
             if self._sim_switch_heater == 'on':
                 self._sim_persistent_field = self._sim_current_field
         elif self._sim_activity == 'to zero':
-            dt = (time.time() - self._sim_start_time) * 30.0
+            dt = (time.time() - self._sim_start_time)
             if self._sim_sweep_duration <= 0 or dt >= self._sim_sweep_duration:
                 self._sim_current_field = 0.0
                 self._sim_activity = 'hold'

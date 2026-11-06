@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import time
+import threading
 import numpy as np
 import Pyro4
 import h5py
@@ -13,8 +14,11 @@ parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
+from measurements.utils import configure_plot_axes
 from drivers.lightfield_qcodes import lf_signal_bridge
 from station_setup import initialize_station, simulated_devices
+from measurement_data_paths import dated_measurement_filename, dated_measurement_path
+from measurement_data_paths import measurement_data_dir, measurement_start_text, new_measurement_start, measurement_device_modes
 
 
 class AcquisitionWorker(QtCore.QThread):
@@ -24,7 +28,6 @@ class AcquisitionWorker(QtCore.QThread):
     """
     point_measured = QtCore.pyqtSignal(np.ndarray, np.ndarray, object)  # wavelengths, intensities, raw_intensities
     progress_updated = QtCore.pyqtSignal(int, int)  # current, total
-    finished = QtCore.pyqtSignal()
     error_occurred = QtCore.pyqtSignal(str)
 
     def __init__(self, station, mode, num_spectra, average, accum_method, center_wl=500.0, parent=None):
@@ -37,6 +40,14 @@ class AcquisitionWorker(QtCore.QThread):
         self.center_wl = center_wl
         self._stop_requested = False
         self._paused = False
+        self._preview_lock = threading.Lock()
+        self._latest_preview = None
+
+    def take_latest_preview(self):
+        """One-slot mailbox: slow rendering cannot queue outdated live frames."""
+        with self._preview_lock:
+            frame, self._latest_preview = self._latest_preview, None
+        return frame
 
     def stop(self):
         self._stop_requested = True
@@ -51,62 +62,39 @@ class AcquisitionWorker(QtCore.QThread):
         try:
             camera = self.station.camera
             
-            # --- Live Continuous Mode (Native LightField Preview) ---
             if self.mode == "continuous":
+                previous_frames = camera.num_frames()
+                camera.num_frames(1)
                 try:
                     camera.remote_lf.start_preview()
-                except Exception as e:
-                    print(f"Error starting remote preview: {e}")
-                    self.error_occurred.emit(str(e))
-                    return
-
-                wl = None
-                while not self._stop_requested:
-                    while self._paused and not self._stop_requested:
-                        self.msleep(100)
-                    if self._stop_requested:
-                        break
-                    try:
-                        # Fetch the latest live preview spectrum from the server's cache
+                    while not self._stop_requested:
+                        poll_started = time.monotonic()
+                        if self._paused:
+                            self.msleep(20)
+                            continue
                         data = camera.remote_lf.get_latest_preview_data()
-                        if data is not None:
-                            if isinstance(data, str):
-                                print("\n--- DEBUG PREVIEW SERVER INFO ---")
-                                print(data)
-                                print("---------------------------------\n")
-                                self.msleep(500)
-                                continue
-                            intensities = np.array(data)
-                            try:
-                                wl_list = camera.remote_lf.get_wavelengths_cache()
-                                if wl_list is None:
-                                    wl = None
-                                else:
-                                    wl = np.array(wl_list)
-                            except Exception:
-                                wl = None
-                            
-                            if wl is None or len(wl) == 0:
-                                # Fallback: estimate wavelength grid using cached center wavelength
-                                mono_wl = self.center_wl
-                                wl = mono_wl + (np.arange(len(intensities)) - len(intensities)//2) * 0.05
-                            
-                            # Emit live data to GUI
-                            self.point_measured.emit(wl, intensities, None)
-                    except Exception as e:
-                        # Don't print if it's just AttributeError (server hasn't updated yet)
-                        if "AttributeError" not in type(e).__name__:
-                            print(f"Error reading preview frame: {e}")
-                    
-                    self.msleep(100)
-
-                try:
-                    camera.remote_lf.stop_preview()
-                except Exception as e:
-                    print(f"Error stopping remote preview: {e}")
-
-                if not self._stop_requested:
-                    self.finished.emit()
+                        if data is not None and not isinstance(data, str):
+                            intensities = np.asarray(data, dtype=float)
+                            wavelengths = np.asarray(camera.remote_lf.get_wavelengths_cache(), dtype=float)
+                            if (intensities.ndim != 1 or wavelengths.ndim != 1
+                                    or intensities.shape != wavelengths.shape
+                                    or not np.all(np.isfinite(intensities))
+                                    or not np.all(np.isfinite(wavelengths))):
+                                raise ValueError("Live spectrum has no valid wavelength calibration or intensity array.")
+                            # Keep the completed frame even if Stop was clicked
+                            # during a legacy NIRvana acquisition.
+                            with self._preview_lock:
+                                self._latest_preview = (wavelengths, intensities, None)
+                        # Native streams are polled at up to 30 Hz. Blocking
+                        # legacy acquisitions need no additional 100 ms delay.
+                        remaining_ms = int(33 - 1000 * (time.monotonic() - poll_started))
+                        if remaining_ms > 0 and not self._stop_requested:
+                            self.msleep(remaining_ms)
+                finally:
+                    try:
+                        camera.remote_lf.stop_preview()
+                    finally:
+                        camera.num_frames(previous_frames)
                 return
 
             # --- Hardware native multi-exposure acquisition ---
@@ -132,10 +120,10 @@ class AcquisitionWorker(QtCore.QThread):
 
             self.progress_updated.emit(self.num_spectra, self.num_spectra)
             self.point_measured.emit(wl_arr, processed_arr, intensities_arr)
-            self.finished.emit()
 
         except Exception as e:
-            self.error_occurred.emit(str(e))
+            if not self._stop_requested:
+                self.error_occurred.emit(str(e))
 
     def capture_one(self):
         camera = self.station.camera
@@ -158,6 +146,56 @@ class AcquisitionWorker(QtCore.QThread):
             intensities_arr = intensities_arr[0]
             
         return wl_arr, intensities_arr
+
+
+class IntermediatePreviewWorker(QtCore.QThread):
+    """Query intermediate frames outside the GUI thread using an owned socket."""
+    def __init__(self, uri, spectrometer_type, generation, parent=None):
+        super().__init__(parent)
+        self.uri, self.spectrometer_type = uri, spectrometer_type
+        self.generation = generation
+        self.frame = None
+
+    def run(self):
+        proxy = None
+        try:
+            proxy = Pyro4.Proxy(self.uri)
+            proxy._pyroTimeout = 2.0
+            if self.spectrometer_type in ['wingspecG15', 'winspecG11', 'wingspecG11', 'winspecG15']:
+                from drivers.remote_client import PyroProxyWrapper
+                proxy = PyroProxyWrapper(proxy)
+            data = proxy.get_latest_preview_data()
+            if data is None or isinstance(data, str):
+                return
+            wavelengths = np.asarray(proxy.get_wavelengths_cache(), dtype=float)
+            intensities = np.asarray(data, dtype=float)
+            if (wavelengths.ndim == 1 and intensities.shape == wavelengths.shape
+                    and wavelengths.size and np.all(np.isfinite(wavelengths))
+                    and np.all(np.isfinite(intensities))):
+                self.frame = (wavelengths, intensities)
+        except Exception:
+            # An optional intermediate frame must not fail a recorded exposure.
+            pass
+        finally:
+            if proxy is not None:
+                try:
+                    proxy._pyroRelease()
+                except Exception:
+                    pass
+
+
+class SpectrometerControlWorker(QtCore.QThread):
+    """Keep remote motor operations off the GUI thread; never retry movement."""
+    def __init__(self, remote, command, value, parent=None):
+        super().__init__(parent)
+        self.remote, self.command, self.value = remote, command, value
+        self.result, self.error = None, None
+
+    def run(self):
+        try:
+            self.result = getattr(self.remote, self.command)(self.value)
+        except Exception as exc:
+            self.error = str(exc)
 
 
 class StatusWorker(QtCore.QThread):
@@ -186,7 +224,7 @@ class StatusWorker(QtCore.QThread):
         self._is_paused = False
 
     def run(self):
-        if self.spectrometer_type == 'lightfieldG11':
+        if self.spectrometer_type == 'lightfieldG11' or getattr(self.camera, 'simulated', False):
             while not self._stop_requested:
                 if self._is_paused:
                     self.msleep(100)
@@ -444,14 +482,14 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         self.ref_y = None
         self.ref_y_raw = None
 
-        self.live_x = None
-        self.live_y = None
-        self.live_y_raw = None
-
         # Threading Worker
         self.worker = None
         self.is_running = False
         self.is_paused = False
+        self.plotter_mode = False
+        self._live_autoscale = True
+        self._preview_generation = 0
+        self._intermediate_worker = None
 
         # Last known states for removed UI widgets
         self.last_known_shutter = ""
@@ -469,50 +507,40 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         self.setup_ui()
         self.apply_qss_theme()
         
-        # Start background thread to poll status (avoids blocking main GUI thread)
-        camera = self.station.camera
-        uri = getattr(getattr(camera, "remote_lf", None), "_pyroUri", None)
-        spec_type = getattr(camera, "spectrometer_type", "lightfieldG15")
-        if uri is not None or spec_type == "lightfieldG11":
-            self.status_worker = StatusWorker(uri, spectrometer_type=spec_type, camera=camera, parent=self)
-            self.status_worker.status_polled.connect(self.on_status_polled)
-            # Connect instrument signal bridge for direct parameter changes
-            lf_signal_bridge.exposure_time_changed.connect(self.on_exposure_signal)
-            lf_signal_bridge.num_frames_changed.connect(self.on_num_frames_signal)
-            lf_signal_bridge.wavelength_changed.connect(self.on_wavelength_signal)
-            lf_signal_bridge.grating_changed.connect(self.on_grating_signal)
-            lf_signal_bridge.target_temperature_changed.connect(self.on_target_temperature_signal)
-            lf_signal_bridge.shutter_control_changed.connect(self.on_shutter_signal)
-            self.status_worker.start()
-        else:
-            print("Warning: Could not get remote Pyro URI. Status polling disabled.")
-        
+        self.reconnect_status_worker()
+        lf_signal_bridge.exposure_time_changed.connect(self.on_exposure_signal)
+        lf_signal_bridge.num_frames_changed.connect(self.on_num_frames_signal)
+        lf_signal_bridge.wavelength_changed.connect(self.on_wavelength_signal)
+        lf_signal_bridge.grating_changed.connect(self.on_grating_signal)
+        lf_signal_bridge.target_temperature_changed.connect(self.on_target_temperature_signal)
+        lf_signal_bridge.shutter_control_changed.connect(self.on_shutter_signal)
+
         self.update_est_time()
         self.view_control_popup = ViewControlPopup(self, has_grid=True)
         
-        # Create a dedicated Pyro4 proxy for live frame polling to bypass the client-side thread lock
-        try:
-            camera = self.station.camera
-            uri = getattr(getattr(camera, "remote_lf", None), "_pyroUri", None)
-            spec_type = getattr(camera, "spectrometer_type", "lightfieldG15")
-            if uri is not None:
-                raw_poll_proxy = Pyro4.Proxy(uri)
-                raw_poll_proxy._pyroTimeout = 2.0
-                if spec_type in ['wingspecG15', 'winspecG11', 'wingspecG11', 'winspecG15']:
-                    from drivers.remote_client import PyroProxyWrapper
-                    self.live_poll_proxy = PyroProxyWrapper(raw_poll_proxy)
-                else:
-                    self.live_poll_proxy = raw_poll_proxy
-            else:
-                self.live_poll_proxy = None
-        except Exception as e:
-            print(f"Warning: Could not create dedicated live poll proxy: {e}")
-            self.live_poll_proxy = None
-
-        # Timer for polling intermediate frames during acquisition
+        # Timers only hand off work or draw the most recent completed frame;
+        # no camera/network call is made from a GUI timer.
         self.live_poll_timer = QtCore.QTimer(self)
-        self.live_poll_timer.setInterval(200)  # poll every 200 ms
+        self.live_poll_timer.setInterval(200)
         self.live_poll_timer.timeout.connect(self.poll_intermediate_frame)
+        self.live_render_timer = QtCore.QTimer(self)
+        self.live_render_timer.setInterval(33)
+        self.live_render_timer.timeout.connect(self.render_latest_live_frame)
+
+    def reconnect_status_worker(self):
+        old_worker = getattr(self, "status_worker", None)
+        if old_worker is not None:
+            old_worker.stop()
+            old_worker.wait()
+            old_worker.deleteLater()
+        self.spectrometer_status = {}
+        camera = self.station.camera
+        uri = getattr(camera.remote_lf, "_pyroUri", None)
+        self.status_worker = StatusWorker(uri, spectrometer_type=camera.spectrometer_type,
+                                          camera=camera, parent=self)
+        self.status_worker.status_polled.connect(self.on_status_polled)
+        self.status_worker.start()
+        self.set_ui_enabled(True)
 
     # --- value_storage Sync ---
     def load_value_storage(self):
@@ -552,6 +580,8 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
                 print(f"Error loading value_storage: {e}")
 
     def reload_gui_from_storage(self):
+        if self.plotter_mode:
+            return
         self.load_value_storage()
         
         self.exposure_box.blockSignals(True)
@@ -606,6 +636,8 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
             pass
 
     def save_value_storage(self):
+        if self.plotter_mode:
+            return
         storage_path = os.path.join(self.parent_dir, "value_storage")
         data = {}
         if os.path.exists(storage_path):
@@ -692,7 +724,7 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         spec_layout.addRow(QtWidgets.QLabel("Grating:"), self.grating_combo)
         
         self.wl_box = QtWidgets.QDoubleSpinBox()
-        self.wl_box.setRange(200.0, 1200.0)
+        self.wl_box.setRange(200.0, 2500.0)
         self.wl_box.setDecimals(2)
         self.wl_box.setSingleStep(1.0)
         # Fetch current wavelength (fall back to stored value)
@@ -705,7 +737,7 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         spec_layout.addRow(QtWidgets.QLabel("Center Wavelength (nm):"), self.wl_box)
         
         self.energy_box = QtWidgets.QDoubleSpinBox()
-        self.energy_box.setRange(1.0, 6.0)
+        self.energy_box.setRange(0.49, 6.2)
         self.energy_box.setDecimals(4)
         self.energy_box.setSingleStep(0.01)
         self.energy_box.setValue(1239.84193 / self.wl_box.value())
@@ -713,6 +745,9 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         self.energy_box.editingFinished.connect(self.on_energy_changed)
         spec_layout.addRow(QtWidgets.QLabel("Center Energy (eV):"), self.energy_box)
         
+        self.spectrometer_readback = QtWidgets.QLabel("Waiting for spectrometer readback...")
+        self.spectrometer_readback.setWordWrap(True)
+        spec_layout.addRow(self.spectrometer_readback)
         top_row_layout.addWidget(spec_box)
 
         # Box 2: Camera Settings
@@ -778,7 +813,7 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         self.num_spectra_box = QtWidgets.QSpinBox()
         self.num_spectra_box.setRange(1, 10000)
         self.num_spectra_box.setValue(self.stored_num_spectra)
-        self.num_spectra_box.valueChanged.connect(self.update_est_time)
+        self.num_spectra_box.valueChanged.connect(self.on_num_spectra_changed)
         multi_layout.addRow(QtWidgets.QLabel("No. Spectra:"), self.num_spectra_box)
 
         # Hidden Average combo (forced to "Yes")
@@ -847,7 +882,6 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         # Mode colours: same order as PLOT_MODES
         PLOT_MODES = [
             ("Signal",                                          "#3b82f6"),
-            ("Live",                                            "#06b6d4"),
             ("Background",                                      "#f59e0b"),
             ("Reference",                                       "#10b981"),
             ("Signal - Background",                             "#a855f7"),
@@ -898,7 +932,10 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         self.plot_widget = pg.PlotWidget(title="Spectrograph Analysis View")
         self.plot_widget.setLabel('left', 'Intensity', 'counts')
         self.plot_widget.setLabel('bottom', 'Wavelength', 'nm')
-        self.plot_widget.showGrid(x=True, y=True)
+        configure_plot_axes(self.plot_widget)
+        self.plot_widget.showGrid(x=False, y=False)
+        self.plot_widget.getViewBox().sigRangeChangedManually.connect(self._on_manual_plot_range)
+        self.plot_widget.getViewBox().sigStateChanged.connect(self._on_plot_view_state)
         # Create one PlotDataItem per mode
         for mode, colour in self.plot_modes_cfg:
             curve = self.plot_widget.plot([], [], name=mode, pen=pg.mkPen(colour, width=2))
@@ -913,7 +950,7 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         btn_layout.setContentsMargins(15, 20, 15, 15)
         btn_box.setFixedWidth(240)
 
-        self.run_btn = QtWidgets.QPushButton("Run")
+        self.run_btn = QtWidgets.QPushButton("Live on")
         self.run_btn.setObjectName("runBtn")
         self.run_btn.setCheckable(True)
         self.run_btn.clicked.connect(self.toggle_run)
@@ -982,31 +1019,18 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
                     location = "bluefors-pc"
                 elif spec_type == "lightfieldG11":
                     spec_name = "NIRvana (G11)"
-                    location = "10.236.10.143"
+                    location = "DESKTOP-LSQKIT5.dhcp-int-phys.ethz.ch"
             self.conn_lbl = QtWidgets.QLabel(f"{spec_name}: CONNECTED ({location})  ")
             self.conn_lbl.setStyleSheet("color: #10b981; font-weight: bold; font-family: Consolas, monospace;")
             status_bar.addPermanentWidget(self.conn_lbl)
 
-        # Check if spectrometer supports run (only lightfieldG15 and wingspecG15 do)
+        # Native preview displays spectra without creating acquisition files.
         spec_type = "lightfieldG15"
         if hasattr(self, "station") and hasattr(self.station, "camera") and self.station.camera is not None:
             spec_type = getattr(self.station.camera, "spectrometer_type", "lightfieldG15")
         
-        if spec_type not in ["lightfieldG15", "wingspecG15", "winspecG11", "wingspecG11", "winspecG15"]:
-            self.run_btn.setEnabled(False)
-            self.run_btn.setToolTip(f"Run (continuous preview) is not supported by {spec_type}.")
+        self.run_btn.setToolTip("Continuously display spectra for alignment without saving them in the dashboard.")
             
-        # Disable monochromator, temperature, and shutter controls ONLY for NIRvana (lightfieldG11)
-        if spec_type == "lightfieldG11":
-            self.grating_combo.setEnabled(False)
-            self.grating_combo.setToolTip(f"Grating control is not supported by {spec_type}.")
-            self.wl_box.setEnabled(False)
-            self.wl_box.setToolTip(f"Wavelength control is not supported by {spec_type}.")
-            self.energy_box.setEnabled(False)
-            self.energy_box.setToolTip(f"Energy control is not supported by {spec_type}.")
-            self.target_temp_box.setEnabled(False)
-            self.target_temp_box.setToolTip(f"Temperature control is not supported by {spec_type}.")
-
     # --- Device Event Callbacks ---
     def sync_wl_to_energy(self, wl):
         self.energy_box.blockSignals(True)
@@ -1024,27 +1048,96 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
             self.wl_box.setValue(200.0)
         self.wl_box.blockSignals(False)
 
+    def _uses_nirvana_controls(self):
+        camera = self.station.camera
+        return not camera.simulated and camera.spectrometer_type == "lightfieldG11"
+
+    def _start_spectrometer_control(self, command, value):
+        if self.plotter_mode:
+            return
+        if self.is_running or getattr(self, "grating_setting", False):
+            return
+        status = getattr(self, "spectrometer_status", {})
+        capability = "wavelength" if command == "set_wavelength" else "grating"
+        if not status.get("capabilities", {}).get(capability, False):
+            return
+        if command == "set_wavelength" and status.get("wl") is not None and abs(status["wl"] - value) < 0.01:
+            return
+        self.grating_setting = True
+        self.set_ui_enabled(False)
+        self.status_worker.pause()
+        self.status_lbl.setText("Waiting for LightField spectrometer readback...")
+        self.control_worker = SpectrometerControlWorker(self.station.camera.remote_lf,
+                                                        command, value, self)
+        self.control_worker.finished.connect(self._finish_spectrometer_control)
+        self.control_worker.start()
+        parent = self.grating_combo.window()
+        if parent is not self and hasattr(parent, "check_measurement_status"):
+            parent.check_measurement_status()
+
+    def _finish_spectrometer_control(self):
+        worker = self.control_worker
+        self.grating_setting = False
+        if worker.result is not None:
+            self.on_status_polled(worker.result)
+            self.status_lbl.setText("Status: LightField setting confirmed by readback")
+            self.save_value_storage()
+        else:
+            self.spectrometer_status = {}
+            self.spectrometer_readback.setText("Setting could not be confirmed. Waiting for fresh readback.")
+            self.status_lbl.setText("Spectrometer error: " + str(worker.error))
+        self.set_ui_enabled(True)
+        self.status_worker.resume()
+        self.control_worker = None
+        worker.deleteLater()
+        parent = self.grating_combo.window()
+        if parent is not self and hasattr(parent, "check_measurement_status"):
+            parent.check_measurement_status()
+
     def on_wavelength_changed(self):
+        if self.plotter_mode:
+            return
         wl = self.wl_box.value()
+        if self._uses_nirvana_controls():
+            self._start_spectrometer_control("set_wavelength", wl)
+            return
         try:
             self.station.monochromator.wavelength(wl)
+            if self.station.camera.simulated:
+                self.station.camera.remote_lf.wavelength = wl
+                self.station.camera.remote_lf._cached_wavelengths = None
             self.status_lbl.setText(f"Status: Wavelength set to {wl:.2f} nm")
             self.save_value_storage()
         except Exception as e:
             self.status_lbl.setText(f"Error: Failed to set wavelength ({e})")
 
     def on_energy_changed(self):
+        if self.plotter_mode:
+            return
+        if self._uses_nirvana_controls():
+            self.on_wavelength_changed()
+            return
         wl = self.wl_box.value()
         energy = self.energy_box.value()
         try:
             self.station.monochromator.wavelength(wl)
+            if self.station.camera.simulated:
+                self.station.camera.remote_lf.wavelength = wl
+                self.station.camera.remote_lf._cached_wavelengths = None
             self.status_lbl.setText(f"Status: Wavelength set to {wl:.2f} nm ({energy:.4f} eV)")
             self.save_value_storage()
         except Exception as e:
             self.status_lbl.setText(f"Error: Failed to set wavelength ({e})")
 
     def on_grating_changed(self):
+        if self.plotter_mode:
+            return
         label = self.grating_combo.currentText()
+        if self._uses_nirvana_controls():
+            value = self.grating_map.get(label)
+            if value is not None:
+                self._start_spectrometer_control("set_grating", value)
+            return
         self.grating_setting = True
         self.status_lbl.setText(f"Setting grating to {label}")
         QtWidgets.QApplication.processEvents()
@@ -1071,11 +1164,24 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
 
 
     def on_exposure_changed(self):
+        if self.plotter_mode:
+            return
         val = self.exposure_box.value()
         try:
             self.station.camera.exposure_time(val)
         except Exception as e:
             print(f"Error setting camera exposure time: {e}")
+        self.save_value_storage()
+        self.update_est_time()
+
+    def on_num_spectra_changed(self):
+        if self.plotter_mode:
+            return
+        val = self.num_spectra_box.value()
+        try:
+            self.station.camera.num_frames(val)
+        except Exception as e:
+            print(f"Error setting camera num_frames: {e}")
         self.save_value_storage()
         self.update_est_time()
 
@@ -1090,6 +1196,8 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         self.save_value_storage()
 
     def on_target_temperature_changed(self):
+        if self.plotter_mode:
+            return
         val = self.target_temp_box.value()
         try:
             self.station.camera.remote_lf.set_target_temperature(val)
@@ -1103,6 +1211,8 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
     # --- Periodic Device Polling ---
     # --- Slots for instrument signal bridge ---
     def on_exposure_signal(self, val):
+        if self.plotter_mode:
+            return
         # Update exposure UI without triggering recursive set
         self.exposure_box.blockSignals(True)
         self.exposure_box.setValue(val)
@@ -1112,6 +1222,8 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         self.status_lbl.setText(f"Status: Exposure updated to {val:.3f}s (remote)")
 
     def on_num_frames_signal(self, val):
+        if self.plotter_mode:
+            return
         if self.is_running:
             return
         self.num_spectra_box.blockSignals(True)
@@ -1122,6 +1234,8 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         self.status_lbl.setText(f"Status: Num spectra set to {val} (remote)")
 
     def on_wavelength_signal(self, wl):
+        if self.plotter_mode:
+            return
         # Update wavelength and synced energy
         if abs(self.wl_box.value() - wl) > 0.01:
             self.wl_box.blockSignals(True)
@@ -1129,27 +1243,25 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
             self.wl_box.blockSignals(False)
             # Sync energy
             self.sync_wl_to_energy(wl)
-            # Also update monochromator if needed (avoid recursion)
-            try:
-                self.station.monochromator.wavelength(wl)
-            except Exception:
-                pass
             self.save_value_storage()
             self.status_lbl.setText(f"Status: Wavelength updated to {wl:.2f} nm (remote)")
 
     def on_grating_signal(self, grating):
-        # Update grating combo if not manually setting
-        if not getattr(self, "grating_setting", False):
-            label = self.grating_reverse.get(str(grating))
-            if label is None:
-                label = getattr(self, "last_grating_label", "*")
-            self.grating_combo.blockSignals(True)
-            self.grating_combo.setCurrentText(label)
-            self.grating_combo.blockSignals(False)
-            self.save_value_storage()
-            self.status_lbl.setText(f"Status: Grating updated (remote)")
+        if self.plotter_mode:
+            return
+        value = str(grating)
+        label = self.grating_reverse.get(value, value)
+        self.grating_map[label] = value
+        self.grating_reverse[value] = label
+        self.grating_combo.blockSignals(True)
+        if self.grating_combo.findText(label) < 0:
+            self.grating_combo.addItem(label)
+        self.grating_combo.setCurrentText(label)
+        self.grating_combo.blockSignals(False)
 
     def on_target_temperature_signal(self, val):
+        if self.plotter_mode:
+            return
         self.target_temp_box.blockSignals(True)
         self.target_temp_box.setValue(val)
         self.target_temp_box.blockSignals(False)
@@ -1157,6 +1269,8 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         self.status_lbl.setText(f"Status: Target temperature updated to {val:.1f} °C (remote)")
 
     def on_shutter_signal(self, val):
+        if self.plotter_mode:
+            return
         try:
             idx = int(val)
             shutter_map = {1: "Normal", 2: "Always Closed", 3: "Always Open"}
@@ -1166,6 +1280,22 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
             pass
 
     def on_status_polled(self, data):
+        if self.plotter_mode:
+            return
+        if self._uses_nirvana_controls() and self.grating_setting:
+            return  # Discard a read started before the current movement.
+        self.spectrometer_status = dict(data)
+        if self._uses_nirvana_controls():
+            if "gratings" in data:
+                choices = [str(value) for value in data["gratings"]]
+                if choices != list(self.grating_map):
+                    self.grating_map = {value: value for value in choices}
+                    self.grating_reverse = dict(self.grating_map)
+                    self.grating_combo.blockSignals(True)
+                    self.grating_combo.clear()
+                    self.grating_combo.addItems(choices)
+                    self.grating_combo.blockSignals(False)
+            self._update_spectrometer_controls()
         if not data.get('success', False):
             # Check connection issue
             err = data.get('error', '')
@@ -1213,8 +1343,7 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         try:
             if target_temp is not None and target_temp != "*":
                 spec_type = getattr(self.station.camera, "spectrometer_type", "lightfieldG15")
-                supports_hardware_cfg = (spec_type in ["lightfieldG15", "wingspecG15", "winspecG11", "wingspecG11", "winspecG15"])
-                ui_enabled = self.acquire_btn.setEnabled(True) or self.acquire_btn.isEnabled()
+                supports_hardware_cfg = self.station.camera.simulated or spec_type != "lightfieldG11"
                 ui_enabled = self.acquire_btn.isEnabled() and supports_hardware_cfg
                 
                 self.target_temp_title_lbl.setEnabled(True)
@@ -1263,20 +1392,29 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-        # 6. Update Grating
-        grating = data.get('grating')
-        try:
-            if grating is not None:
-                if not getattr(self, "grating_setting", False):
-                    label = self.grating_reverse.get(str(grating))
-                    if label is None:
-                        label = getattr(self, "last_grating_label", "*")
-                    if self.grating_combo.currentText() != label:
-                        self.grating_combo.blockSignals(True)
-                        self.grating_combo.setCurrentText(label)
-                        self.grating_combo.blockSignals(False)
-        except Exception:
-            pass
+        # Display the actual returned grating, including values absent from the
+        # old hard-coded list. Never replace unknown hardware with a cached label.
+        grating = data.get("grating")
+        if grating is not None and not self.grating_setting:
+            self.on_grating_signal(grating)
+        wl = data.get("wl")
+        if data.get("status_source") == "local_settings":
+            self.spectrometer_readback.setText(
+                "Live uses repeated acquisitions; the dashboard does not save them. "
+                "LightField's existing export settings still apply. Set grating/wavelength in LightField."
+                if self._uses_legacy_nirvana_live() else
+                "Remote grating/wavelength controls unavailable. Normal Acquire remains available.")
+            self.grating_combo.blockSignals(True)
+            self.grating_combo.setCurrentIndex(-1)
+            self.grating_combo.setPlaceholderText("Unavailable from server")
+            self.grating_combo.blockSignals(False)
+            self.wl_box.lineEdit().setText("Unavailable")
+            self.energy_box.lineEdit().setText("Unavailable")
+        else:
+            self.spectrometer_readback.setText(
+                f"{'SIMULATED' if self.station.camera.simulated else 'Hardware readback'}: "
+                f"grating {grating if grating is not None else 'unavailable'}; "
+                f"centre {str(wl) + ' nm' if wl is not None else 'unavailable'}")
 
         # 7. Update Exposure Time (only if user is not focusing the box)
         exposure = data.get('exposure')
@@ -1296,15 +1434,11 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         wl = data.get('wl')
         try:
             if wl is not None and not self.wl_box.hasFocus():
-                if abs(self.wl_box.value() - wl) > 0.01:
+                if abs(self.wl_box.value() - wl) > 0.01 or self.wl_box.lineEdit().text() == "Unavailable":
                     self.wl_box.blockSignals(True)
                     self.wl_box.setValue(wl)
                     self.wl_box.blockSignals(False)
                     self.sync_wl_to_energy(wl)
-                    try:
-                        self.station.monochromator.wavelength(wl)
-                    except Exception:
-                        pass
         except Exception:
             pass
 
@@ -1337,6 +1471,12 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
     # --- Core Acquisition Control ---
     # --- Core Acquisition Control ---
     def start_acquisition(self, mode):
+        if self.plotter_mode or self.is_running:
+            return
+        if getattr(self, "grating_setting", False):
+            return
+        self.measurement_device_modes = measurement_device_modes(self.station)
+        self.measurement_started_at = new_measurement_start()
         self._interrupt_requested = False
         self._autosaved_this_run = False
         self.status_bar_update("Acquiring...")
@@ -1347,8 +1487,11 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         self.is_running = True
         self.station.live_status_paused = True
         self.is_paused = False
-        self.live_x = None
-        self.live_y = None
+        self.active_acquisition_mode = mode
+        self._acquisition_failed = False
+        self._acquisition_error = ""
+        self._received_data_this_run = False
+        self._preview_generation += 1
         
         camera = self.station.camera
         spec_type = getattr(camera, "spectrometer_type", "lightfieldG15")
@@ -1370,65 +1513,77 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         self.worker.start()
 
     def toggle_run(self):
+        if self.plotter_mode:
+            self.run_btn.setChecked(False)
+            return
+        if getattr(self, "grating_setting", False):
+            self.run_btn.setChecked(False)
+            return
         if self.run_btn.isChecked():
+            if not self._live_preview_available():
+                self.run_btn.blockSignals(True)
+                self.run_btn.setChecked(False)
+                self.run_btn.blockSignals(False)
+                self._update_spectrometer_controls()
+                self.status_bar_update("Live unavailable: the connected NIRvana server does not provide a no-save stream. Normal Acquire is available.")
+                return
+            self.active_acquisition_mode = "continuous"
+            self._first_live_frame = True
             self._interrupt_requested = False
             self._autosaved_this_run = False
-            self.run_btn.setText("Stop")
+            self._acquisition_failed = False
+            self._acquisition_error = ""
+            self._received_data_this_run = False
+            self.set_ui_enabled(False)
+            self.run_btn.setEnabled(True)
+            self.station.live_status_paused = True
             # Disable other triggers
             self.acquire_btn.setEnabled(False)
             self.bg_btn.setEnabled(False)
             self.ref_btn.setEnabled(False)
             self.reset_btn.setEnabled(True)
             self.is_running = True
+            self.run_btn.setText("Live off")
             self.is_paused = False
-            self.status_bar_update("Live Acquisition active")
+            self.status_bar_update("Waiting for the first live spectrum; dashboard saving is off.")
             self.progress_bar.setMaximum(0)  # Infinite loader pattern
             
-            # Automatically check the "Live" box so the user immediately sees it
-            if "Live" in self.plot_mode_checks:
-                self.plot_mode_checks["Live"].setChecked(True)
+            # Automatically check the "Signal" box so the user immediately sees it
+            if "Signal" in self.plot_mode_checks:
+                self.plot_mode_checks["Signal"].setChecked(True)
                 
+            if self._live_autoscale:
+                self.plot_widget.enableAutoRange()
+            
             self.worker = AcquisitionWorker(self.station, "continuous", 1, False, "Sum", center_wl=self.wl_box.value(), parent=self)
-            self.worker.point_measured.connect(lambda xl, yl, y_raw=None: self.on_data_acquired("continuous", xl, yl, y_raw))
             self.worker.error_occurred.connect(self.on_acquisition_error)
+            self.worker.finished.connect(self.on_acquisition_finished)
+            self.live_render_timer.start()
             self.worker.start()
         else:
             self.reset_acquisition()
 
     def reset_acquisition(self):
-        if self.is_running:
-            self._interrupt_requested = True
-            self.trigger_autosave(was_interrupted=True)
+        if not self.is_running:
+            return
+        self._interrupt_requested = True
         self.live_poll_timer.stop()
-        # Tell the remote camera server/LightField to abort via safe thread-safe abort flag setting
-        try:
-            if hasattr(self.station, 'camera') and hasattr(self.station.camera, 'abort_acquisition'):
-                self.station.camera.abort_acquisition()
-        except Exception as e:
-            print(f"Warning: Could not send remote abort command to camera server: {e}")
-
         if self.worker is not None and self.worker.isRunning():
+            # Set the stop flag before cancelling the socket so cancellation
+            # cannot be mistaken for a failed measurement.
             self.worker.stop()
-            # Wait up to 1 second to avoid freezing GUI thread
-            if not self.worker.wait(1000):
-                print("Warning: AcquisitionWorker did not stop cleanly within 1s. Terminating...")
-                self.worker.terminate()
-                self.worker.wait()
-        
-        self.is_running = False
-        self.station.live_status_paused = False
-        self.is_paused = False
-
-        self.run_btn.blockSignals(True)
-        self.run_btn.setChecked(False)
-        self.run_btn.setText("Run")
-        self.run_btn.blockSignals(False)
-        
-        self.progress_bar.setMaximum(100)
-        self.progress_bar.setValue(0)
-        self.set_ui_enabled(True)
-        self.reset_btn.setEnabled(False)
-        self.status_bar_update("Acquisition reset. Ready.")
+            finish_current = (self._uses_legacy_nirvana_live()
+                              and self.active_acquisition_mode == "continuous")
+            if not finish_current:
+                try:
+                    self.station.camera.abort_acquisition()
+                except Exception as exc:
+                    print(f"Could not cancel acquisition: {exc}")
+            self.run_btn.setEnabled(False)
+            self.reset_btn.setEnabled(False)
+            self.status_bar_update("Stopping after the current spectrum..." if finish_current else "Stopping acquisition...")
+        else:
+            self.on_acquisition_finished()
 
     def on_progress_updated(self, current, total):
         if self.progress_bar.maximum() == 0:
@@ -1436,113 +1591,119 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         pct = int(100 * current / total)
         self.progress_bar.setValue(pct)
 
-    def poll_intermediate_frame(self):
-        try:
-            if getattr(self, "live_poll_proxy", None) is None:
-                # Re-try initializing the proxy
-                camera = self.station.camera
-                uri = getattr(getattr(camera, "remote_lf", None), "_pyroUri", None)
-                spec_type = getattr(camera, "spectrometer_type", "lightfieldG15")
-                if uri is not None:
-                    raw_poll_proxy = Pyro4.Proxy(uri)
-                    raw_poll_proxy._pyroTimeout = 2.0
-                    if spec_type in ['wingspecG15', 'winspecG11', 'wingspecG11', 'winspecG15']:
-                        from drivers.remote_client import PyroProxyWrapper
-                        self.live_poll_proxy = PyroProxyWrapper(raw_poll_proxy)
-                    else:
-                        self.live_poll_proxy = raw_poll_proxy
-                else:
-                    return
+    def render_latest_live_frame(self):
+        worker = self.worker
+        if worker is None or getattr(self, "active_acquisition_mode", None) != "continuous":
+            return
+        frame = worker.take_latest_preview()
+        if frame is not None:
+            self.on_data_acquired("continuous", *frame)
 
-            data = self.live_poll_proxy.get_latest_preview_data()
-            if data is not None and not isinstance(data, str):
-                intensities = np.array(data)
-                # Estimate/get wavelengths
-                try:
-                    wl_list = self.live_poll_proxy.get_wavelengths_cache()
-                    if wl_list is None:
-                        wl = None
-                    else:
-                        wl = np.array(wl_list)
-                except Exception:
-                    wl = None
-                
-                if wl is None or len(wl) == 0:
-                    try:
-                        mono_wl = self.wl_box.value()
-                    except Exception:
-                        mono_wl = 500.0
-                    wl = mono_wl + (np.arange(len(intensities)) - len(intensities)//2) * 0.05
-                
-                # Check "Live" plot box so it's visible
-                if "Live" in self.plot_mode_checks and not self.plot_mode_checks["Live"].isChecked():
-                    self.plot_mode_checks["Live"].setChecked(True)
-                
-                self.live_x = wl
-                self.live_y = intensities
+    def poll_intermediate_frame(self):
+        if (self.plotter_mode or not self.is_running or self._intermediate_worker is not None
+                or getattr(self, "active_acquisition_mode", None) == "continuous"):
+            return
+        camera = self.station.camera
+        uri = getattr(getattr(camera, "remote_lf", None), "_pyroUri", None)
+        if uri is None:
+            return
+        worker = IntermediatePreviewWorker(uri, camera.spectrometer_type, self._preview_generation, self)
+        self._intermediate_worker = worker
+        worker.finished.connect(self._intermediate_frame_finished)
+        worker.start()
+
+    def _intermediate_frame_finished(self):
+        worker = self._intermediate_worker
+        if worker is None:
+            return
+        self._intermediate_worker = None
+        if (worker.generation == self._preview_generation and self.is_running
+                and not self.plotter_mode and worker.frame is not None
+                and not getattr(self, "_received_data_this_run", False)):
+            mode = self.active_acquisition_mode
+            prefix = {"single": "signal", "background": "bg", "reference": "ref"}.get(mode)
+            if prefix is not None:
+                x, y = worker.frame
+                setattr(self, prefix + "_x", x)
+                setattr(self, prefix + "_y", y)
                 self.replot()
-        except Exception as e:
-            print(f"Exception in client poll_intermediate_frame: {e}")
+        worker.deleteLater()
 
     def on_data_acquired(self, mode, x, y, y_raw=None):
+        self._received_data_this_run = True
         # Save variables depending on the trigger button
-        if mode == "continuous":
-            self.live_x = x
-            self.live_y = y
-            self.live_y_raw = y_raw
-        elif mode == "single":
+        if mode == "continuous" or mode == "single":
             self.signal_x = x
             self.signal_y = y
             self.signal_y_raw = y_raw
+            if "Signal" in self.plot_mode_checks and not self.plot_mode_checks["Signal"].isChecked():
+                self.plot_mode_checks["Signal"].setChecked(True)
         elif mode == "background":
             self.bg_x = x
             self.bg_y = y
             self.bg_y_raw = y_raw
+            if "Background" in self.plot_mode_checks and not self.plot_mode_checks["Background"].isChecked():
+                self.plot_mode_checks["Background"].setChecked(True)
         elif mode == "reference":
             self.ref_x = x
             self.ref_y = y
             self.ref_y_raw = y_raw
+            if "Reference" in self.plot_mode_checks and not self.plot_mode_checks["Reference"].isChecked():
+                self.plot_mode_checks["Reference"].setChecked(True)
             
         self.replot()
-        self.update_save_button_state()
+        if mode == "continuous" and getattr(self, "_first_live_frame", False):
+            self._first_live_frame = False
+            self.status_bar_update("Live alignment; dashboard saving is off.")
+        if mode != "continuous":
+            self.update_save_button_state()
 
     def on_acquisition_finished(self):
         self.live_poll_timer.stop()
-        if self.run_btn.isChecked():
-            return
+        continuous = getattr(self, "active_acquisition_mode", None) == "continuous"
+        if continuous:
+            self.render_latest_live_frame()
+        self.live_render_timer.stop()
+        self._preview_generation += 1
         self.is_running = False
         self.station.live_status_paused = False
         self.is_paused = False
+        self.run_btn.blockSignals(True)
+        self.run_btn.setChecked(False)
+        self.run_btn.setText("Live on")
+        self.run_btn.blockSignals(False)
         self.set_ui_enabled(True)
         self.reset_btn.setEnabled(False)
         self.progress_bar.setMaximum(100)
-        self.progress_bar.setValue(100)
-        self.status_bar_update("Acquisition complete.")
-        self.trigger_autosave(was_interrupted=False)
+        self.progress_bar.setValue(0 if continuous else 100)
+        if not continuous and getattr(self, "_received_data_this_run", False) and not getattr(self, "_acquisition_failed", False):
+            self.trigger_autosave(was_interrupted=getattr(self, "_interrupt_requested", False))
+        if getattr(self, "_acquisition_failed", False):
+            self.status_bar_update("Acquisition failed: " + getattr(self, "_acquisition_error", "Unknown error"))
+        else:
+            self.status_bar_update("Live stopped; last spectrum retained. No spectra saved by the dashboard." if continuous else "Acquisition finished.")
 
     def on_acquisition_error(self, err_msg):
-        was_interrupted = getattr(self, "_interrupt_requested", False)
-        self.trigger_autosave(was_interrupted=was_interrupted)
-        self.reset_acquisition()
-        self.update_save_button_state()
-        if was_interrupted:
-            self._interrupt_requested = False
-            self.status_bar_update("Acquisition interrupted by user.")
-            return
+        self._acquisition_failed = True
+        self._acquisition_error = str(err_msg)
+        self.status_bar_update(f"Acquisition failed: {err_msg}")
         QtWidgets.QMessageBox.critical(self, "Acquisition Error", f"An error occurred during acquisition:\n{err_msg}")
-        self.status_bar_update("Status: Error occurred")
 
     def trigger_autosave(self, was_interrupted=False):
+        if getattr(self, "active_acquisition_mode", None) == "continuous":
+            return
         if getattr(self, "_autosaved_this_run", False):
             return
-        has_data = (self.signal_y is not None) or (self.bg_y is not None) or (self.ref_y is not None) or (self.live_y is not None)
+        has_data = (self.signal_y is not None) or (self.bg_y is not None) or (self.ref_y is not None)
         if not has_data:
             return
-        autosave_dir = os.path.join(parent_dir, "data", "autosave")
-        os.makedirs(autosave_dir, exist_ok=True)
+        autosave_dir = measurement_data_dir(
+            parent_dir, getattr(self, "measurement_started_at", None), autosave=True
+        )
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         suffix = "_interrupted" if was_interrupted else ""
-        filename = f"autosave_spectra_{timestamp}{suffix}.h5"
+        filename = f"autosave_spectra_{timestamp[-6:]}{suffix}.h5"
+        filename = dated_measurement_filename(filename, getattr(self, "measurement_started_at", None))
         file_path = os.path.join(autosave_dir, filename)
         try:
             self.save_data_to_file(file_path)
@@ -1552,7 +1713,7 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
             print(f"Auto-save failed: {e}")
 
     def prompt_save_on_interrupt(self):
-        has_data = (self.signal_y is not None) or (self.bg_y is not None) or (self.ref_y is not None) or (self.live_y is not None)
+        has_data = (self.signal_y is not None) or (self.bg_y is not None) or (self.ref_y is not None)
         if not has_data:
             return
         reply = QtWidgets.QMessageBox.question(
@@ -1569,18 +1730,22 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         self.status_lbl.setText(f"Status: {text}")
 
     def update_save_button_state(self):
-        # Enable save button if we have any of signal, background, reference, or live data
-        has_data = (self.signal_y is not None) or (self.bg_y is not None) or (self.ref_y is not None) or (self.live_y is not None)
-        self.save_btn.setEnabled(has_data)
+        # Enable save button if we have any of signal, background, or reference data
+        has_data = (self.signal_y is not None) or (self.bg_y is not None) or (self.ref_y is not None)
+        self.save_btn.setEnabled(has_data and not self.is_running)
 
 
 
     def save_data_to_file(self, file_path, selections=None):
+        if self.plotter_mode:
+            return
         """Save selected datasets to file.
         :param file_path: Destination file path.
-        :param selections: List of dataset names to include. Possible values: 'Signal', 'Background', 'Reference', 'Live'.
+        :param selections: List of dataset names to include. Possible values: 'Signal', 'Background', 'Reference'.
         If None, all available datasets are saved.
         """
+        if self.is_running and getattr(self, "active_acquisition_mode", None) == "continuous":
+            raise RuntimeError("Live alignment spectra are not saved. Stop Live and use Acquire to record a spectrum.")
         if selections is None:
             selections = []
         # If no selections specified, default to all available datasets
@@ -1591,11 +1756,9 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
                 selections.append('Background')
             if self.ref_x is not None:
                 selections.append('Reference')
-            if getattr(self, 'live_x', None) is not None:
-                selections.append('Live')
         # Determine the primary wavelength grid based on selected datasets
         x_grid = None
-        # Prioritize signal, then background, then reference, then live
+        # Prioritize signal, then background, then reference
         candidates = []
         if 'Signal' in selections and self.signal_x is not None:
             candidates.append(self.signal_x)
@@ -1603,15 +1766,13 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
             candidates.append(self.bg_x)
         if 'Reference' in selections and self.ref_x is not None:
             candidates.append(self.ref_x)
-        if 'Live' in selections and self.live_x is not None:
-            candidates.append(self.live_x)
         for x_arr in candidates:
             if x_arr is not None:
                 x_grid = x_arr
                 break
         if x_grid is None:
             # Fallback to any available x grid
-            for x_arr in (self.signal_x, self.bg_x, self.ref_x, getattr(self, 'live_x', None)):
+            for x_arr in (self.signal_x, self.bg_x, self.ref_x):
                 if x_arr is not None:
                     x_grid = x_arr
                     break
@@ -1639,12 +1800,7 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
                 if ref_raw is None:
                     ref_raw = np.array([self.ref_y])
                 data["reference"]["raw_intensities"] = ref_raw.tolist()
-            if 'Live' in selections and self.live_x is not None:
-                data["live"] = {"wavelength": self.live_x.tolist(), "intensity": self.live_y.tolist()}
-                live_raw = getattr(self, 'live_y_raw', None)
-                if live_raw is None:
-                    live_raw = np.array([self.live_y])
-                data["live"]["raw_intensities"] = live_raw.tolist()
+
 
             # Add metadata
             metadata = {}
@@ -1657,8 +1813,12 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
                 metadata["ccd_status"] = getattr(self, 'last_known_ccd_status', '')
                 metadata["gain"] = self.gain_lbl.text()
                 metadata["timestamp"] = time.strftime('%Y-%m-%d %H:%M:%S')
+                metadata["measurement_started_at"] = measurement_start_text(
+                    getattr(self, "measurement_started_at", None)
+                )
             except Exception:
                 pass
+            metadata["device_modes"] = getattr(self, "measurement_device_modes", {})
             data["metadata"] = metadata
             
             with open(file_path, 'w') as f:
@@ -1668,6 +1828,7 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         # HDF5 formatting option
         if file_path.endswith('.h5'):
             with h5py.File(file_path, 'w') as h5f:
+                h5f.attrs["device_modes"] = json.dumps(getattr(self, "measurement_device_modes", {}))
                 # Query current B field
                 meas_b = 0.0
                 magnet = getattr(self.station, 'magnet', None)
@@ -1727,14 +1888,7 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
                     if ref_raw is None:
                         ref_raw = np.array([self.ref_y])
                     grp.create_dataset('raw_intensities', data=ref_raw)
-                if 'Live' in selections and self.live_x is not None:
-                    grp = h5f.create_group('live')
-                    grp.create_dataset('wavelength', data=self.live_x)
-                    grp.create_dataset('intensity', data=self.live_y)
-                    live_raw = getattr(self, 'live_y_raw', None)
-                    if live_raw is None:
-                        live_raw = np.array([self.live_y])
-                    grp.create_dataset('raw_intensities', data=live_raw)
+
                 # Metadata as attributes on root
                 try:
                     h5f.attrs['center_wavelength_nm'] = self.wl_box.value()
@@ -1745,6 +1899,9 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
                     h5f.attrs['ccd_status'] = getattr(self, 'last_known_ccd_status', '')
                     h5f.attrs['gain'] = self.gain_lbl.text()
                     h5f.attrs['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                    h5f.attrs['measurement_started_at'] = measurement_start_text(
+                        getattr(self, "measurement_started_at", None)
+                    )
                     # Store full value_storage JSON as a dataset for full state recovery
                     try:
                         storage_path = os.path.join(parent_dir, "value_storage")
@@ -1775,7 +1932,11 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         # Text/CSV column-based formatting option
         metadata_lines = []
         metadata_lines.append("# --- Spectroscopy Data Save ---")
+        metadata_lines.append("# Device modes: " + json.dumps(getattr(self, "measurement_device_modes", {})))
         metadata_lines.append(f"# Date/Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        metadata_lines.append(
+            f"# Measurement started: {measurement_start_text(getattr(self, 'measurement_started_at', None))}"
+        )
         
         try:
             metadata_lines.append(f"# Monochromator Center Wavelength (nm): {self.wl_box.value()}")
@@ -1811,9 +1972,7 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
             header_cols.append("Reference (counts)")
             data_cols.append(get_column_data(self.ref_x, self.ref_y))
             
-        if 'Live' in selections and self.live_y is not None:
-            header_cols.append("Live (counts)")
-            data_cols.append(get_column_data(self.live_x, self.live_y))
+
             
         metadata_lines.append("# Columns: " + ", ".join(header_cols))
         
@@ -1838,9 +1997,11 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         After a successful save, the current value_storage is persisted.
         """
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        default_name = f"spectra_{timestamp}.h5"
-        data_dir = os.path.join(parent_dir, "data")
-        default_dir = data_dir
+        default_name = f"spectra_{timestamp[-6:]}.h5"
+        default_name = dated_measurement_filename(default_name, getattr(self, "measurement_started_at", None))
+        default_dir = measurement_data_dir(
+            parent_dir, getattr(self, "measurement_started_at", None)
+        )
         file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Save Spectra Data",
@@ -1849,6 +2010,7 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         )
         if not file_path:
             return
+        file_path = dated_measurement_path(file_path, getattr(self, "measurement_started_at", None))
         try:
             self.save_data_to_file(file_path, selections=None)
             self.status_bar_update(f"Saved to {os.path.basename(file_path)}")
@@ -1856,19 +2018,31 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Save Error", f"Failed to save data:\n{e}")
 
+    def set_plotter_mode(self, enabled):
+        if enabled and (self.is_running or getattr(self, "grating_setting", False)):
+            raise RuntimeError("Finish acquisition or spectrometer movement before entering Plotter mode.")
+        self.plotter_mode = bool(enabled)
+        if self.plotter_mode:
+            self.status_worker.pause()
+            self.live_poll_timer.stop()
+            self.live_render_timer.stop()
+        else:
+            self.status_worker.resume()
+        self.set_ui_enabled(not self.is_running)
+
     def set_ui_enabled(self, enabled):
+        enabled = enabled and not self.plotter_mode
+        self._ui_enabled = enabled
         self.acquire_btn.setEnabled(enabled)
         self.bg_btn.setEnabled(enabled)
         self.ref_btn.setEnabled(enabled)
+        self.run_btn.setEnabled(enabled)
         
         spec_type = "lightfieldG15"
         if hasattr(self, "station") and hasattr(self.station, "camera") and self.station.camera is not None:
             spec_type = getattr(self.station.camera, "spectrometer_type", "lightfieldG15")
-        supports_hardware_cfg = (spec_type in ["lightfieldG15", "wingspecG15", "winspecG11", "wingspecG11", "winspecG15"])
-        
-        self.grating_combo.setEnabled(enabled and supports_hardware_cfg)
-        self.wl_box.setEnabled(enabled and supports_hardware_cfg)
-        self.energy_box.setEnabled(enabled and supports_hardware_cfg)
+        supports_hardware_cfg = self.station.camera.simulated or spec_type != "lightfieldG11"
+        self._update_spectrometer_controls()
         self.exposure_box.setEnabled(enabled)
         self.num_spectra_box.setEnabled(enabled)
         self.average_combo.setEnabled(enabled)
@@ -1884,10 +2058,41 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
 
 
 
+    def _uses_legacy_nirvana_live(self):
+        return (self._uses_nirvana_controls()
+                and not getattr(self.station.camera.remote_lf, "controls_enabled", False))
+
+    def _live_preview_available(self):
+        if self._uses_legacy_nirvana_live():
+            return True
+        if not self._uses_nirvana_controls():
+            return True
+        status = getattr(self, "spectrometer_status", {})
+        return bool(status.get("success") and status.get("capabilities", {}).get("preview"))
+
+    def _update_spectrometer_controls(self):
+        enabled = getattr(self, "_ui_enabled", True) and not self.plotter_mode
+        nirvana = self._uses_nirvana_controls()
+        status = getattr(self, "spectrometer_status", {})
+        capabilities = status.get("capabilities", {})
+        idle = not status.get("busy", False)
+        for control, capability in ((self.grating_combo, "grating"),
+                                    (self.wl_box, "wavelength"), (self.energy_box, "wavelength")):
+            supported = not nirvana or (status.get("success", False) and capabilities.get(capability, False))
+            control.setEnabled(enabled and supported and (not nirvana or idle))
+            control.setToolTip("" if supported else "Requires LightField readback from the updated NIRvana server (port 65433).")
+        preview = self._live_preview_available()
+        # Keep the Stop button active while a live acquisition is running.
+        if not (self.is_running and getattr(self, "active_acquisition_mode", None) == "continuous"):
+            self.run_btn.setEnabled(enabled and preview)
+            self.run_btn.setText("Live on")
+        self.run_btn.setToolTip("Repeated acquisitions using the existing NIRvana server. No dashboard files are saved; LightField's existing export settings still apply. Stop finishes the current spectrum."
+                               if self._uses_legacy_nirvana_live() else
+                               "Live alignment: no spectra saved. Camera rows are summed for NIRvana preview."
+                               if preview else "The connected NIRvana server only supports file-export acquisitions. A no-save live stream is unavailable; normal Acquire still works.")
+
     def _get_data_for_mode(self, mode):
         """Return (x, y) arrays for a single plot mode, or (None, None) if unavailable."""
-        if mode == "Live":
-            return self.live_x, self.live_y
 
         if mode == "Background" and self.bg_y is not None:
             return self.bg_x, self.bg_y
@@ -1900,6 +2105,8 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
 
         x = self.signal_x
         y = self.signal_y
+        if mode == "Signal":
+            return x, y
 
         def get_interp(ref_x, ref_y):
             if ref_y is None or ref_x is None:
@@ -1908,43 +2115,51 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
                 return ref_y
             return np.interp(x, ref_x, ref_y)
 
-        bg_y_interp  = get_interp(self.bg_x,  self.bg_y)
-        ref_y_interp = get_interp(self.ref_x, self.ref_y)
+        bg_y_interp = get_interp(self.bg_x, self.bg_y)
 
-        if mode == "Signal":
-            return x, y
-        elif mode == "Background":
+        if mode == "Background":
             return self.bg_x, self.bg_y
         elif mode == "Reference":
             return self.ref_x, self.ref_y
         elif mode == "Signal - Background":
             return x, y - bg_y_interp
         elif mode == "(Signal - Reference) / (Reference - Background)":
+            ref_y_interp = get_interp(self.ref_x, self.ref_y)
             denom = ref_y_interp - bg_y_interp
             denom[denom == 0.0] = 1e-9
             return x, (y - ref_y_interp) / denom
     def closeEvent(self, event):
+        if getattr(self, "control_worker", None) is not None and self.control_worker.isRunning():
+            event.ignore()
+            return
         if hasattr(self, "status_worker") and self.status_worker.isRunning():
             self.status_worker.stop()
             self.status_worker.wait()
         if getattr(self, "worker", None) and self.worker.isRunning():
             self.worker.stop()
             self.worker.wait()
-        if hasattr(self, "live_poll_proxy") and self.live_poll_proxy is not None:
-            try:
-                self.live_poll_proxy._pyroRelease()
-            except Exception:
-                pass
+        if self._intermediate_worker is not None:
+            self._intermediate_worker.wait()
         self.save_value_storage()
         super().closeEvent(event)
+
+    def _on_manual_plot_range(self, _axes):
+        self._live_autoscale = False
+        self.plot_widget.disableAutoRange()
+
+    def _on_plot_view_state(self, view):
+        # PyQtGraph's "A" (auto-range) button also resumes live autoscaling.
+        if all(view.autoRangeEnabled()):
+            self._live_autoscale = True
 
     def replot(self):
         scale = self.scale_combo.currentText()
         use_energy = scale == "Energy (eV)"
-        if use_energy:
-            self.plot_widget.setLabel('bottom', 'Energy', 'eV')
-        else:
-            self.plot_widget.setLabel('bottom', 'Wavelength', 'nm')
+        if scale != getattr(self, "_plotted_axis_scale", None):
+            self.plot_widget.setLabel('bottom', 'Energy' if use_energy else 'Wavelength',
+                                      'eV' if use_energy else 'nm')
+            configure_plot_axes(self.plot_widget)
+            self._plotted_axis_scale = scale
 
         for mode, curve in self.plot_curves.items():
             cb = self.plot_mode_checks[mode]
@@ -1959,7 +2174,7 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
                         curve.setData(np.asarray(x), np.asarray(y))
                 else:
                     curve.setData([], [])
-            else:
+            elif curve.xData is not None and len(curve.xData):
                 curve.setData([], [])
 
     def scale_plots(self):
@@ -2004,6 +2219,9 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         else:
             # Fallback to standard autoRange if no active curve has data
             self.plot_widget.autoRange()
+        self._live_autoscale = True
+        if self.is_running and getattr(self, "active_acquisition_mode", None) == "continuous":
+            self.plot_widget.enableAutoRange()
 
     def toggle_view_control_popup(self):
         if self.view_control_popup.isVisible():
@@ -2018,6 +2236,9 @@ class SingleSpectraWindow(QtWidgets.QMainWindow):
         popup = self.view_control_popup
         mode = popup.get_axis_mode()
         if mode == "None":
+            return
+        if mode == "Both":
+            self.scale_plots()
             return
             
         x_min, x_max = None, None
