@@ -1,4 +1,7 @@
-pip install PyQt6 pyqtgraph Pyro4 h5py numpy pandas qcodes pyvisa
-pip install qcodes qcodes-contrib-drivers PyQt6 pyqtgraph h5py numpy Pyro4 pyvisa pyvisa-py
+# The GUI needs pyqtgraph 0.14 (0.13 lacks AxisItem.setSIPrefixEnableRanges).
+# Keep numpy below 2: h5py, scipy and matplotlib builds made for numpy 1.x fail with numpy 2.
+# Tested: pyqtgraph 0.14.0, numpy 1.26.4, PyQt6 6.12.0. Quotes are needed for < and >.
+pip install PyQt6 "pyqtgraph>=0.14,<0.15" Pyro4 h5py "numpy>=1.25,<2" pandas qcodes pyvisa
+pip install qcodes qcodes-contrib-drivers PyQt6 "pyqtgraph>=0.14,<0.15" h5py "numpy>=1.25,<2" Pyro4 pyvisa pyvisa-py
 
 pip install thorlabs-elliptec

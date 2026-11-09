@@ -57,7 +57,15 @@ At each measurement point: ramp channel 1, ramp channel 2, wait the full GUI
 settling time, then acquire. Stop or a failed ramp prevents acquisition;
 resuming a paused DGS repeats the point's ramps and settling before acquiring.
 Stop holds the last gate voltages; B/V ground-on-completion remains a ramp
-applied only after successful completion.
+applied only after successful completion. Dual Gate's **Ramp gates to 0 V when
+complete** (off by default, saved as `dual_gate.ramp_to_zero`) likewise runs only
+after a complete sweep: both channels move together along a straight line to
+0 V in alternating steps of at most 0.05 V at their ramp rates, so the
+gate-to-gate voltage never rises on the way. Ramping one channel first could:
+(5 V, 5 V) passes (0 V, 5 V). Outputs stay on. The GUI stays locked until 0 V
+is reached; Stop holds the voltages reached and Interrupt repeats the step after
+Resume. If the end ramp fails, the error states that the sweep data is complete.
+Position DGS hides this option and keeps the gates after every pixel.
 
 Enabling a previously disabled voltage output first ramps the dormant setpoint
 to zero, enables the output, and ramps back to its original requested voltage.

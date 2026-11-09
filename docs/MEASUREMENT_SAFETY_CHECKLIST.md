@@ -14,6 +14,7 @@
 - [x] Latest-frame display avoids stale-frame queues and the former 100 ms artificial delay.
 - [x] Direct gate-coefficient proposal documented; existing transform not migrated.
 - [x] Native Qt shutdown crash reproduced, isolated and fixed while keeping wheel protection active.
+- [x] Optional Dual-Gate end ramp: both gates to 0 V together, only after a complete sweep (off by default).
 
 ## To do after editing
 
@@ -58,7 +59,8 @@ was restarted or updated on its host PC.
 - Manual current-source mode cannot guarantee voltage slew rate; gate sweeps
   require voltage sourcing. Explicit OFF remains immediate.
 - Stop and Data plotter mode leave gate outputs at existing setpoints; they do
-  not automatically disconnect or ground the sample.
+  not automatically disconnect or ground the sample. The optional Dual-Gate end
+  ramp only brings the setpoints to 0 V after a complete sweep; outputs stay on.
 - Other programs and instrument front-panel changes remain outside GUI control.
 
 See `GATE_CURRENT_PROTECTION.md` for the exact protections and

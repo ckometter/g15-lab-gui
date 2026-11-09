@@ -225,6 +225,95 @@ class DgsRampSequenceTests(unittest.TestCase):
         self.assertTrue(self.station.smu.ch1.ramp_stop_requested)
         self.assertTrue(self.station.smu.ch2.ramp_stop_requested)
 
+    def track_setpoints(self, events, on_write=None):
+        """Stateful fake channels: set_r.volt changes what volt() reads back."""
+        setpoints = {1: 0., 2: 0.}
+        for axis in (1, 2):
+            channel = getattr(self.station.smu, f'ch{axis}')
+            channel.volt.side_effect = lambda axis=axis: setpoints[axis]
+
+            def write(target, axis=axis):
+                if on_write is not None:
+                    on_write(axis, target)
+                setpoints[axis] = target
+                events.append(('ramp', axis, target))
+            channel.set_r.volt.side_effect = write
+        return setpoints
+
+    def test_optional_final_ramp_moves_both_gates_together_before_finished(self):
+        self.params['ramp_to_zero'] = True
+        worker = self.worker()
+        events = []
+        setpoints = self.track_setpoints(events)
+        worker.finished.connect(lambda: events.append(('finished',)), DIRECT)
+        worker._do_run()
+        self.assertEqual(worker.errors, [])
+        self.assertEqual(len(worker.points), 1)
+        self.assertEqual(events[:2], [('ramp', 1, .2), ('ramp', 2, .3)])
+        self.assertEqual(events[-1], ('finished',))
+        final = events[2:-1]
+        self.assertEqual([axis for _, axis, _ in final], [1, 2] * (len(final) // 2))
+        self.assertEqual(final[-2:], [('ramp', 1, 0.), ('ramp', 2, 0.)])
+        self.assertEqual(setpoints, {1: 0., 2: 0.})
+        previous = {1: .2, 2: .3}
+        for _, axis, target in final:
+            self.assertLessEqual(abs(target - previous[axis]), .05 + 1e-12)
+            previous[axis] = target
+        # Both gates stay on the straight line to 0 V: V1/V2 keeps the 0.2/0.3 ratio.
+        for (_, _, v1), (_, _, v2) in zip(final[0:-2:2], final[1:-2:2]):
+            self.assertAlmostEqual(v1 / v2, .2 / .3)
+
+    def test_final_ramp_is_off_by_default_and_never_runs_inside_position_scans(self):
+        for position, enabled in ((False, False), (True, True)):
+            with self.subTest(position=position, enabled=enabled):
+                self.store.reset_mock()
+                self.store.position_finished.return_value = True
+                if enabled:
+                    self.params['ramp_to_zero'] = True
+                worker = self.worker(position)
+                events = []
+                setpoints = self.track_setpoints(events)
+                worker.run() if position else worker._do_run()
+                self.assertEqual(events, [('ramp', 1, .2), ('ramp', 2, .3)])
+                self.assertEqual(setpoints, {1: .2, 2: .3})
+                if position:
+                    self.assertTrue(worker.completed)
+
+    def test_stop_during_final_ramp_holds_reached_voltages_without_finished(self):
+        self.params['ramp_to_zero'] = True
+        worker = self.worker()
+        events, writes = [], [0]
+
+        def stop_on_fifth_write(axis, target):
+            writes[0] += 1
+            if writes[0] == 5:  # two sweep writes, then two final-ramp steps
+                worker.stop()
+                raise GateRampCancelled('Stop requested')
+        setpoints = self.track_setpoints(events, stop_on_fifth_write)
+        worker.finished.connect(lambda: events.append(('finished',)), DIRECT)
+        worker._do_run()
+        self.assertEqual(worker.errors, [])
+        self.assertNotIn(('finished',), events)
+        self.assertEqual(len(events), 4)
+        self.assertEqual(setpoints, {1: events[2][2], 2: events[3][2]})
+        self.assertGreater(setpoints[2], 0)
+
+    def test_final_ramp_failure_reports_that_the_sweep_data_is_complete(self):
+        self.params['ramp_to_zero'] = True
+        worker = self.worker()
+        events, writes = [], [0]
+
+        def fail_in_final_ramp(axis, target):
+            writes[0] += 1
+            if writes[0] == 3:
+                raise RuntimeError('setpoint not confirmed')
+        self.track_setpoints(events, fail_in_final_ramp)
+        worker._do_run()
+        self.assertEqual(len(worker.points), 1)
+        self.assertEqual(len(worker.errors), 1)
+        self.assertIn('Sweep data is complete', worker.errors[0])
+        self.assertIn('setpoint not confirmed', worker.errors[0])
+
     def test_stop_before_manual_worker_run_issues_no_set_commands(self):
         for parameter in ('volt', 'curr', 'output'):
             with self.subTest(parameter=parameter):

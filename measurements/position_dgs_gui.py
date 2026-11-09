@@ -72,6 +72,10 @@ class PositionDGSWindow(MainWindow):
         for key in ('move_rate', 'return_rate'):
             self.scan_inputs[key].setToolTip('Also capped by the scanner safety rate saved in the Dashboard.')
         self.serpentine_box.setToolTip('Applies to the gate sweep within each scanner pixel. Scanner lines always run forward in X, return X slowly, then step Y.')
+        # The Dual-Gate end ramp is not offered here: per-pixel sweeps keep their gates.
+        with QtCore.QSignalBlocker(self.ramp_zero_box):
+            self.ramp_zero_box.setChecked(False)
+        self.ramp_zero_box.hide()
         self.read_origin_btn = QtWidgets.QPushButton('Use current scanner offsets')
         self.read_origin_btn.setToolTip('Read the connected ANC300 X/Y offsets into the Start fields. Does not move either axis or change Size or Step.')
         self.read_origin_btn.clicked.connect(self.read_scan_origin)

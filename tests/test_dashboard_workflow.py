@@ -35,7 +35,8 @@ class DashboardWorkflowTests(unittest.TestCase):
             "single_spectra": {"num_spectra": 2},
         }))
         for name in ("single_spectra_gui", "Dual_gate_sweep_gui", "B_V_sweep_gui",
-                     "photoluminescence_map_gui", "scalar_map_gui", "polarization_control_gui", "position_dgs_gui"):
+                     "photoluminescence_map_gui", "scalar_map_gui", "polarization_control_gui", "position_dgs_gui",
+                     "capacitance_gui"):
             module = importlib.import_module("measurements." + name)
             self.context.enter_context(patch.object(module, "parent_dir", directory))
         self.context.enter_context(patch.object(PositionTab, "save_storage"))
@@ -706,6 +707,38 @@ class DashboardWorkflowTests(unittest.TestCase):
                 self.assertIn(name, data)
             self.assertEqual(data["spectra"].shape, (2, 2, 512))
             self.assertEqual(json.loads(data.attrs["device_modes"])["smu"], "simulated")
+        self.errors.assert_not_called()
+
+    def test_dgs_optional_end_ramp_returns_gates_to_zero_and_is_persisted(self):
+        window = self.dashboard.dual_window
+        self.dashboard.tab_widget.setCurrentIndex(1)
+        for axis, end in ((1, 0.3), (2, -0.2)):
+            getattr(window, f"c{axis}_start").setValue(end / 2)
+            getattr(window, f"c{axis}_end").setValue(end)
+            getattr(window, f"c{axis}_pts").setValue(2)
+        window.exposure_box.setValue(0.01)
+        window.settling_box.setValue(0)
+        # Raster order, so the last point is (C1 end, C2 end) = (0.3, -0.2).
+        window.sweep_mode_combo.setCurrentText("Hold C2, sweep C1")
+        window.serpentine_box.setChecked(False)
+        # Default off: the gates hold the last sweep point, as before.
+        self.assertFalse(window.ramp_zero_box.isChecked())
+        window.begin_sweep()
+        self.wait_for(lambda: not window.is_running, timeout=10)
+        self.assertAlmostEqual(self.station.smu.ch1.volt(), 0.3)
+        self.assertAlmostEqual(self.station.smu.ch2.volt(), -0.2)
+        window.ramp_zero_box.setChecked(True)
+        self.assertTrue(json.loads((self.directory / "value_storage").read_text())["dual_gate"]["ramp_to_zero"])
+        window.begin_sweep()
+        self.assertFalse(window.ramp_zero_box.isEnabled())
+        self.wait_for(lambda: not window.is_running, timeout=10)
+        self.assertTrue(np.all(window.data_measured_mask))
+        self.assertEqual(self.station.smu.ch1.volt(), 0.0)
+        self.assertEqual(self.station.smu.ch2.volt(), 0.0)
+        self.assertTrue(window.ramp_zero_box.isEnabled())
+        # Position DGS reuses this panel but never offers the end ramp.
+        self.assertTrue(self.dashboard.position_dgs_window.ramp_zero_box.isHidden())
+        self.assertFalse(self.dashboard.position_dgs_window.ramp_zero_box.isChecked())
         self.errors.assert_not_called()
 
     def test_position_dgs_records_all_positions_and_reopens_without_motion(self):
