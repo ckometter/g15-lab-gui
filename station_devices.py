@@ -27,6 +27,9 @@ DEVICE_NAMES = (
     "piezo300",
     "magnet",
     "powermeter",
+    "lockin",
+    "awg",
+    "dac",
 )
 
 DEVICE_LABELS = {
@@ -40,6 +43,9 @@ DEVICE_LABELS = {
     "piezo300": "Attocube ANC300",
     "magnet": "Oxford magnet",
     "powermeter": "Thorlabs PM100D power meter",
+    "lockin": "SR830 lock-in (capacitance bridge)",
+    "awg": "Siglent SDG2042X AWG (bridge excitation)",
+    "dac": "QPG uVoltDAQ DAC/ADC (gate voltages)",
 }
 
 
@@ -79,6 +85,29 @@ def _physical_powermeter():
         except Exception as exc:
             errors.append(f"{address}: {exc}")
     raise RuntimeError("Power meter connection failed. " + "; ".join(errors))
+
+
+def _physical_awg():
+    """Prefer any Siglent USB generator (vendor 0xF4EC), then the configured address."""
+    import pyvisa
+
+    configured = station_setup.AWG_ADDRESS
+    # Borrow the shared manager without closing it (see _physical_powermeter).
+    manager = pyvisa.ResourceManager()
+    try:
+        found = [address for address in manager.list_resources()
+                 if "USB" in address.upper() and "F4EC" in address.upper()]
+    except Exception as exc:
+        print(f"VISA enumeration failed ({exc}); trying the configured AWG address.")
+        found = []
+    addresses = list(dict.fromkeys(found + [configured]))
+    errors = []
+    for address in addresses:
+        try:
+            return station_setup.SiglentSDG2042X("awg", address=address)
+        except Exception as exc:
+            errors.append(f"{address}: {exc}")
+    raise RuntimeError("Siglent AWG connection failed. " + "; ".join(errors))
 
 
 def initialize_device(station, name, *, simulated, spectrometer_type=None):
@@ -134,6 +163,16 @@ def initialize_device(station, name, *, simulated, spectrometer_type=None):
                 station_setup.ThorlabsPM100D(name, address="simulated")
                 if simulated else _physical_powermeter()
             )
+        elif name == "lockin":
+            component = station_setup.StanfordSR830(
+                name, address="simulated" if simulated else station_setup.LOCKIN_ADDRESS)
+        elif name == "awg":
+            component = (station_setup.SiglentSDG2042X(name, address="simulated")
+                         if simulated else _physical_awg())
+        elif name == "dac":
+            # Connecting never sends INITIALIZE; existing DAC voltages are retained.
+            component = station_setup.QPGuVoltDAQ(
+                name, address="simulated" if simulated else station_setup.DAC_ADDRESS)
         if name in ("piezo150", "piezo300") and not simulated:
             print(f"Identified {name} at {address}; existing voltages/modes are retained.")
         if name == "camera" and not simulated and isinstance(component.remote_lf, NIRvanaSocketWrapper):
@@ -217,6 +256,22 @@ def verify_device(component, name):
         component.field()
     elif name == "powermeter":
         component.power()
+    elif name == "lockin":
+        identity = component.IDN()
+        print(f"Lock-in: {identity.get('vendor')} {identity.get('model')}, reference "
+              f"{component.reference_source()} at {component.frequency():.6g} Hz, "
+              f"sensitivity {component.sensitivity():g} V. Readback only; no settings changed.")
+    elif name == "awg":
+        identity = component.IDN()
+        states = [f"CH{n}: {'ON' if s['enabled'] else 'OFF'} {s['wave_type']} {s['frequency']:.6g} Hz "
+                  f"{s['amplitude']:g} Vpp phase {s['phase']:g} deg"
+                  for n, s in ((n, getattr(component, f'ch{n}').state()) for n in (1, 2))]
+        print(f"AWG: {identity.get('vendor')} {identity.get('model')}. " + "; ".join(states)
+              + ". Readback only; outputs unchanged.")
+    elif name == "dac":
+        component.IDN()
+        voltages = ", ".join(f"DAC{ch} {component.dac(ch).voltage():.6g} V" for ch in range(4))
+        print(f"uVoltDAQ setpoints: {voltages}. Readback only; no voltage changed.")
     else:
         component.IDN()
     return "VERIFIED (readback)"

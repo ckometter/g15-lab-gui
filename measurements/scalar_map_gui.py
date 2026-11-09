@@ -1479,9 +1479,8 @@ class ScalarMapWindow(QtWidgets.QMainWindow):
         from theme import SCIENTIFIC_THEME_QSS
         self.setStyleSheet(SCIENTIFIC_THEME_QSS)
 
-        # Hide up/down arrows on all spinboxes
-        for spin in self.findChildren(QtWidgets.QAbstractSpinBox):
-            spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+        # The theme hides spin-box arrows (zero-width buttons). Also setting NoButtons
+        # leaves a 1 px number field with PyQt6 >= 6.12, so it is not used.
 
         # Apply unified dark styling and gridlines to all PlotWidgets
         import pyqtgraph as pg

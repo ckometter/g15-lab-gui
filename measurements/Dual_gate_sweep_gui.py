@@ -24,7 +24,7 @@ if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
 from station_setup import initialize_station, simulated_devices
-from gate_safety import (GATE_CURRENT_COMPLIANCE_A, GATE_MAX_ABS_VOLTAGE_V,
+from gate_safety import (GATE_CURRENT_COMPLIANCE_A, GATE_MAX_ABS_VOLTAGE_V, GATE_MAX_RAMP_STEP_V,
                          GateRampCancelled, validate_gate_targets, validate_gate_voltage,
                          validate_current_compliance)
 from gui_safety import install_parameter_wheel_guard
@@ -602,10 +602,61 @@ class SweepWorker(QtCore.QThread):
                     self.point_measured.emit(i, j, c1, c2, v1, v2, spectrum, curr_ch1, curr_ch2, meas_v1, meas_v2, meas_b, raw_frames)
                     self.progress_updated.emit(point_count, total_points)
 
+            # Optional end ramp, before "finished" so the GUI stays locked until 0 V.
+            # Standalone sweeps only: Position DGS runs this loop once per pixel
+            # with its own controller and must keep the gates where they are.
+            if self.params.get('ramp_to_zero', False) and self._control is self:
+                self.status_updated.emit('Status: Sweep complete. Ramping both gates to 0 V...')
+                try:
+                    if not self.ramp_gates_to_zero(smu):
+                        return
+                except Exception as exc:
+                    raise RuntimeError(f'Sweep data is complete, but the final ramp to 0 V failed: {exc}') from exc
+
             self.finished.emit()
 
         except Exception as e:
             self.error_occurred.emit(str(e))
+
+    def ramp_gates_to_zero(self, smu):
+        """Ramp both gates to 0 V together after a complete sweep.
+
+        The channels advance in alternating steps of at most GATE_MAX_RAMP_STEP_V
+        along a straight line to 0 V, at their configured ramp rates. Ramping one
+        channel after the other could transiently raise the gate-to-gate voltage,
+        e.g. (5 V, 5 V) -> (0 V, 5 V). Stop holds the voltages reached; a pause
+        repeats the interrupted step after Resume. Returns False when stopped.
+        """
+        start = [validate_gate_voltage(float(getattr(smu, f'ch{axis}').volt()), axis) for axis in (1, 2)]
+        steps = math.ceil(max(abs(value) for value in start) / GATE_MAX_RAMP_STEP_V - 1e-12)
+        a, b, c, d = (self.params[key] for key in ('a', 'b', 'c', 'd'))
+        for index in range(1, steps + 1):
+            targets = [0.0 if index == steps else value * (1 - index / steps) for value in start]
+            for axis, target in zip((1, 2), targets):
+                channel = getattr(smu, f'ch{axis}')
+                while True:
+                    if not self.check_pause_and_stop():
+                        return False
+                    generation = self.prepare_gate_ramp()
+                    if generation is None:
+                        return False
+                    try:
+                        channel.set_r.volt(target)
+                    except GateRampCancelled:
+                        if not self._control._is_running:
+                            return False
+                        if self._control._cancel_generation == generation:
+                            raise
+                        continue  # Paused inside the step: repeat it after Resume.
+                    if getattr(channel, 'ramp_stop_requested', False):
+                        if self._control._cancel_generation == generation:
+                            raise GateRampCancelled('Gate output cancelled during the final ramp to 0 V.')
+                        continue
+                    break
+            # Virtual-gate values follow VG1 = a*V1 + b*V2 and VG2 = c*V1 + d*V2.
+            self.voltage_updated.emit(a * targets[0] + b * targets[1], c * targets[0] + d * targets[1],
+                                      targets[0], targets[1])
+        return True
 
 
 class ViewControlPopup(QtWidgets.QFrame):
@@ -1159,7 +1210,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "coeff_c": 0.0,
             "coeff_d": 1.0,
             "sweep_mode": "Hold C1, sweep C2",
-            "serpentine": True
+            "serpentine": True,
+            "ramp_to_zero": False
         }
         self.stored_settings = defaults.copy()
         if os.path.exists(storage_path):
@@ -1279,6 +1331,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 current_data["dual_gate"]["sweep_mode"] = self.sweep_mode_combo.currentText()
             if hasattr(self, "serpentine_box"):
                 current_data["dual_gate"]["serpentine"] = self.serpentine_box.isChecked()
+            if hasattr(self, "ramp_zero_box"):
+                current_data["dual_gate"]["ramp_to_zero"] = self.ramp_zero_box.isChecked()
 
             # Purge deprecated root-level keys and legacy c1/c2 compliance keys
             deprecated_keys = [
@@ -1397,6 +1451,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.serpentine_box.blockSignals(True)
         self.serpentine_box.setChecked(self.stored_settings.get("serpentine", True))
         self.serpentine_box.blockSignals(False)
+
+        self.ramp_zero_box.blockSignals(True)
+        self.ramp_zero_box.setChecked(self.stored_settings.get("ramp_to_zero", False))
+        self.ramp_zero_box.blockSignals(False)
 
         self.update_step_calculations()
         self.update_variable_names()
@@ -1848,6 +1906,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.serpentine_box.setChecked(self.stored_settings.get("serpentine", True))
         self.serpentine_box.stateChanged.connect(self.save_storage)
         other_layout.addWidget(self.serpentine_box)
+
+        self.ramp_zero_box = QtWidgets.QCheckBox("Ramp gates to 0 V when complete")
+        self.ramp_zero_box.setToolTip(
+            "After a complete sweep, ramp both channels to 0 V together (straight line, "
+            "steps of at most 0.05 V at the set ramp rates). Stop and errors keep the "
+            "present voltages; outputs stay on.")
+        self.ramp_zero_box.setChecked(self.stored_settings.get("ramp_to_zero", False))
+        self.ramp_zero_box.stateChanged.connect(self.save_storage)
+        other_layout.addWidget(self.ramp_zero_box)
 
         # Timing Grid
         timing_grid = QtWidgets.QGridLayout()
@@ -2377,7 +2444,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "coeff_c": 0.0,
             "coeff_d": 1.0,
             "sweep_mode": "Hold C1, sweep C2",
-            "serpentine": True
+            "serpentine": True,
+            "ramp_to_zero": False
         }
         self.stored_settings = defaults.copy()
         if os.path.exists(storage_path):
@@ -2497,6 +2565,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 current_data["dual_gate"]["sweep_mode"] = self.sweep_mode_combo.currentText()
             if hasattr(self, "serpentine_box"):
                 current_data["dual_gate"]["serpentine"] = self.serpentine_box.isChecked()
+            if hasattr(self, "ramp_zero_box"):
+                current_data["dual_gate"]["ramp_to_zero"] = self.ramp_zero_box.isChecked()
 
             # Purge deprecated root-level keys and legacy c1/c2 compliance keys
             deprecated_keys = [
@@ -2615,6 +2685,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.serpentine_box.blockSignals(True)
         self.serpentine_box.setChecked(self.stored_settings.get("serpentine", True))
         self.serpentine_box.blockSignals(False)
+
+        self.ramp_zero_box.blockSignals(True)
+        self.ramp_zero_box.setChecked(self.stored_settings.get("ramp_to_zero", False))
+        self.ramp_zero_box.blockSignals(False)
 
         self.update_step_calculations()
         self.update_variable_names()
@@ -3059,6 +3133,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.serpentine_box.setChecked(self.stored_settings.get("serpentine", True))
         self.serpentine_box.stateChanged.connect(self.save_storage)
         other_layout.addWidget(self.serpentine_box)
+
+        self.ramp_zero_box = QtWidgets.QCheckBox("Ramp gates to 0 V when complete")
+        self.ramp_zero_box.setToolTip(
+            "After a complete sweep, ramp both channels to 0 V together (straight line, "
+            "steps of at most 0.05 V at the set ramp rates). Stop and errors keep the "
+            "present voltages; outputs stay on.")
+        self.ramp_zero_box.setChecked(self.stored_settings.get("ramp_to_zero", False))
+        self.ramp_zero_box.stateChanged.connect(self.save_storage)
+        other_layout.addWidget(self.ramp_zero_box)
 
         # Timing Grid
         timing_grid = QtWidgets.QGridLayout()
@@ -3514,9 +3597,8 @@ class MainWindow(QtWidgets.QMainWindow):
         from theme import SCIENTIFIC_THEME_QSS
         self.setStyleSheet(SCIENTIFIC_THEME_QSS)
 
-        # Hide up/down arrows on all spinboxes
-        for spin in self.findChildren(QtWidgets.QAbstractSpinBox):
-            spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+        # The theme hides spin-box arrows (zero-width buttons). Also setting NoButtons
+        # leaves a 1 px number field with PyQt6 >= 6.12, so it is not used.
 
         # Apply unified dark styling and gridlines to all PlotWidgets
         import pyqtgraph as pg
@@ -3969,7 +4051,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             with QtCore.QSignalBlocker(box):
                 box.setReadOnly(not editable)
-                box.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
                 box.setDecimals(12)
                 box.setRange(-1.0, 1e12)
                 box.setSpecialValueText('Readback unavailable')
@@ -4086,6 +4167,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settling_box.setEnabled(enabled)
         self.sweep_mode_combo.setEnabled(enabled)
         self.serpentine_box.setEnabled(enabled)
+        self.ramp_zero_box.setEnabled(enabled)
 
     # --- Sweep Measurement Control ---
     def begin_sweep(self):
@@ -4245,6 +4327,7 @@ class MainWindow(QtWidgets.QMainWindow):
             'c2_pts': self.c2_pts.value(),
             'sweep_mode': self.sweep_mode_combo.currentText(),
             'serpentine': self.serpentine_box.isChecked(),
+            'ramp_to_zero': self.ramp_zero_box.isChecked(),
             'exposure_time': self.exposure_box.value(),
             'settling_time': self.settling_box.value(),
             'num_pixels': num_pixels,
