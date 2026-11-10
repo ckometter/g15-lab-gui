@@ -9,9 +9,9 @@ try:
 except ImportError:
     pass
 
-import qcodes as qc
 from qcodes.dataset import initialise_or_create_database_at
 from qcodes.instrument import Instrument
+from qcodes.station import Station
 
 # Add current folder to sys.path to ensure local drivers package is importable
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -82,7 +82,7 @@ simulated_devices = {
     'dac': True,
 }
 
-def initialize_station(simulated: bool = False, simulated_devices: dict = None, db_path: str = "my_measurement_data.db", spectrometer_type: str = SPECTROMETER_TYPE) -> qc.Station:
+def initialize_station(simulated: bool = False, simulated_devices: dict = None, db_path: str = "my_measurement_data.db", spectrometer_type: str = SPECTROMETER_TYPE) -> Station:
     """
     Close existing instrument instances to avoid name conflict errors, connect to the database,
     and initialize all station components (both physical and simulated).
@@ -94,7 +94,7 @@ def initialize_station(simulated: bool = False, simulated_devices: dict = None, 
     initialise_or_create_database_at(db_abs_path)
     print(f"QCoDeS database set to: {db_abs_path}")
 
-    station = qc.Station()
+    station = Station()
 
     if simulated_devices is None:
         simulated_devices = globals()['simulated_devices'].copy()

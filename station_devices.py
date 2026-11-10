@@ -8,9 +8,9 @@ and reports when an unavailable physical device is replaced by simulation.
 import os
 from contextlib import contextmanager
 
-import qcodes as qc
 from qcodes.dataset import initialise_or_create_database_at
 from qcodes.instrument import Instrument
+from qcodes.station import Station
 
 import station_setup
 from drivers.remote_client import ClientLightFieldCamera, ClientLightFieldMonochromator, NIRvanaSocketWrapper
@@ -53,7 +53,7 @@ def create_station(db_path):
     """Create the shared QCoDeS station once, before any device is opened."""
     Instrument.close_all()
     initialise_or_create_database_at(os.path.abspath(db_path))
-    return qc.Station()
+    return Station()
 
 
 def _spectrometer_config(spectrometer_type):
