@@ -61,10 +61,12 @@ if PhysicalANC300 is not None:
                                 submod.parameters[p_name]._snapshot_get = False
 
         def _open_resource(self, address: str, visalib: str | None):
-            resource = super()._open_resource(address, visalib)
+            opened = super()._open_resource(address, visalib)
+            # qcodes 0.51 returns (resource, backend, manager); qcodes 0.59 returns the resource.
+            resource = opened[0] if isinstance(opened, tuple) else opened
             if 'ASRL' in address:
                 resource.baud_rate = 38400
-            return resource
+            return opened
 
         def _clear_input_buffer(self):
             if hasattr(self, 'visa_handle') and self.visa_handle is not None:
