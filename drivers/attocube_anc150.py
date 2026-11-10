@@ -70,10 +70,12 @@ class AttocubeANC150(VisaInstrument):
             self.connect_message()
 
     def _open_resource(self, address: str, visalib: str | None):
-        resource = super()._open_resource(address, visalib)
+        opened = super()._open_resource(address, visalib)
+        # qcodes 0.51 returns (resource, backend, manager); qcodes 0.59 returns the resource.
+        resource = opened[0] if isinstance(opened, tuple) else opened
         if 'ASRL' in address:
             resource.baud_rate = 38400
-        return resource
+        return opened
 
     def ask_raw(self, cmd: str) -> str:
         lock = getattr(self, 'comm_lock', None)
