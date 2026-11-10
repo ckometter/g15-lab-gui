@@ -15,11 +15,13 @@
 - [x] Direct gate-coefficient proposal documented; existing transform not migrated.
 - [x] Native Qt shutdown crash reproduced, isolated and fixed while keeping wheel protection active.
 - [x] Optional Dual-Gate end ramp: both gates to 0 V together, only after a complete sweep (off by default).
+- [x] Dual-Gate outputs: Keysight or a uVoltDAQ DAC per gate; DAC gates checked against +/-10 V, currents saved as NaN.
 
 ## To do after editing
 
 - [ ] Relaunch the measurement GUI at an idle point; source edits do not update a running process.
 - [ ] Check physical device/readback status before connecting a sample or measuring.
+- [ ] Check that each gate is wired to its selected Dual-Gate **Output** before measuring with the uVoltDAQ.
 - [ ] Review `GATE_COORDINATE_PROPOSAL.md` before implementing a new coordinate convention.
 
 ## Validation (2026-10-01)

@@ -350,7 +350,7 @@ class LabMainWindow(QtWidgets.QMainWindow):
         for name, tabs in {"smu": (1, 2, CAPACITANCE_TAB), "camera": (0, 1, 2, 3), "magnet": (2,),
                            "piezo300": (3, 4, 5), "piezo150": (5,), "rotator1": (6,),
                            "rotator2": (6,), "rotator3": (6,), "lockin": (CAPACITANCE_TAB,),
-                           "awg": (CAPACITANCE_TAB,), "dac": (CAPACITANCE_TAB,)}.items():
+                           "awg": (CAPACITANCE_TAB,), "dac": (1, CAPACITANCE_TAB)}.items():
             # Full list is always visible, including devices used indirectly.
             for index in tabs:
                 self.tab_widget.setTabToolTip(index, self.simulation_label.text())

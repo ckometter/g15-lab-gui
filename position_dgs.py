@@ -12,6 +12,7 @@ import numpy as np
 from PyQt6 import QtCore
 
 from measurements.Dual_gate_sweep_gui import SweepWorker, validate_dgs_parameters, require_voltage_source_modes
+from dgs_gate_outputs import DEFAULT_GATE_OUTPUTS, normalize_gate_outputs
 from scanner_safety import SafeScannerMotion
 
 # The PSDGS scanner safety limit lives here. Applies to X/Y offsets, NOT gates.
@@ -230,6 +231,8 @@ class PositionSweepWorker(SweepWorker):
                 for value in np.concatenate((x, y)):
                     self.station.piezo300.scanner_settings.validate(value)
             validate_dgs_parameters(self.params)
+            if normalize_gate_outputs(self.params.get('gate_outputs')) != DEFAULT_GATE_OUTPUTS:
+                raise ValueError('Position scans drive both gates with the Keysight only.')
             scanner_state(self.station.piezo300)  # Both axes before any write.
             require_voltage_source_modes(self.station.smu)
             self.station.smu.enforce_current_compliance()
