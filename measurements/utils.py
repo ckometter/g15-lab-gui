@@ -16,10 +16,17 @@ def configure_plot_axes(plot):
         axis.setStyle(autoExpandTextSpace=True, autoReduceTextSpace=True,
                       hideOverlappingLabels=True)
         if axis.labelUnits == 'V':
-            # In pyqtgraph 0.14 disabling auto-prefixes still recalculates once.
-            # Clear any previous mV scale as well as preventing future changes.
-            axis.setSIPrefixEnableRanges(())
-            axis.enableAutoSIPrefix(False)
+            # Disabling auto-prefixes still recalculates once from the current
+            # range, which can leave a stale mV scale behind.
+            if hasattr(axis, 'setSIPrefixEnableRanges'):  # pyqtgraph >= 0.14
+                # Clear any previous mV scale as well as preventing future changes.
+                axis.setSIPrefixEnableRanges(())
+                axis.enableAutoSIPrefix(False)
+            else:  # pyqtgraph 0.13 has no prefix ranges: undo that recalculation.
+                axis.enableAutoSIPrefix(False)
+                axis.autoSIPrefixScale = 1.0
+                axis.labelUnitPrefix = ''
+                axis._updateLabel()
 
 
 def update_current_slice(plot, curve, coordinates, currents, measured):
