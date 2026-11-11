@@ -28,6 +28,7 @@ DEVICE_NAMES = (
     "magnet",
     "powermeter",
     "lockin",
+    "lockin2",
     "awg",
     "dac",
 )
@@ -43,7 +44,8 @@ DEVICE_LABELS = {
     "piezo300": "Attocube ANC300",
     "magnet": "Oxford magnet",
     "powermeter": "Thorlabs PM100D power meter",
-    "lockin": "SR830 lock-in (capacitance bridge)",
+    "lockin": "SR830 lock-in 1 (bridge / transport current)",
+    "lockin2": "SR830 lock-in 2 (transport voltage)",
     "awg": "Siglent SDG2042X AWG (bridge excitation)",
     "dac": "QPG uVoltDAQ DAC/ADC (gate voltages)",
 }
@@ -163,9 +165,9 @@ def initialize_device(station, name, *, simulated, spectrometer_type=None):
                 station_setup.ThorlabsPM100D(name, address="simulated")
                 if simulated else _physical_powermeter()
             )
-        elif name == "lockin":
-            component = station_setup.StanfordSR830(
-                name, address="simulated" if simulated else station_setup.LOCKIN_ADDRESS)
+        elif name in ("lockin", "lockin2"):
+            address = station_setup.LOCKIN_ADDRESS if name == "lockin" else station_setup.LOCKIN2_ADDRESS
+            component = station_setup.StanfordSR830(name, address="simulated" if simulated else address)
         elif name == "awg":
             component = (station_setup.SiglentSDG2042X(name, address="simulated")
                          if simulated else _physical_awg())
@@ -256,11 +258,12 @@ def verify_device(component, name):
         component.field()
     elif name == "powermeter":
         component.power()
-    elif name == "lockin":
+    elif name in ("lockin", "lockin2"):
         identity = component.IDN()
-        print(f"Lock-in: {identity.get('vendor')} {identity.get('model')}, reference "
-              f"{component.reference_source()} at {component.frequency():.6g} Hz, "
-              f"sensitivity {component.sensitivity():g} V. Readback only; no settings changed.")
+        print(f"{name}: {identity.get('vendor')} {identity.get('model')}, input "
+              f"{component.input_config()}, reference {component.reference_source()} at "
+              f"{component.frequency():.6g} Hz, sensitivity {component.sensitivity():g} "
+              f"{component.sensitivity.unit}. Readback only; no settings changed.")
     elif name == "awg":
         identity = component.IDN()
         states = [f"CH{n}: {'ON' if s['enabled'] else 'OFF'} {s['wave_type']} {s['frequency']:.6g} Hz "

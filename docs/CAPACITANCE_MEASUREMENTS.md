@@ -1,6 +1,6 @@
 # Capacitance bridge measurements
 
-The **Capacitance** tab (last tab, index 8) ports the qcodes-qpg
+The **Capacitance** tab (index 8) ports the qcodes-qpg
 `capacitance_measurement.py` workflow into the dashboard: balance an AC
 capacitance bridge once, then sweep the normalized density `n0` and field `p0`
 (or two electrode voltages directly) and convert the off-balance lock-in signal
@@ -8,6 +8,13 @@ into capacitance and dissipation at every point. The balancing algorithm is
 the original `CapacitanceBridgeSR830Lockin`, ported without Qt to
 [`capacitance_bridge.py`](../capacitance_bridge.py), where it can be reused by
 scripts and is tested against verbatim copies of the original formulas.
+
+The electrode, coordinate, limit, sweep, plot and file machinery is shared
+with the **Transport** tab ([TRANSPORT_MEASUREMENTS.md](TRANSPORT_MEASUREMENTS.md)):
+coordinates and limits in [`electrode_sweep.py`](../electrode_sweep.py),
+outputs and coordinated moves in [`electrode_outputs.py`](../electrode_outputs.py),
+and the common window in [`measurements/gate_map_gui.py`](../measurements/gate_map_gui.py).
+`capacitance_bridge.py` still re-exports the coordinate functions for scripts.
 
 | Type | AC excitation | Bridge (measurement) node | Default DC-fixed electrode |
 |---|---|---|---|
@@ -27,7 +34,7 @@ Physical or Simulation, then **Connect / Retry**). Checks are readback only.
 
 | Device name | Instrument | Address (`station_setup.py`) |
 |---|---|---|
-| `lockin` | SR830 lock-in (`lia1` in the g15 station.yaml) | `LOCKIN_ADDRESS = 'GPIB0::9::INSTR'` |
+| `lockin` | SR830 lock-in 1 (`lia1` in the g15 station.yaml; also the Transport tab's current lock-in) | `LOCKIN_ADDRESS = 'GPIB0::9::INSTR'` |
 | `awg` | Siglent SDG2042X (`awg`) | any USB VISA resource with Siglent vendor ID `F4EC`, else `AWG_ADDRESS` |
 | `dac` | QPG uVoltDAQ 4O4I (`da`) | `DAC_ADDRESS = 'ASRL15::INSTR'`; connecting never sends `INITIALIZE`, so present voltages are kept |
 | `smu` | Keysight B2902B (existing) | optional electrode outputs |

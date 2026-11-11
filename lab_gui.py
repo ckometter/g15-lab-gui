@@ -18,10 +18,12 @@ from measurements.scalar_map_gui import ScalarMapWindow
 from measurements.position_tab import PositionTab
 from measurements.position_dgs_gui import PositionDGSWindow
 from measurements.capacitance_gui import CapacitanceWindow
+from measurements.transport_gui import TransportWindow
 initialize_station = station_setup.initialize_station
 
-# Tab indices are positional; Capacitance is appended so earlier indices are unchanged.
+# Tab indices are positional; new tabs are appended so earlier indices are unchanged.
 CAPACITANCE_TAB = 8
+TRANSPORT_TAB = 9
 
 
 class LabMainWindow(QtWidgets.QMainWindow):
@@ -96,6 +98,14 @@ class LabMainWindow(QtWidgets.QMainWindow):
         self.capacitance_window = CapacitanceWindow(station, embed=True)
         self.capacitance_window.dashboard = self
         self.tab_widget.addTab(self.capacitance_window.centralWidget(), "Capacitance")
+
+        # ---- Four-probe Transport Tab ------------------------------------------
+        self.transport_window = TransportWindow(station, embed=True)
+        self.transport_window.dashboard = self
+        self.tab_widget.addTab(self.transport_window.centralWidget(), "Transport")
+        # Gate-map tabs (measurements/gate_map_gui.py) share one interface: busy(),
+        # save_storage(), reload_gui_from_storage(), live_status_worker, shutdown().
+        self.gate_map_tabs = {CAPACITANCE_TAB: self.capacitance_window, TRANSPORT_TAB: self.transport_window}
 
         for index, window in ((0, self.single_window), (1, self.dual_window), (7, self.position_dgs_window)):
             window.dashboard = self
@@ -221,7 +231,7 @@ class LabMainWindow(QtWidgets.QMainWindow):
                                       (self.position_dgs_window, 'live_status_worker'),
                                       (self.pl_map_window, 'live_status_worker'),
                                       (self.scalar_map_window, 'live_status_worker'),
-                                      (self.capacitance_window, 'live_status_worker'),
+                                      *[(window, 'live_status_worker') for window in self.gate_map_tabs.values()],
                                       (self.pol_window, 'worker')):
                 worker = getattr(window, attribute, None)
                 if worker is not None and worker.isRunning():
@@ -291,7 +301,7 @@ class LabMainWindow(QtWidgets.QMainWindow):
     def measurement_active(self):
         # The polarization worker runs continuously for polling, even when idle.
         for name in ("single_window", "dual_window", "bv_window", "pl_map_window",
-                     "scalar_map_window", "position_dgs_window", "capacitance_window"):
+                     "scalar_map_window", "position_dgs_window", "capacitance_window", "transport_window"):
             window = getattr(self, name, None)
             if window is None:
                 continue
@@ -330,7 +340,7 @@ class LabMainWindow(QtWidgets.QMainWindow):
         if self.position_tab.motion_active():
             return False
         for window in (self.dual_window, self.bv_window, self.pl_map_window,
-                       self.scalar_map_window, self.position_dgs_window, self.capacitance_window):
+                       self.scalar_map_window, self.position_dgs_window, *self.gate_map_tabs.values()):
             if getattr(window, 'is_running', False):
                 return False
             for name in ('worker', 'sweep_worker', 'control_worker', '_intermediate_worker'):
@@ -347,10 +357,11 @@ class LabMainWindow(QtWidgets.QMainWindow):
         self.simulation_label.setText("SIMULATION: " + ", ".join(simulated) if simulated else "Physical devices selected")
         self.simulation_label.setToolTip("\n".join(DEVICE_LABELS.get(name, name) for name in simulated))
         self.tab_widget.setTabToolTip(7, self.simulation_label.text())
-        for name, tabs in {"smu": (1, 2, CAPACITANCE_TAB), "camera": (0, 1, 2, 3), "magnet": (2,),
+        for name, tabs in {"smu": (1, 2, CAPACITANCE_TAB, TRANSPORT_TAB), "camera": (0, 1, 2, 3), "magnet": (2,),
                            "piezo300": (3, 4, 5), "piezo150": (5,), "rotator1": (6,),
-                           "rotator2": (6,), "rotator3": (6,), "lockin": (CAPACITANCE_TAB,),
-                           "awg": (CAPACITANCE_TAB,), "dac": (1, CAPACITANCE_TAB)}.items():
+                           "rotator2": (6,), "rotator3": (6,), "lockin": (CAPACITANCE_TAB, TRANSPORT_TAB),
+                           "lockin2": (TRANSPORT_TAB,), "awg": (CAPACITANCE_TAB,),
+                           "dac": (1, CAPACITANCE_TAB, TRANSPORT_TAB)}.items():
             # Full list is always visible, including devices used indirectly.
             for index in tabs:
                 self.tab_widget.setTabToolTip(index, self.simulation_label.text())
@@ -375,7 +386,7 @@ class LabMainWindow(QtWidgets.QMainWindow):
                              (self.position_dgs_window, "live_status_worker"),
                              (self.pl_map_window, "live_status_worker"),
                              (self.scalar_map_window, "live_status_worker"),
-                             (self.capacitance_window, "live_status_worker"),
+                             *[(window, "live_status_worker") for window in self.gate_map_tabs.values()],
                              (self.pol_window, "worker")):
             worker = getattr(window, attr, None)
             if worker is not None and worker.isRunning():
@@ -420,8 +431,9 @@ class LabMainWindow(QtWidgets.QMainWindow):
             worker.start()
         self.single_window.reconnect_status_worker()
         self.single_window.live_poll_proxy = None
-        # Instruments are looked up at use time; refresh labels and the poller's outputs.
-        self.capacitance_window.on_devices_changed()
+        # Instruments are looked up at use time; refresh labels and the pollers' outputs.
+        for window in self.gate_map_tabs.values():
+            window.on_devices_changed()
         self.devices_changing = False
         self.centralWidget().setEnabled(True)
         self.update_device_indicators()
@@ -490,11 +502,12 @@ class LabMainWindow(QtWidgets.QMainWindow):
                     self.pol_window.save_storage()
                 except Exception as e:
                     print(f"Error saving polarization settings: {e}")
-        elif prev_idx == CAPACITANCE_TAB:
+        elif prev_idx in self.gate_map_tabs:
+            window = self.gate_map_tabs[prev_idx]
             try:
-                self.capacitance_window.save_storage()
+                window.save_storage()
             except Exception as e:
-                print(f"Error saving capacitance settings: {e}")
+                print(f"Error saving {window.TAB_NAME.lower()} settings: {e}")
 
         # Update current tab index
         self.current_tab_idx = index
@@ -524,8 +537,8 @@ class LabMainWindow(QtWidgets.QMainWindow):
         elif index == 7:
             if not self.manual_dc_ramp_active():
                 self.position_dgs_window.reload_gui_from_storage()
-        elif index == CAPACITANCE_TAB:
-            self.capacitance_window.reload_gui_from_storage()
+        elif index in self.gate_map_tabs:
+            self.gate_map_tabs[index].reload_gui_from_storage()
 
         # Trigger immediate status worker updates based on the new active tab
         self.check_measurement_status()
@@ -568,8 +581,8 @@ class LabMainWindow(QtWidgets.QMainWindow):
         if getattr(self.scalar_map_window, "is_running", False):
             meas_running = True
 
-        # Capacitance bridge (sweep, balance, AWG and manual electrode ramps)
-        if self.capacitance_window.busy():
+        # Gate-map tabs: capacitance bridge and transport (sweeps, balances, AWG, manual electrode ramps)
+        if any(window.busy() for window in self.gate_map_tabs.values()):
             meas_running = True
 
         # 2. Control tab bar interaction
@@ -641,16 +654,17 @@ class LabMainWindow(QtWidgets.QMainWindow):
                 if not getattr(scalar_worker, "_is_paused", False):
                     scalar_worker.pause()
 
-        # Capacitance Live Status Worker (lock-in and electrode readout while idle on its tab)
-        capacitance_worker = getattr(self.capacitance_window, "live_status_worker", None)
-        if capacitance_worker:
-            should_run = (not meas_running) and (current_idx == CAPACITANCE_TAB)
-            if should_run:
-                if getattr(capacitance_worker, "_is_paused", False):
-                    capacitance_worker.resume()
-            else:
-                if not getattr(capacitance_worker, "_is_paused", False):
-                    capacitance_worker.pause()
+        # Gate-map Live Status Workers (lock-in and electrode readout while idle on their tab)
+        for tab_index, window in self.gate_map_tabs.items():
+            gate_map_worker = getattr(window, "live_status_worker", None)
+            if gate_map_worker:
+                should_run = (not meas_running) and (current_idx == tab_index)
+                if should_run:
+                    if getattr(gate_map_worker, "_is_paused", False):
+                        gate_map_worker.resume()
+                else:
+                    if not getattr(gate_map_worker, "_is_paused", False):
+                        gate_map_worker.pause()
 
         # Dashboard Polling Timer (active when index == 5 and no measurement is running)
         if hasattr(self, 'position_tab') and self.position_tab:
@@ -699,17 +713,17 @@ class LabMainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage('Stopping the active ramp or finishing the current preview read before closing…')
             QtCore.QTimer.singleShot(100, self.close)
             return
-        capacitance_workers = [worker for worker in (self.capacitance_window.sweep_worker,
-                                                     self.capacitance_window.ramp_worker,
-                                                     self.capacitance_window.control_worker)
-                               if worker is not None and worker.isRunning()]
-        if capacitance_workers:
-            for worker in capacitance_workers:
+        gate_map_workers = [(window, worker) for window in self.gate_map_tabs.values()
+                            for worker in (window.sweep_worker, window.ramp_worker, window.control_worker)
+                            if worker is not None and worker.isRunning()]
+        if gate_map_workers:
+            for _window, worker in gate_map_workers:
                 worker.stop()
             # The worker ends after its current instrument call, autosaves partial
             # data and exits; waiting here would freeze the GUI thread.
             event.ignore()
-            self.statusBar().showMessage('Stopping the capacitance measurement before closing…')
+            names = sorted({window.TAB_NAME.lower() for window, _worker in gate_map_workers})
+            self.statusBar().showMessage(f"Stopping the {' and '.join(names)} measurement before closing…")
             QtCore.QTimer.singleShot(100, self.close)
             return
         self.lockout_timer.stop()
@@ -786,11 +800,12 @@ class LabMainWindow(QtWidgets.QMainWindow):
         if magnet_worker is not None and magnet_worker.isRunning():
             magnet_worker.stop()
             magnet_worker.wait()
-        try:
-            # Stops its live poller and saves its settings; its workers already ended above.
-            self.capacitance_window.shutdown()
-        except Exception:
-            pass
+        for window in self.gate_map_tabs.values():
+            try:
+                # Stops its live poller and saves its settings; its workers already ended above.
+                window.shutdown()
+            except Exception:
+                pass
         if self.plotter_mode:
             # Restore the measurement forms before the usual close-time saves.
             # Keep plotter guards active; shutdown must not restart polling.

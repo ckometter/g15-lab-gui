@@ -1,4 +1,4 @@
-"""Electrode outputs for capacitance measurements: assignment, limits and motion.
+"""Electrode outputs for the gate-map tabs (capacitance, transport): assignment, limits and motion.
 
 Each electrode role (top gate, bottom gate, sample) is wired to one DC output:
 a Keysight B2902B channel (protected ramp, compliance, leakage readback), a
@@ -15,7 +15,7 @@ import math
 import threading
 import time
 
-from capacitance_bridge import ELECTRODE_LABELS, ELECTRODES, ElectrodeLimits, interpolate_path, swept_electrodes
+from electrode_sweep import ELECTRODE_LABELS, ELECTRODES, ElectrodeLimits, interpolate_path, swept_electrodes
 from drivers.qpg_uvoltdaq import DAC_RANGE_V, validate_dac_voltage
 from gate_safety import (GATE_MAX_ABS_VOLTAGE_V, GATE_MAX_RAMP_STEP_V, GateRampCancelled,
                          validate_gate_voltage, validate_positive_ramp_value)

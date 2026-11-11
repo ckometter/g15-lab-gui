@@ -12,7 +12,7 @@ import h5py
 import numpy as np
 
 import capacitance_bridge as cb
-from capacitance_electrodes import ElectrodeSet, MeasurementStopped, RunControl, validate_wiring
+from electrode_outputs import ElectrodeSet, MeasurementStopped, RunControl, validate_wiring
 from drivers.qpg_uvoltdaq import QPGuVoltDAQ, UVoltDacChannel
 from drivers.siglent_sdg import SiglentSDG2042X, parse_fields, parse_number
 from drivers.stanford_sr830 import StanfordSR830

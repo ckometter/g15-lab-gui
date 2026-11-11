@@ -36,7 +36,7 @@ class DashboardWorkflowTests(unittest.TestCase):
         }))
         for name in ("single_spectra_gui", "Dual_gate_sweep_gui", "B_V_sweep_gui",
                      "photoluminescence_map_gui", "scalar_map_gui", "polarization_control_gui", "position_dgs_gui",
-                     "capacitance_gui"):
+                     "gate_map_gui", "capacitance_gui", "transport_gui"):
             module = importlib.import_module("measurements." + name)
             self.context.enter_context(patch.object(module, "parent_dir", directory))
         self.context.enter_context(patch.object(PositionTab, "save_storage"))
