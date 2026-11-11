@@ -19,6 +19,7 @@ from measurements.position_tab import PositionTab
 from measurements.position_dgs_gui import PositionDGSWindow
 from measurements.capacitance_gui import CapacitanceWindow
 from measurements.transport_gui import TransportWindow
+from measurements.levelmeter_panel import LevelmeterPanel, LevelmeterStatusLabel, LevelmeterWorker
 initialize_station = station_setup.initialize_station
 
 # Tab indices are positional; new tabs are appended so earlier indices are unchanged.
@@ -184,6 +185,16 @@ class LabMainWindow(QtWidgets.QMainWindow):
             "color: #059669; font-weight: bold; font-family: Consolas, monospace; font-size: 11px;"
         )
         status_bar.addPermanentWidget(lf_label)
+        # Helium level, read-only from the separate level-meter program: a status-bar
+        # indicator on every tab and a plot in the Dashboard tab, fed by a background thread.
+        self.levelmeter_label = LevelmeterStatusLabel()
+        self.levelmeter_label.clicked.connect(self.show_levelmeter)
+        status_bar.addPermanentWidget(self.levelmeter_label)
+        self.levelmeter_panel = LevelmeterPanel()
+        self.position_tab.add_panel(self.levelmeter_panel)
+        self.levelmeter_worker = LevelmeterWorker(parent=self)
+        self.levelmeter_worker.updated.connect(self.on_levelmeter_update)
+        self.levelmeter_worker.start(QtCore.QThread.Priority.LowPriority)
         self.simulation_label = QtWidgets.QLabel()
         self.simulation_label.setStyleSheet("color: #7c3aed; font-weight: bold;")
         status_bar.addWidget(self.simulation_label, 1)
@@ -297,6 +308,15 @@ class LabMainWindow(QtWidgets.QMainWindow):
         self.device_manager.show()
         self.device_manager.raise_()
         self.device_manager.activateWindow()
+
+    def on_levelmeter_update(self, summary):
+        self.levelmeter_label.show_summary(summary)
+        self.levelmeter_panel.show_summary(summary)
+
+    def show_levelmeter(self):
+        """Clicking the helium status shows its plot (refused while another tab measures)."""
+        if not self.plotter_mode:
+            self.tab_widget.setCurrentIndex(5)
 
     def measurement_active(self):
         # The polarization worker runs continuously for polling, even when idle.
@@ -727,6 +747,8 @@ class LabMainWindow(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(100, self.close)
             return
         self.lockout_timer.stop()
+        self.levelmeter_worker.stop()
+        self.levelmeter_worker.wait(3000)
         if hasattr(self.position_tab, "polling_timer"):
             self.position_tab.polling_timer.stop()
         position_worker = self.position_dgs_window.sweep_worker

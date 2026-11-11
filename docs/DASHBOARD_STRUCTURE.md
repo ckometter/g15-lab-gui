@@ -7,7 +7,7 @@
 | 2 | B/V Sweep | `B_V_sweep_gui.py` | spectra vs field and gate |
 | 3 | Vector Map | `photoluminescence_map_gui.py` | spectra vs scanner position |
 | 4 | Scalar Map | `scalar_map_gui.py` | power meter vs scanner position |
-| 5 | Dashboard | `position_tab.py` | positioners and magnet |
+| 5 | Dashboard | `position_tab.py` | positioners and magnet; helium-level plot ([LEVELMETER.md](LEVELMETER.md)) |
 | 6 | Polarization control | `polarization_control_gui.py` | rotators |
 | 7 | Position DGS | `position_dgs_gui.py`, a subclass of tab 1 | a dual-gate sweep at each scanner position |
 | 8 | Capacitance | `capacitance_gui.py`, a gate-map tab | bridge C and D vs gates |

@@ -391,6 +391,7 @@ class PositionTab(PositionMotionControls, QtWidgets.QWidget):
         scroll.setWidgetResizable(True)
         content = QtWidgets.QWidget()
         main_layout = QtWidgets.QHBoxLayout(content)
+        self.panels_layout = main_layout  # add_panel() appends to the right of the controls
         scroll.setWidget(content)
         outer_layout.addWidget(scroll)
 
@@ -720,6 +721,10 @@ class PositionTab(PositionMotionControls, QtWidgets.QWidget):
         
 
 
+
+    def add_panel(self, widget, stretch=1):
+        """Show a read-only panel (e.g. the helium level) to the right of the motion controls."""
+        self.panels_layout.addWidget(widget, stretch)
 
     def _get_step(self, line_edit: QtWidgets.QLineEdit) -> float:
         try:
