@@ -3,7 +3,8 @@ import json
 import math
 from PyQt6 import QtWidgets, QtCore, QtGui
 from scanner_safety import ScannerSettings
-from measurements.position_motion import PositionMotionControls
+from drivers.attocube_anc150 import MAX_AMPLITUDE, MAX_FREQUENCY
+from measurements.position_motion import ERROR_STYLE, PositionMotionControls
 
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -279,6 +280,13 @@ class PositionTab(PositionMotionControls, QtWidgets.QWidget):
             if lock is not None:
                 lock.release()
 
+    @staticmethod
+    def show_stepper_setting(label, text, problem=""):
+        """Show a polled stepper setting; one that blocks stepping in red, with the reason as tooltip."""
+        label.setText(text)
+        label.setStyleSheet(ERROR_STYLE if problem else "")
+        label.setToolTip(problem)
+
     def poll_voltages(self):
         self.refresh_scanner_readbacks()
         self.refresh_stepper_coordinates()
@@ -296,31 +304,35 @@ class PositionTab(PositionMotionControls, QtWidgets.QWidget):
             is_sim = getattr(self.stepper_controller, 'simulated', False)
             axis_chars = {1: 'x', 2: 'y', 3: 'z'}
             for axis, label in zip([1, 2, 3], [self.sf1_label, self.sf2_label, self.sf3_label]):
+                ch = axis_chars[axis]
                 try:
-                    ch = axis_chars[axis]
                     if is_sim:
-                        label.setText(f"F{ch}: Simulation")
+                        self.show_stepper_setting(label, f"F{ch}: Simulation")
                     else:
                         freq = getattr(self.stepper_controller, f'frequency_ch{axis}')()
-                        if freq > 0:
-                            label.setText(f"F{ch}: {freq:.0f} Hz")
-                        else:
-                            label.setText(f"F{ch}: Off")
-                except Exception:
-                    label.setText(f"F{ch}: unavailable")
+                        self.show_stepper_setting(
+                            label, (f"F{ch}: {freq:.0f} Hz" if freq > 0 else f"F{ch}: Off")
+                            + (f" (max {MAX_FREQUENCY})" if freq > MAX_FREQUENCY else ""),
+                            "" if 1 <= freq <= MAX_FREQUENCY else
+                            f"{ch.upper()} will not step: the dashboard steps only at 1 to {MAX_FREQUENCY} Hz. "
+                            f"Enter a frequency here, or turn the front-panel knob.")
+                except Exception as exc:
+                    self.show_stepper_setting(label, f"F{ch}: unavailable", f"No frequency readback: {exc}")
             for axis, label in zip([1, 2, 3], [self.am1_label, self.am2_label, self.am3_label]):
+                ch = axis_chars[axis]
                 try:
-                    ch = axis_chars[axis]
                     if is_sim:
-                        label.setText(f"A{ch}: Simulation")
+                        self.show_stepper_setting(label, f"A{ch}: Simulation")
                     else:
                         amp = getattr(self.stepper_controller, f'voltage_ch{axis}')()
-                        if amp > 0:
-                            label.setText(f"A{ch}: {amp:.1f} V")
-                        else:
-                            label.setText(f"A{ch}: Off")
-                except Exception:
-                    label.setText(f"A{ch}: unavailable")
+                        self.show_stepper_setting(
+                            label, (f"A{ch}: {amp:.1f} V" if amp > 0 else f"A{ch}: Off")
+                            + (f" (max {MAX_AMPLITUDE})" if amp > MAX_AMPLITUDE else ""),
+                            "" if 0 <= amp <= MAX_AMPLITUDE else
+                            f"{ch.upper()} will not step: the dashboard steps only at 0 to {MAX_AMPLITUDE} V. "
+                            f"Enter an amplitude here, or turn the front-panel knob.")
+                except Exception as exc:
+                    self.show_stepper_setting(label, f"A{ch}: unavailable", f"No amplitude readback: {exc}")
 
         # Poll magnet parameters every 3 ticks (3 seconds) to avoid freezing the GUI
         if self.magnet_controller is not None and not self.magnet_ramping:
@@ -396,7 +408,7 @@ class PositionTab(PositionMotionControls, QtWidgets.QWidget):
         outer_layout.addWidget(scroll)
 
         # ----- Stepper Group -----
-        stepper_group = QtWidgets.QGroupBox("Stepper (ANC150)")
+        self.stepper_group = stepper_group = QtWidgets.QGroupBox("Stepper (ANC150)")
         
         # Grid/Cross layout for XY buttons (wrapped in a fixed-size widget to keep it nicely quadratic)
         cross_widget = QtWidgets.QWidget()

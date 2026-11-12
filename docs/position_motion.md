@@ -32,17 +32,28 @@ are explicitly applied.
 Stepper frequency is limited to **100 Hz** and amplitude to **120 V** in the UI
 and driver setters. Motion also checks current controller settings, so a higher
 frequency or amplitude set from the front panel blocks movement until corrected.
+The Dashboard shows such a setting in red, for example `Fx: 102 Hz (max 100)`,
+and a refused move says which axis and value, e.g. `X: ANC150 axis 1 is set to
+102 Hz, outside the stepping limit of 1 to 100 Hz`. These messages also go to the
+Device Manager's application log. If the ANC150 is simulated (not connected in the
+Device Manager), the stepper box title says `SIMULATED, nothing moves`.
 
 Stepper X/Y/Z pseudo-coordinates count acknowledged commanded steps relative to
 the current session's origin. **Set zero (no motion)** declares the current
 location `(0, 0, 0)` without sending motion commands. **Goto X, Y, Z** moves to an
 absolute pseudo-coordinate; the relative checkbox instead adds step counts.
-Arrow clicks issue a single step; holding an arrow issues repeated counted single
-steps. Stop ends after the current single pulse, without issuing another.
+An arrow click makes one step. Holding an arrow (longer than 0.5 s) keeps stepping
+until released, at about three quarters of the controller's frequency. Moves are
+sent as counted bursts: one `stepu`/`stepd <axis> <n>` command per at most 0.25 s
+of steps, each after fresh frequency/amplitude readbacks (~25 ms per command), and
+the next only once the controller has made them. Releasing the arrow or Stop ends
+after the current burst. (One command per single step, as before, managed only ~6
+steps/s instead of the set 43-100 Hz.)
 
 These are open-loop step counts, not measured distance: slip and front-panel
 movement cannot be detected. Reconnecting starts a new origin. An uncertain
-motion write invalidates that axis's coordinate; set a new zero before using goto.
+motion write invalidates that axis's coordinate; arrows and relative moves still
+work, but set a new zero before an absolute Goto.
 The Dashboard blocks device replacement and competing measurements during motion,
 and requests motion cancellation before closing.
 

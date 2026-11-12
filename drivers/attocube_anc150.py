@@ -146,18 +146,19 @@ class AttocubeANC150(VisaInstrument):
         else:
             self.write(f"setv {axis} {int(round(val))}")
 
-    def step(self, axis: int, steps: int) -> None:
-        """
-        Step the specified axis.
-        Use positive integer for forward/up steps, and negative integer for backward/down.
+    def step(self, axis: int, steps: int) -> float | None:
+        """Make ``steps`` counted steps on ``axis`` with one command (positive up, negative down).
+
+        The controller takes abs(steps) / frequency seconds to make them. Returns that
+        frequency (Hz), read back and checked just before the command; None for 0 steps.
         """
         self._validate_axis(axis)
         if type(steps) is not int:
             raise ValueError('Stepper motion requires an integer step count.')
         if steps == 0:
-            return
+            return None
         with self.comm_lock:
-            self.validate_drive(axis)
+            frequency = self.validate_drive(axis)
             try:
                 if self.simulated:
                     self._positions[axis] += steps
@@ -170,6 +171,7 @@ class AttocubeANC150(VisaInstrument):
                 raise
             if self._pseudo_positions[axis] is not None:
                 self._pseudo_positions[axis] += steps
+        return frequency
 
     @staticmethod
     def _validate_axis(axis):
@@ -185,8 +187,16 @@ class AttocubeANC150(VisaInstrument):
         return value
 
     def validate_drive(self, axis):
-        frequency = self._validate_setting(axis, self._get_frequency(axis), 1, MAX_FREQUENCY, 'frequency (Hz)')
-        self._validate_setting(axis, self._get_voltage(axis), 0, MAX_AMPLITUDE, 'amplitude (V)')
+        """Return this axis' step frequency (Hz) if it and the amplitude are within the stepping limits.
+
+        Both are read back, because they can also be changed on the front panel.
+        """
+        self._validate_axis(axis)
+        frequency, amplitude = float(self._get_frequency(axis)), float(self._get_voltage(axis))
+        for value, low, high, unit in ((frequency, 1, MAX_FREQUENCY, 'Hz'), (amplitude, 0, MAX_AMPLITUDE, 'V')):
+            if not (math.isfinite(value) and low <= value <= high):
+                raise ValueError(f'ANC150 axis {axis} is set to {value:g} {unit}, outside the stepping limit of '
+                                 f'{low} to {high} {unit}. Change it on the dashboard or the front panel.')
         return frequency
 
     def pseudo_position(self, axis):
