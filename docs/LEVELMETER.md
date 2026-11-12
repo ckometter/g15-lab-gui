@@ -30,6 +30,24 @@ copies the file and reads the copy with h5py, so it never locks the file the
 level meter writes to. Measurements never wait for it. To read another folder,
 set the environment variable `G15_LEVELMETER_DIR`.
 
+## Forecast
+
+The dewar is not a straight tube. In the October 2026 data, for the same
+boil-off, the level fell about **5× faster in the neck** (above ~645 mm) and
+about **3× faster below ~430 mm** than in between. A straight line through the
+last 24 hours of millimetres was therefore wrong in both directions: too
+pessimistic just after a refill, then about 2× too optimistic from roughly
+560 mm down. Tested on the October refills, its median error was 29 h.
+
+The forecast instead converts the level into a helium amount using that shape.
+It measures the boil-off from the last 24 hours below the neck (neck readings
+are unreliable just after a refill), falling back to the rate from before the
+refill and then to a typical 4 mm/h. Its median error on the same refills was
+5 h. The status bar shows the present mm/h. The 24-hour plot still shows a
+plain straight-line fit of what was measured. The Slack alerts use the same
+model (`levelmeter_slack.py` in the level-meter folder; keep the constants in
+step).
+
 ## Colours
 
 | Shown | Meaning |

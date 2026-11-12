@@ -52,6 +52,25 @@ class LevelmeterFileTests(unittest.TestCase):
         self.assertTrue(np.isnan(lm.trend(times[-1:], levels[-1:])))
 
 
+class DewarShapeTests(unittest.TestCase):
+    def test_level_falls_faster_in_the_neck_and_near_the_bottom(self):
+        self.assertEqual((lm.speed(700), lm.speed(500), lm.speed(300)), (5.0, 1.0, 3.0))
+        # One middle-section mm of helium is 5 mm of level in the neck and 3 mm near the bottom.
+        self.assertAlmostEqual(float(lm.amount(700) - lm.amount(695)), 1.0)
+        self.assertAlmostEqual(float(lm.amount(500) - lm.amount(499)), 1.0)
+        self.assertAlmostEqual(float(lm.amount(300) - lm.amount(297)), 1.0)
+
+    def test_rate_ignores_the_neck_and_uses_the_rate_from_before_a_refill(self):
+        now = time.time()
+        before_t, before_l = falling(now - 7200, 30, 400.0, -3.0)  # near the bottom: 1 mm/h of helium
+        after_t = now - np.arange(5, -1, -1) * 600.0
+        after_l = np.linspace(752.0, 740.0, 6)                      # only neck readings since the refill
+        rate, source = lm.helium_rate(np.r_[before_t, after_t], np.r_[before_l, after_l])
+        self.assertAlmostEqual(rate, 1.0, places=6)
+        self.assertIn("before the last refill", source)
+        self.assertEqual(lm.helium_rate(after_t, after_l), (lm.TYPICAL_RATE, "typical rate, too few recent readings"))
+
+
 class LevelmeterStateTests(unittest.TestCase):
     def setUp(self):
         self.now = time.time()
@@ -67,10 +86,13 @@ class LevelmeterStateTests(unittest.TestCase):
         self.assertIn("Levelmeter-Stop.bat", summary.detail)
 
     def test_falling_toward_the_threshold_within_a_day_needs_attention(self):
-        summary = self.summary(rate=-12.0, start=600.0)
+        # 570 -> 450 mm at 4 mm/h in the middle section; below 430 mm it will fall 3x faster.
+        summary = self.summary(rate=-4.0, start=570.0)
         self.assertEqual(summary.severity, lm.ATTENTION)
         self.assertIn("230 mm in ~", summary.text)
-        self.assertAlmostEqual(summary.hours_to_low, (summary.latest_level - 230.0) / 12.0, places=3)
+        self.assertAlmostEqual(summary.hours_to_low, lm.hours_until(summary.latest_level, 230.0, 4.0), places=3)
+        self.assertLess(summary.hours_to_low, (summary.latest_level - 230.0) / 4.0 - 20)  # sooner than a straight line
+        self.assertIn("3x faster below 430 mm", summary.detail)
 
     def test_below_the_threshold_is_low(self):
         summary = self.summary(rate=-1.0, start=250.0)

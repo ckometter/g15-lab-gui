@@ -32,6 +32,18 @@ OFF_BELOW_MM = 5.0         # about 0 V (-1 mm): the level meter is off, or the d
 WARN_WITHIN_H = 24.0       # attention when the trend reaches the threshold within a day
 FILL_LIMIT = 1e30          # NetCDF fill values (9.97e36) mark unwritten entries
 
+# Dewar shape, measured from the October 2026 refills (keep in step with levelmeter_slack.py in
+# the level-meter folder): for the same boil-off the level falls about NECK_SPEED times faster in
+# the neck (above NECK_MM) and BOTTOM_SPEED times faster below BOTTOM_MM than in between. The
+# forecast therefore counts the helium "amount" in middle-section millimetres and ignores neck
+# readings; on the October refills its median error was 5 h, versus 29 h for a straight line.
+NECK_MM = 645.0
+BOTTOM_MM = 430.0
+NECK_SPEED = 5.0
+BOTTOM_SPEED = 3.0
+TYPICAL_RATE = 4.0         # middle-section mm/h when no rate can be measured (October median)
+REFILL_STEP_MM = 20.0      # a rise between two readings larger than this is a refill
+
 # Severity of a summary: shown grey, normal, orange or red.
 INACTIVE, NORMAL, ATTENTION, PROBLEM = -1, 0, 1, 2
 
@@ -74,6 +86,52 @@ def trend(times, levels, latest=None):
     return float(slope)
 
 
+def speed(level):
+    """How many times faster than in the middle section the level falls at ``level``."""
+    return NECK_SPEED if level > NECK_MM else BOTTOM_SPEED if level < BOTTOM_MM else 1.0
+
+
+def amount(level):
+    """Helium amount at ``level`` (mm), in middle-section millimetres."""
+    level = np.asarray(level, dtype=float)
+    return (np.minimum(level, BOTTOM_MM) / BOTTOM_SPEED + np.clip(level - BOTTOM_MM, 0, NECK_MM - BOTTOM_MM)
+            + np.maximum(level - NECK_MM, 0) / NECK_SPEED)
+
+
+def _amount_rate(times, levels):
+    """Middle-section mm/h over the last 24 h of these readings, without the neck or ~0 mm; None under 3 h."""
+    if not len(times):
+        return None
+    use = (times >= times[-1] - 24 * 3600) & (levels < NECK_MM) & (levels > OFF_BELOW_MM)
+    if np.count_nonzero(use) < 12 or np.ptp(times[use]) < 3 * 3600:
+        return None
+    rate = -float(np.polyfit((times[use] - times[-1]) / 3600.0, amount(levels[use]), 1)[0])
+    return rate if rate > 0.05 else None
+
+
+def helium_rate(times, levels):
+    """(middle-section mm/h, where it comes from): since the last refill, else before it, else typical."""
+    times, levels = np.asarray(times, dtype=float), np.asarray(levels, dtype=float)
+    steps = np.flatnonzero(np.diff(levels) > REFILL_STEP_MM)
+    start = int(steps[-1]) + 1 if steps.size else 0
+    rate = _amount_rate(times[start:], levels[start:])
+    if rate is not None:
+        return rate, "measured over the last 24 h"
+    if start:
+        before = start - 1
+        while before > 0 and levels[before] - levels[before - 1] > REFILL_STEP_MM:
+            before -= 1
+        rate = _amount_rate(times[:before + 1], levels[:before + 1])
+        if rate is not None:
+            return rate, "rate from before the last refill"
+    return TYPICAL_RATE, "typical rate, too few recent readings"
+
+
+def hours_until(level, target, rate):
+    """Hours for the level to fall from ``level`` to ``target`` at ``rate`` (middle-section mm/h)."""
+    return max(0.0, float(amount(level) - amount(target))) / rate
+
+
 def describe_age(seconds):
     minutes = max(0.0, seconds) / 60
     if minutes < 90:
@@ -95,8 +153,9 @@ class LevelSummary:
     folder: str = ""
     latest_time: float = math.nan   # unix time of the newest reading
     latest_level: float = math.nan  # mm
-    slope: float = math.nan         # mm/h over the last 24 h
-    hours_to_low: float = math.nan  # until LOW_LEVEL_MM at the present slope
+    slope: float = math.nan         # straight-line mm/h over the last 24 h (the 24-hour plot)
+    hours_to_low: float = math.nan  # until LOW_LEVEL_MM, from the dewar-shape forecast
+    falling: float = math.nan       # mm/h at the present level, from the dewar-shape forecast
     times: np.ndarray = field(default_factory=lambda: np.zeros(0))
     levels: np.ndarray = field(default_factory=lambda: np.zeros(0))
 
@@ -110,16 +169,19 @@ def summarize(times, levels, *, now, stopped_since=None, error=None, folder=""):
         return LevelSummary(INACTIVE, "LHe: no level-meter data", f"{detail}\n{controls}".strip(), str(folder))
     latest, level = float(times[-1]), float(levels[-1])
     slope = trend(times, levels, latest)
-    hours_to_low = ((level - LOW_LEVEL_MM) / -slope
-                    if math.isfinite(slope) and slope < 0 and level > LOW_LEVEL_MM else math.nan)
+    amount_rate, source = helium_rate(times, levels)
+    falling = amount_rate * speed(level)
+    hours_to_low = hours_until(level, LOW_LEVEL_MM, amount_rate) if level > LOW_LEVEL_MM else math.nan
     keep = times >= latest - HISTORY_DAYS * 86400
-    summary = LevelSummary(NORMAL, "", "", str(folder), latest, level, slope, hours_to_low, times[keep], levels[keep])
+    summary = LevelSummary(NORMAL, "", "", str(folder), latest, level, slope, hours_to_low, falling,
+                           times[keep], levels[keep])
     age = now - latest
     when = datetime.fromtimestamp(latest).strftime("%d %b %H:%M")
-    rate = f"{slope:+.1f} mm/h" if math.isfinite(slope) else "rate n/a"
+    rate = f"{-falling:+.1f} mm/h"
     eta = (f"{LOW_LEVEL_MM:.0f} mm in ~{describe_hours(hours_to_low)}" if math.isfinite(hours_to_low) else "")
-    reading = f"Last reading {level:.0f} mm at {when} ({describe_age(age)} ago); 24 h trend {rate}"
-    reading += f"; {eta} at this rate." if eta else "."
+    reading = f"Last reading {level:.0f} mm at {when} ({describe_age(age)} ago); falling {falling:.1f} mm/h ({source})"
+    reading += (f"; {eta} at this pace, which allows for the level falling about {BOTTOM_SPEED:g}x faster "
+                f"below {BOTTOM_MM:.0f} mm." if eta else ".")
     if error:
         reading += f"\nThe newest file could not be read ({error}); showing the previous copy."
     if stopped_since is not None:
