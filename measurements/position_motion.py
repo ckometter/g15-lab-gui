@@ -3,6 +3,15 @@ from PyQt6 import QtCore, QtWidgets
 
 from scanner_safety import ScannerSettings, move_scanner, wait_for_motion
 
+STEPPER_AXES = {1: 'X', 2: 'Y', 3: 'Z'}
+# Counted stepper moves are sent as bursts: one "stepu/stepd <axis> <n>" command makes n steps at the
+# controller's frequency. A burst lasts at most BURST_S, so Stop or releasing an arrow takes effect
+# within that time, and the step count stays exact. (One command per single step was ~8x slower than
+# the front panel: every step also needs a mode command and frequency/amplitude readbacks.)
+BURST_S = 0.25
+BURST_MARGIN_S = 0.02    # extra wait so a burst has finished before the next command
+ERROR_STYLE = 'color: #b91c1c; font-weight: bold;'
+
 
 class ScannerMotionWorker(QtCore.QThread):
     progress = QtCore.pyqtSignal(int, float)
@@ -51,37 +60,45 @@ class StepperMotionWorker(QtCore.QThread):
         if not controller.motion_lock.acquire(blocking=False):
             self.error.emit('Stepper is already moving.')
             return
+        axis = None
         try:
-            targets = {}
+            # Check every axis before any of them moves. Steps still to make per axis; None = until stopped.
             axes = [self.jog[0]] if self.jog else list(self.targets)
+            remaining, frequency = {}, {}
             for axis in axes:
-                controller.validate_drive(axis)
-                current = controller.pseudo_position(axis)
-                if current is None:
-                    raise RuntimeError('Stepper coordinate is unknown. Set zero before moving.')
-                if not self.jog:
-                    target = self.targets[axis]
-                    if type(target) is not int:
-                        raise ValueError('Stepper coordinates must be integer step counts.')
-                    targets[axis] = target + current if self.relative else target
-            for axis in axes:
-                while not self.stop_requested:
+                frequency[axis] = controller.validate_drive(axis)
+                if self.jog:
+                    remaining[axis] = None
+                    continue
+                target = self.targets[axis]
+                if type(target) is not int:
+                    raise ValueError('Stepper coordinates must be integer step counts.')
+                if self.relative:
+                    remaining[axis] = target  # arrows and relative moves need no known coordinate
+                else:
                     current = controller.pseudo_position(axis)
-                    if not self.jog and current == targets[axis]:
-                        break
-                    direction = self.jog[1] if self.jog else (1 if targets[axis] > current else -1)
-                    frequency = controller.validate_drive(axis)
-                    if self.stop_requested:
-                        return
-                    controller.step(axis, direction)
+                    if current is None:
+                        raise RuntimeError('Stepper coordinate is unknown. Set zero before an absolute Goto.')
+                    remaining[axis] = target - current
+            for axis in axes:
+                while not self.stop_requested and remaining[axis] != 0:
+                    left = remaining[axis]
+                    direction = self.jog[1] if left is None else (1 if left > 0 else -1)
+                    count = max(1, int(frequency[axis] * BURST_S))
+                    if left is not None:
+                        count = min(count, abs(left))
+                    # step() reads back and checks the settings again: the front panel may have changed them.
+                    frequency[axis] = controller.step(axis, direction * count)
+                    if left is not None:
+                        remaining[axis] = left - direction * count
                     self.progress.emit()
-                    # Complete this single pulse before finishing/stopping the worker.
-                    wait_for_motion(1.0 / frequency, lambda: True)
+                    # Let the controller finish this burst before the next command or the end of the move.
+                    wait_for_motion(count / frequency[axis] + BURST_MARGIN_S, lambda: True)
                 if self.stop_requested:
                     return
             self.completed = True
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit(f'{STEPPER_AXES.get(axis, "Stepper")}: {exc}' if axis else str(exc))
         finally:
             controller.motion_lock.release()
 
@@ -264,7 +281,8 @@ class PositionMotionControls:
         for button in (self.stepper_goto_btn, self.stepper_zero_btn, self.stepper_stop_btn):
             row.addWidget(button)
         layout.addLayout(row)
-        self.stepper_status = QtWidgets.QLabel('Idle. Maximum 100 Hz / 120 V.')
+        self.stepper_status = QtWidgets.QLabel('Idle. Click an arrow: 1 step. Hold it: keeps stepping until '
+                                               'released. Limits 100 Hz / 120 V.')
         self.stepper_status.setWordWrap(True)
         layout.addWidget(self.stepper_status)
         self.refresh_stepper_coordinates()
@@ -274,6 +292,11 @@ class PositionMotionControls:
         values = [controller.pseudo_position(a) if controller else None for a in (1, 2, 3)]
         self.stepper_position_label.setText('Pseudo position: ' + '   '.join(
             f'{axis}: {value if value is not None else "unknown"}' for axis, value in zip('XYZ', values)))
+        group = getattr(self, 'stepper_group', None)
+        if group is not None:
+            group.setTitle('Stepper (ANC150): not connected' if controller is None else
+                           'Stepper (ANC150): SIMULATED, nothing moves'
+                           if getattr(controller, 'simulated', False) else 'Stepper (ANC150)')
 
     def zero_stepper_coordinates(self):
         try:
@@ -301,6 +324,7 @@ class PositionMotionControls:
         for widget in [self.stepper_goto_btn, self.stepper_zero_btn, *self.f_edits, *self.a_edits]:
             widget.setEnabled(False)
         self.stepper_stop_btn.setEnabled(True)
+        self.stepper_status.setStyleSheet('')
         self.stepper_status.setText('Moving in counted steps...')
         self.stepper_worker.start()
         self.update_motion_lockout()
@@ -308,14 +332,18 @@ class PositionMotionControls:
     def stepper_motion_error(self, message):
         self._stepper_error = message
         self.stepper_status.setText(message)
+        self.stepper_status.setStyleSheet(ERROR_STYLE)
+        print(f'Stepper stopped: {message}')  # also in the Device Manager's application log
 
     def stepper_motion_finished(self):
         self._stepper_busy = False
         for widget in [self.stepper_goto_btn, self.stepper_zero_btn, *self.f_edits, *self.a_edits]:
             widget.setEnabled(True)
         self.stepper_stop_btn.setEnabled(False)
-        self.stepper_status.setText(self._stepper_error or (
-            'Stepper move complete.' if self.stepper_worker.completed else 'Stepper stopped.'))
+        text = 'Stepper move complete.' if self.stepper_worker.completed else 'Stepper stopped.'
+        if getattr(self.stepper_controller, 'simulated', False):
+            text += ' SIMULATED ANC150: no hardware moved. Connect it in the Device Manager.'
+        self.stepper_status.setText(self._stepper_error or text)
         self.refresh_stepper_coordinates()
         self.update_motion_lockout()
 

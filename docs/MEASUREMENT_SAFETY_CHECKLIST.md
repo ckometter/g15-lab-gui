@@ -15,11 +15,15 @@
 - [x] Direct gate-coefficient proposal documented; existing transform not migrated.
 - [x] Native Qt shutdown crash reproduced, isolated and fixed while keeping wheel protection active.
 - [x] Optional Dual-Gate end ramp: both gates to 0 V together, only after a complete sweep (off by default).
+- [x] Dual-Gate outputs: Keysight or a uVoltDAQ DAC per gate; DAC gates checked against +/-10 V, currents saved as NaN.
+- [x] Transport tab: both lock-ins' input modes are checked against the selected wiring before any electrode moves; whole-map limits as in the Capacitance tab (default top-gate dielectric limit 0.8 V, from the script's station).
 
 ## To do after editing
 
 - [ ] Relaunch the measurement GUI at an idle point; source edits do not update a running process.
 - [ ] Check physical device/readback status before connecting a sample or measuring.
+- [ ] Check that each gate is wired to its selected Dual-Gate **Output** before measuring with the uVoltDAQ.
+- [ ] Before the first Transport run: connect `lockin2` (SR830 at `GPIB0::10::INSTR`) in the Device Manager, set the Transport tab's gate limits for the device, and compare one live R4 reading with the qcodes-qpg script.
 - [ ] Review `GATE_COORDINATE_PROPOSAL.md` before implementing a new coordinate convention.
 
 ## Validation (2026-10-01)

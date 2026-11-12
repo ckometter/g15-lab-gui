@@ -99,3 +99,29 @@ the driver, within the voltage cap.
   record the acquisition weights and physical target grids.
 - No physical instrument was used for validation. Recheck instrument readbacks
   after relaunch before using a sample.
+
+## uVoltDAQ gate outputs in Dual Gate Sweep
+
+Each Dual Gate channel box has an **Output** selector. V1 is driven by Keysight
+CH1 or one uVoltDAQ DAC output (DAC0 to DAC3); V2 by Keysight CH2 or another DAC
+output. The Keysight is the default, and the choice is saved as
+`dual_gate.gate_output_1` and `dual_gate.gate_output_2`. Changing the selection
+never writes to an instrument: wire the gate to the selected output first.
+
+The uVoltDAQ is a lower-noise voltage source with no current readback, current
+compliance or output switch. For a gate on a DAC output:
+
+- Output switch, source mode and current limit do not apply and are shown as
+  such; the setpoint is limited to +/-10 V.
+- The complete sweep is checked against +/-10 V before any output changes, in
+  addition to the +/-210 V gate limit.
+- Ramps use the DAC driver's protected ramp (steps of at most 0.05 V at that
+  gate's ramp rate, final setpoint confirmed). Stop, pause/resume and the
+  optional end ramp to 0 V behave as for the Keysight.
+- Currents are saved as NaN and the current maps say "no current readback".
+  `measured_volt_chN` holds the DAC setpoint readback, not a measured voltage.
+  Files record `gate_output_chN`, its label and notes; the current limit is NaN.
+- Only a Keysight channel that drives a gate is checked and gets its compliance
+  confirmed; an unused Keysight channel is left untouched.
+
+Position DGS always drives both gates with the Keysight.

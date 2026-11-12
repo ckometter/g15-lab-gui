@@ -36,7 +36,7 @@ class DashboardWorkflowTests(unittest.TestCase):
         }))
         for name in ("single_spectra_gui", "Dual_gate_sweep_gui", "B_V_sweep_gui",
                      "photoluminescence_map_gui", "scalar_map_gui", "polarization_control_gui", "position_dgs_gui",
-                     "capacitance_gui"):
+                     "gate_map_gui", "capacitance_gui", "transport_gui"):
             module = importlib.import_module("measurements." + name)
             self.context.enter_context(patch.object(module, "parent_dir", directory))
         self.context.enter_context(patch.object(PositionTab, "save_storage"))
@@ -45,6 +45,8 @@ class DashboardWorkflowTests(unittest.TestCase):
         self.context.enter_context(patch("pyvisa.ResourceManager", side_effect=AssertionError("Hardware access in simulation test")))
         self.context.enter_context(patch("socket.create_connection", side_effect=AssertionError("Network access in dashboard test")))
         self.context.enter_context(patch("Pyro4.Proxy", side_effect=AssertionError("Remote access in simulation test")))
+        # The helium panel reads a test folder (missing unless a test fills it), never the real level meter.
+        self.context.enter_context(patch.dict(os.environ, {"G15_LEVELMETER_DIR": str(self.directory / "levelmeter")}))
         self.errors = self.context.enter_context(patch.object(QtWidgets.QMessageBox, "critical"))
         self.context.enter_context(patch.object(QtWidgets.QMessageBox, "information"))
         self.station = Station()

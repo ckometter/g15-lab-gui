@@ -13,6 +13,7 @@ from PyQt6 import QtTest, QtWidgets
 
 from drivers.attocube_anc150 import AttocubeANC150
 from drivers.attocube_anc300 import AttocubeANC300
+from fake_anc150 import FakeANC150Port, connect_fake
 from measurements.position_tab import PositionTab
 from scanner_safety import ScannerSettings
 
@@ -201,6 +202,78 @@ class PositionMotionTests(unittest.TestCase):
         self.assertIsNone(self.stepper.pseudo_position(1))
         self.stepper.zero_pseudo_position()
         self.assertEqual(self.stepper.pseudo_position(1), 0)
+
+    def fake_port(self, **settings):
+        """Talk to an offline stand-in for the lab's ANC150 through the driver's real serial code."""
+        port = FakeANC150Port(**settings)
+        connect_fake(self.stepper, port)
+        self.addCleanup(setattr, self.stepper, 'simulated', True)
+        return port
+
+    def test_held_arrow_steps_near_the_set_frequency_in_counted_bursts(self):
+        port = self.fake_port(frequencies=(100, 43, 52), latency=0.01)
+        tab = self.tab()
+        tab.start_stepper_motion(jog=(2, 1))
+        QtTest.QTest.qWait(1000)
+        tab.stop_stepper_motion()
+        self.wait_for(lambda: not tab.stepper_moving())
+        # The front panel makes 43 steps/s; one command per single step made ~12 here (~6 at the lab's 25 ms).
+        self.assertGreater(port.steps[2], 0.6 * 43)
+        self.assertEqual(self.stepper.pseudo_position(2), port.steps[2])
+        self.assertEqual(port.overlaps, 0)  # never a step command while the axis is still stepping
+        self.assertEqual(port.mode[2], 'stp')
+
+    def test_click_is_one_step_and_goto_sends_counted_bursts(self):
+        port = self.fake_port(frequencies=(100, 100, 52), latency=0.005)
+        tab = self.tab()
+        tab.move_stepper('x', -1)
+        self.wait_for(lambda: not tab.stepper_moving())
+        tab.start_stepper_motion(targets={2: 60}, relative=True)
+        self.wait_for(lambda: not tab.stepper_moving())
+        self.assertEqual([c for c in port.commands if c.startswith('step')],
+                         ['stepd 1 1', 'stepu 2 25', 'stepu 2 25', 'stepu 2 10'])
+        self.assertEqual((port.steps[1], port.steps[2], port.overlaps), (-1, 60, 0))
+        self.assertEqual([self.stepper.pseudo_position(a) for a in (1, 2)], [-1, 60])
+        self.assertEqual(tab.stepper_status.text(), 'Stepper move complete.')
+
+    def test_setting_above_the_limit_names_the_axis_and_value_and_sends_no_motion(self):
+        port = self.fake_port(frequencies=(102, 43, 52))
+        tab = self.tab()
+        tab.poll_voltages()
+        self.assertEqual(tab.sf1_label.text(), 'Fx: 102 Hz (max 100)')
+        self.assertIn('X will not step', tab.sf1_label.toolTip())
+        self.assertEqual((tab.sf2_label.text(), tab.sf2_label.toolTip()), ('Fy: 43 Hz', ''))
+        tab.move_stepper('x', 1)
+        self.wait_for(lambda: not tab.stepper_moving())
+        self.assertFalse([c for c in port.commands if c.startswith(('setm', 'step'))])
+        self.assertTrue(tab.stepper_status.text().startswith('X: ANC150 axis 1 is set to 102 Hz'))
+        self.assertIn('color', tab.stepper_status.styleSheet())
+        port.voltage[3] = 130
+        tab.start_stepper_motion(targets={2: 1, 3: 1}, relative=True)
+        self.wait_for(lambda: not tab.stepper_moving())
+        self.assertEqual(port.steps, {1: 0, 2: 0, 3: 0})  # both axes are checked before either moves
+        self.assertIn('Z: ANC150 axis 3 is set to 130 V', tab.stepper_status.text())
+
+    def test_arrows_move_with_an_unknown_coordinate_but_absolute_goto_needs_zero(self):
+        tab = self.tab()
+        self.stepper._pseudo_positions[1] = None
+        tab.move_stepper('x', 1)
+        self.wait_for(lambda: not tab.stepper_moving())
+        self.assertEqual((self.stepper._positions[1], self.stepper.pseudo_position(1)), (1, None))
+        tab.start_stepper_motion(targets={1: 5})
+        self.wait_for(lambda: not tab.stepper_moving())
+        self.assertEqual(self.stepper._positions[1], 1)
+        self.assertIn('Set zero before an absolute Goto', tab.stepper_status.text())
+
+    def test_simulated_stepper_says_nothing_moves(self):
+        tab = self.tab()
+        self.assertIn('SIMULATED, nothing moves', tab.stepper_group.title())
+        tab.move_stepper('z', 1)
+        self.wait_for(lambda: not tab.stepper_moving())
+        self.assertIn('no hardware moved', tab.stepper_status.text())
+        self.fake_port()
+        tab.refresh_stepper_coordinates()
+        self.assertEqual(tab.stepper_group.title(), 'Stepper (ANC150)')
 
     def test_bad_saved_settings_block_motion_until_explicitly_repaired(self):
         with patch('scanner_safety.ScannerSettings.load', side_effect=ValueError('bad limits')):

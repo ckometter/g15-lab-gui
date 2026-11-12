@@ -9,9 +9,9 @@ try:
 except ImportError:
     pass
 
-import qcodes as qc
 from qcodes.dataset import initialise_or_create_database_at
 from qcodes.instrument import Instrument
+from qcodes.station import Station
 
 # Add current folder to sys.path to ensure local drivers package is importable
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -31,8 +31,9 @@ from drivers.stanford_sr830 import StanfordSR830
 from drivers.siglent_sdg import SiglentSDG2042X
 from drivers.qpg_uvoltdaq import QPGuVoltDAQ
 
-# Capacitance-bridge instruments (addresses from the qcodes-qpg g15 station.yaml).
-LOCKIN_ADDRESS = 'GPIB0::9::INSTR'           # SR830 "lia1"
+# Capacitance-bridge and transport instruments (addresses from the qcodes-qpg g15 station files).
+LOCKIN_ADDRESS = 'GPIB0::9::INSTR'           # SR830 "lia1" / "lia_I": bridge, or transport current
+LOCKIN2_ADDRESS = 'GPIB0::10::INSTR'         # SR830 "lia_V": transport four-probe voltage
 AWG_ADDRESS = 'USB0::0xF4EC::0x1103::SDG1PA0C900083::INSTR'  # Siglent SDG2042X "awg"
 DAC_ADDRESS = 'ASRL15::INSTR'                # QPG uVoltDAQ 4O4I "da"
 
@@ -78,11 +79,12 @@ simulated_devices = {
     'magnet': False,
     'powermeter': True,
     'lockin': True,
+    'lockin2': True,
     'awg': True,
     'dac': True,
 }
 
-def initialize_station(simulated: bool = False, simulated_devices: dict = None, db_path: str = "my_measurement_data.db", spectrometer_type: str = SPECTROMETER_TYPE) -> qc.Station:
+def initialize_station(simulated: bool = False, simulated_devices: dict = None, db_path: str = "my_measurement_data.db", spectrometer_type: str = SPECTROMETER_TYPE) -> Station:
     """
     Close existing instrument instances to avoid name conflict errors, connect to the database,
     and initialize all station components (both physical and simulated).
@@ -94,7 +96,7 @@ def initialize_station(simulated: bool = False, simulated_devices: dict = None, 
     initialise_or_create_database_at(db_abs_path)
     print(f"QCoDeS database set to: {db_abs_path}")
 
-    station = qc.Station()
+    station = Station()
 
     if simulated_devices is None:
         simulated_devices = globals()['simulated_devices'].copy()
@@ -252,8 +254,9 @@ def initialize_station(simulated: bool = False, simulated_devices: dict = None, 
         powermeter = ThorlabsPM100D('powermeter', address='simulated')
     station.add_component(powermeter)
 
-    # 9. Capacitance bridge: SR830 lock-in, Siglent AWG and uVoltDAQ DAC/ADC
+    # 9. Capacitance bridge and transport: SR830 lock-ins, Siglent AWG and uVoltDAQ DAC/ADC
     for name, driver, address in (('lockin', StanfordSR830, LOCKIN_ADDRESS),
+                                  ('lockin2', StanfordSR830, LOCKIN2_ADDRESS),
                                   ('awg', SiglentSDG2042X, AWG_ADDRESS),
                                   ('dac', QPGuVoltDAQ, DAC_ADDRESS)):
         if not should_simulate(name):

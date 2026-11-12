@@ -7,7 +7,7 @@ import threading
 from unittest.mock import patch, MagicMock
 from types import SimpleNamespace
 
-import qcodes as qc
+from qcodes.station import Station
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -44,7 +44,7 @@ class LauncherTests(unittest.TestCase):
                 third.unlock()
 
     def test_dashboard_can_open_before_any_physical_initialization(self):
-        station = qc.Station()
+        station = Station()
         self.addCleanup(lambda: [c.close() for c in list(station.components.values())])
         opened = MagicMock()
         manager = DeviceManagerWindow(station, opened)
@@ -58,7 +58,7 @@ class LauncherTests(unittest.TestCase):
 
     def test_auto_failure_creates_simulation_and_keeps_error_visible(self):
         import station_devices
-        station = qc.Station()
+        station = Station()
         self.addCleanup(lambda: [c.close() for c in list(station.components.values())])
         manager = DeviceManagerWindow(station, lambda: None)
         self.addCleanup(manager.close)
@@ -78,7 +78,7 @@ class LauncherTests(unittest.TestCase):
         self.assertTrue(manager.table.cellWidget(manager.rows["smu"], 1).isEnabled())
 
     def test_strict_physical_failure_does_not_implicitly_connect_simulation(self):
-        station = qc.Station()
+        station = Station()
         manager = DeviceManagerWindow(station, lambda: None)
         self.addCleanup(manager.close)
         manager.table.cellWidget(manager.rows["camera"], 1).setCurrentText("Physical")
@@ -126,7 +126,7 @@ class LauncherTests(unittest.TestCase):
         self.assertIs(station.components["camera"], camera)
 
     def test_device_modes_are_not_locked_after_initialization(self):
-        station = qc.Station()
+        station = Station()
         self.addCleanup(lambda: [c.close() for c in list(station.components.values())])
         manager = DeviceManagerWindow(station, lambda: None)
         self.addCleanup(manager.close)

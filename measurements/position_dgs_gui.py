@@ -25,6 +25,8 @@ parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 class PositionDGSWindow(MainWindow):
     editable_current_compliance = False
+    # Position scans drive both gates with the Keysight; no uVoltDAQ selection here.
+    allow_dac_gate_outputs = False
 
     def __init__(self, station, embed=False):
         self.store = None

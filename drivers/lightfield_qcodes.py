@@ -1,5 +1,6 @@
 import Pyro4
-from qcodes import Instrument, Parameter
+from qcodes.instrument import Instrument
+from qcodes.parameters import Parameter
 import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal
 

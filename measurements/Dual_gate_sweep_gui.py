@@ -24,9 +24,13 @@ if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
 from station_setup import initialize_station, simulated_devices
-from gate_safety import (GATE_CURRENT_COMPLIANCE_A, GATE_MAX_ABS_VOLTAGE_V, GATE_MAX_RAMP_STEP_V,
-                         GateRampCancelled, validate_gate_targets, validate_gate_voltage,
-                         validate_current_compliance)
+from gate_safety import (DEFAULT_GATE_RAMP_RATE_V_PER_S, GATE_CURRENT_COMPLIANCE_A, GATE_MAX_ABS_VOLTAGE_V,
+                         GATE_MAX_RAMP_STEP_V, GateRampCancelled, validate_gate_targets,
+                         validate_gate_voltage, validate_current_compliance)
+from dgs_gate_outputs import (DEFAULT_GATE_OUTPUTS, find_dac, gate_output_label, gate_output_options,
+                              is_dac_output, normalize_gate_outputs, require_gate_outputs_ready,
+                              resolve_gate_channel, uses_keysight, validate_gate_output_targets)
+from drivers.qpg_uvoltdaq import DAC_RANGE_V
 from gui_safety import install_parameter_wheel_guard
 from measurement_data_paths import dated_measurement_filename, dated_measurement_path
 from measurement_data_paths import measurement_data_dir, measurement_start_text, new_measurement_start, measurement_device_modes
@@ -185,12 +189,29 @@ def finite_plot_levels(values):
     return (float(finite.min()), float(finite.max())) if finite.size else (0.0, 1.0)
 
 
+def format_gate_current(curr):
+    """nA/uA/mA text; a gate without current readback (uVoltDAQ) shows n/a."""
+    if curr is None or not math.isfinite(curr):
+        return "n/a (no readback)"
+    if abs(curr) < 1e-6:
+        return f"{curr*1e9:.2f} nA"
+    elif abs(curr) < 1e-3:
+        return f"{curr*1e6:.2f} uA"
+    else:
+        return f"{curr*1e3:.2f} mA"
+
+
 def validate_dgs_parameters(params):
-    """Linear transform extrema occur at corners; preflight before any motion."""
+    """Linear transform extrema occur at corners; preflight before any motion.
+
+    Gates driven by a uVoltDAQ output must also stay within the DAC range.
+    """
     x = [params['c1_start'], params['c1_end'] if params['c1_pts'] > 1 else params['c1_start']]
     y = [params['c2_start'], params['c2_end'] if params['c2_pts'] > 1 else params['c2_start']]
     xx, yy = np.meshgrid(x, y)
-    validate_gate_targets(*transform_c_to_v(xx, yy, *(params[k] for k in ('a', 'b', 'c', 'd'))))
+    v1, v2 = transform_c_to_v(xx, yy, *(params[k] for k in ('a', 'b', 'c', 'd')))
+    validate_gate_targets(v1, v2)
+    validate_gate_output_targets(v1, v2, normalize_gate_outputs(params.get('gate_outputs')))
 
 
 def require_voltage_source_modes(smu):
@@ -327,19 +348,54 @@ class SweepWorker(QtCore.QThread):
         self.pause_cond = QtCore.QWaitCondition()
         self._control = self
         self._cancel_generation = 0
+        # Validated in _do_run, before any write; Keysight CH1/CH2 by default.
+        self.gate_outputs = dict(params.get('gate_outputs') or DEFAULT_GATE_OUTPUTS)
+        self._dac_gates = {}
+
+    def gate(self, axis):
+        """The channel driving V{axis}: a Keysight channel or a uVoltDAQ DAC output."""
+        key = self.gate_outputs.get(axis, DEFAULT_GATE_OUTPUTS[axis])
+        if not is_dac_output(key):
+            return getattr(self.station.smu, f'ch{axis}')
+        if axis not in self._dac_gates:
+            rate = (self.params.get('gate_ramp_rates') or {}).get(axis, DEFAULT_GATE_RAMP_RATE_V_PER_S)
+            self._dac_gates[axis] = resolve_gate_channel(self.station, key, axis, rate)
+        return self._dac_gates[axis]
+
+    def return_keysight_to_local(self):
+        if not uses_keysight(self.gate_outputs):
+            return
+        try:
+            self.station.smu.return_to_local()
+        except Exception:
+            pass
+
+    def read_gate(self, axis):
+        """(current, voltage) after settling. A DAC gate has no current readback."""
+        channel = self.gate(axis)
+        if is_dac_output(self.gate_outputs.get(axis, DEFAULT_GATE_OUTPUTS[axis])):
+            try:
+                return math.nan, float(channel.measure_volt())
+            except Exception:
+                return math.nan, math.nan
+        try:
+            output_on = bool(channel.output())
+            current = channel.measure_curr() if output_on else 0.0
+            voltage = channel.measure_volt() if output_on else 0.0
+        except Exception:
+            current = 0.0
+            voltage = 0.0
+        return current, voltage
 
     def pause(self):
         self.mutex.lock()
         self._is_paused = True
         self._cancel_generation += 1
-        try:
-            self.station.smu.ch1.ramp_stop_requested = True
-        except Exception:
-            pass
-        try:
-            self.station.smu.ch2.ramp_stop_requested = True
-        except Exception:
-            pass
+        for axis in (1, 2):
+            try:
+                self.gate(axis).ramp_stop_requested = True
+            except Exception:
+                pass
         self.mutex.unlock()
 
     def resume(self):
@@ -353,14 +409,11 @@ class SweepWorker(QtCore.QThread):
         self._is_running = False
         self._is_paused = False
         self._cancel_generation += 1
-        try:
-            self.station.smu.ch1.ramp_stop_requested = True
-        except Exception:
-            pass
-        try:
-            self.station.smu.ch2.ramp_stop_requested = True
-        except Exception:
-            pass
+        for axis in (1, 2):
+            try:
+                self.gate(axis).ramp_stop_requested = True
+            except Exception:
+                pass
         self.pause_cond.wakeAll()
         self.mutex.unlock()
 
@@ -374,8 +427,8 @@ class SweepWorker(QtCore.QThread):
                 control.pause_cond.wait(control.mutex)
             if not control._is_running:
                 return None
-            self.station.smu.ch1.ramp_stop_requested = False
-            self.station.smu.ch2.ramp_stop_requested = False
+            self.gate(1).ramp_stop_requested = False
+            self.gate(2).ramp_stop_requested = False
             return control._cancel_generation
         finally:
             control.mutex.unlock()
@@ -387,34 +440,32 @@ class SweepWorker(QtCore.QThread):
             self.pause_cond.wait(self.mutex)
         if not self._is_running:
             self.mutex.unlock()
-            try:
-                self.station.smu.return_to_local()
-            except Exception:
-                pass
+            self.return_keysight_to_local()
             return False
         self.mutex.unlock()
         return True
 
     def run(self):
-        smu = getattr(self.station, "smu", None)
         try:
             try:
                 self._do_run()
             finally:
-                if smu is not None:
-                    try:
-                        smu.return_to_local()
-                    except Exception:
-                        pass
+                self.return_keysight_to_local()
         except Exception as e:
             self.error_occurred.emit(str(e))
 
     def _do_run(self):
         try:
             validate_dgs_parameters(self.params)
-            smu = self.station.smu
-            require_voltage_source_modes(smu)
-            smu.enforce_current_compliance()
+            outputs = normalize_gate_outputs(self.params.get('gate_outputs'))
+            if outputs == DEFAULT_GATE_OUTPUTS:
+                smu = self.station.smu
+                require_voltage_source_modes(smu)
+                smu.enforce_current_compliance()
+            else:
+                # uVoltDAQ gates: setpoint in range. Only Keysight channels that
+                # drive a gate are checked and get their compliance confirmed.
+                require_gate_outputs_ready(self.gate, outputs)
             camera = self.station.camera
             mono = self.station.monochromator
 
@@ -522,10 +573,10 @@ class SweepWorker(QtCore.QThread):
                         if generation is None:
                             return
                         try:
-                            smu.ch1.set_r.volt(v1)
+                            self.gate(1).set_r.volt(v1)
                             if not self.check_pause_and_stop():
                                 return
-                            smu.ch2.set_r.volt(v2)
+                            self.gate(2).set_r.volt(v2)
                         except GateRampCancelled:
                             # Resume retries this entire point, with a fresh ramp
                             # readback, before starting its full settling delay.
@@ -534,7 +585,8 @@ class SweepWorker(QtCore.QThread):
                             if self._control._cancel_generation == generation:
                                 raise
                             continue
-                        if getattr(smu.ch1, 'ramp_stop_requested', False) or getattr(smu.ch2, 'ramp_stop_requested', False):
+                        if (getattr(self.gate(1), 'ramp_stop_requested', False)
+                                or getattr(self.gate(2), 'ramp_stop_requested', False)):
                             if self._control._cancel_generation == generation:
                                 raise GateRampCancelled('Gate output cancelled during sweep')
                             continue
@@ -551,23 +603,11 @@ class SweepWorker(QtCore.QThread):
                     if not self.check_pause_and_stop():
                         return
 
-                    # 4. Read actual SMU voltage and current (before spectrum, so values
-                    #    reflect the settled state, not the state after a long exposure)
-                    try:
-                        ch1_on = bool(smu.ch1.output())
-                        curr_ch1 = smu.ch1.measure_curr() if ch1_on else 0.0
-                        meas_v1 = smu.ch1.measure_volt() if ch1_on else 0.0
-                    except Exception:
-                        curr_ch1 = 0.0
-                        meas_v1 = 0.0
-
-                    try:
-                        ch2_on = bool(smu.ch2.output())
-                        curr_ch2 = smu.ch2.measure_curr() if ch2_on else 0.0
-                        meas_v2 = smu.ch2.measure_volt() if ch2_on else 0.0
-                    except Exception:
-                        curr_ch2 = 0.0
-                        meas_v2 = 0.0
+                    # 4. Read actual gate voltage and current (before spectrum, so values
+                    #    reflect the settled state, not the state after a long exposure).
+                    #    uVoltDAQ gates: NaN current, voltage = confirmed setpoint.
+                    curr_ch1, meas_v1 = self.read_gate(1)
+                    curr_ch2, meas_v2 = self.read_gate(2)
 
                     meas_b = 0.0
                     magnet = getattr(self.station, 'magnet', None)
@@ -608,7 +648,7 @@ class SweepWorker(QtCore.QThread):
             if self.params.get('ramp_to_zero', False) and self._control is self:
                 self.status_updated.emit('Status: Sweep complete. Ramping both gates to 0 V...')
                 try:
-                    if not self.ramp_gates_to_zero(smu):
+                    if not self.ramp_gates_to_zero():
                         return
                 except Exception as exc:
                     raise RuntimeError(f'Sweep data is complete, but the final ramp to 0 V failed: {exc}') from exc
@@ -618,7 +658,7 @@ class SweepWorker(QtCore.QThread):
         except Exception as e:
             self.error_occurred.emit(str(e))
 
-    def ramp_gates_to_zero(self, smu):
+    def ramp_gates_to_zero(self):
         """Ramp both gates to 0 V together after a complete sweep.
 
         The channels advance in alternating steps of at most GATE_MAX_RAMP_STEP_V
@@ -626,14 +666,15 @@ class SweepWorker(QtCore.QThread):
         channel after the other could transiently raise the gate-to-gate voltage,
         e.g. (5 V, 5 V) -> (0 V, 5 V). Stop holds the voltages reached; a pause
         repeats the interrupted step after Resume. Returns False when stopped.
+        Works for Keysight and uVoltDAQ gates alike.
         """
-        start = [validate_gate_voltage(float(getattr(smu, f'ch{axis}').volt()), axis) for axis in (1, 2)]
+        start = [validate_gate_voltage(float(self.gate(axis).volt()), axis) for axis in (1, 2)]
         steps = math.ceil(max(abs(value) for value in start) / GATE_MAX_RAMP_STEP_V - 1e-12)
         a, b, c, d = (self.params[key] for key in ('a', 'b', 'c', 'd'))
         for index in range(1, steps + 1):
             targets = [0.0 if index == steps else value * (1 - index / steps) for value in start]
             for axis, target in zip((1, 2), targets):
-                channel = getattr(smu, f'ch{axis}')
+                channel = self.gate(axis)
                 while True:
                     if not self.check_pause_and_stop():
                         return False
@@ -897,13 +938,72 @@ class LiveStatusWorker(QtCore.QThread):
     status_updated = QtCore.pyqtSignal(float, float, float)
     compliance_updated = QtCore.pyqtSignal(object)
 
-    def __init__(self, station, parent=None):
+    def __init__(self, station, parent=None, gate_outputs=None):
         super().__init__(parent)
         self.station = station
+        # Callable returning the window's present {1: key, 2: key} gate outputs.
+        self.gate_outputs = gate_outputs or (lambda: DEFAULT_GATE_OUTPUTS)
         self._stop_requested = False
         self._is_paused = False
         self._actively_polling = False
         self._last_compliance_poll = 0.0
+
+    @staticmethod
+    def _read_smu_volts(smu, axes):
+        """Setpoints of the listed Keysight channels; cached values while ramping."""
+        values = {axis: 0.0 for axis in axes}
+        channels = {axis: getattr(smu, f'ch{axis}') for axis in axes}
+        if any(getattr(channel, "ramping", False) for channel in channels.values()):
+            for axis, channel in channels.items():
+                latest = channel.volt.get_latest()
+                values[axis] = 0.0 if latest is None else latest
+            return values
+        if getattr(smu, "simulated", False):
+            for axis, channel in channels.items():
+                try:
+                    values[axis] = channel.volt()
+                except Exception:
+                    pass
+            return values
+        old_timeout = None
+        try:
+            if hasattr(smu, "_lock"):
+                with smu._lock:
+                    old_timeout = smu.timeout()
+                    smu.timeout(0.5)
+            else:
+                old_timeout = smu.timeout()
+                smu.timeout(0.5)
+        except Exception:
+            old_timeout = None
+
+        for axis, channel in channels.items():
+            try:
+                values[axis] = channel.volt()
+            except Exception:
+                try:
+                    smu.visa_handle.clear()
+                except Exception:
+                    pass
+
+        if old_timeout is not None:
+            try:
+                if hasattr(smu, "_lock"):
+                    with smu._lock:
+                        smu.timeout(old_timeout)
+                else:
+                    smu.timeout(old_timeout)
+            except Exception:
+                pass
+        return values
+
+    def _read_dac_volt(self, key, axis):
+        """A uVoltDAQ gate setpoint; the last written step while it ramps."""
+        try:
+            channel = resolve_gate_channel(self.station, key, axis)
+            return channel.latest_volt() if channel.ramping else channel.volt()
+        except Exception:
+            return 0.0
 
     def stop(self):
         self._stop_requested = True
@@ -938,69 +1038,18 @@ class LiveStatusWorker(QtCore.QThread):
                         except Exception:
                             pass
                 
-                # Read SMU voltages
-                v1_val = 0.0
-                v2_val = 0.0
+                # Read gate voltages: Keysight channels and/or uVoltDAQ setpoints
+                outputs = self.gate_outputs()
+                values = {1: 0.0, 2: 0.0}
                 smu = getattr(self.station, 'smu', None)
-                if smu is not None:
-                    ch1_ramping = getattr(smu.ch1, "ramping", False)
-                    ch2_ramping = getattr(smu.ch2, "ramping", False)
-                    if ch1_ramping or ch2_ramping:
-                        v1_val = smu.ch1.volt.get_latest()
-                        if v1_val is None:
-                            v1_val = 0.0
-                        v2_val = smu.ch2.volt.get_latest()
-                        if v2_val is None:
-                            v2_val = 0.0
-                    else:
-                        if getattr(smu, "simulated", False):
-                            try:
-                                v1_val = smu.ch1.volt()
-                            except Exception:
-                                pass
-                            try:
-                                v2_val = smu.ch2.volt()
-                            except Exception:
-                                pass
-                        else:
-                            old_timeout = None
-                            try:
-                                if hasattr(smu, "_lock"):
-                                    with smu._lock:
-                                        old_timeout = smu.timeout()
-                                        smu.timeout(0.5)
-                                else:
-                                    old_timeout = smu.timeout()
-                                    smu.timeout(0.5)
-                            except Exception:
-                                old_timeout = None
+                smu_axes = tuple(axis for axis in (1, 2) if not is_dac_output(outputs[axis]))
+                if smu is not None and smu_axes:
+                    values.update(self._read_smu_volts(smu, smu_axes))
+                for axis in (1, 2):
+                    if is_dac_output(outputs[axis]):
+                        values[axis] = self._read_dac_volt(outputs[axis], axis)
+                v1_val, v2_val = values[1], values[2]
 
-                            try:
-                                v1_val = smu.ch1.volt()
-                            except Exception:
-                                try:
-                                    smu.visa_handle.clear()
-                                except Exception:
-                                    pass
-                            
-                            try:
-                                v2_val = smu.ch2.volt()
-                            except Exception:
-                                try:
-                                    smu.visa_handle.clear()
-                                except Exception:
-                                    pass
-
-                            if old_timeout is not None:
-                                try:
-                                    if hasattr(smu, "_lock"):
-                                        with smu._lock:
-                                            smu.timeout(old_timeout)
-                                    else:
-                                        smu.timeout(old_timeout)
-                                except Exception:
-                                    pass
-                
                 if smu is not None and not (getattr(smu.ch1, 'ramping', False) or getattr(smu.ch2, 'ramping', False)):
                     if time.monotonic() - self._last_compliance_poll >= 1.0:
                         self.compliance_updated.emit(read_compliance_values(smu))
@@ -1015,6 +1064,8 @@ class LiveStatusWorker(QtCore.QThread):
 
 class MainWindow(QtWidgets.QMainWindow):
     editable_current_compliance = True
+    # Each gate may be driven by its Keysight channel or a uVoltDAQ DAC output.
+    allow_dac_gate_outputs = True
 
     def __init__(self, station, embed=False):
         super().__init__()
@@ -1124,11 +1175,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
         except Exception as e:
             print(f"Startup warning: could not sync SMU states ({e})")
-        
+        # A gate on a uVoltDAQ output has no Keysight output, mode or compliance.
+        self.apply_gate_output_ui()
+
         self.view_control_popup = ViewControlPopup(self, has_grid=True)
 
         # Start background 5 Hz status polling worker
-        self.live_status_worker = LiveStatusWorker(self.station, parent=self)
+        self.live_status_worker = LiveStatusWorker(self.station, parent=self,
+                                                   gate_outputs=lambda: self.gate_outputs)
         self.live_status_worker.status_updated.connect(self.on_live_status_updated)
         self.live_status_worker.compliance_updated.connect(self.on_compliance_readback)
         self.live_status_worker.start()
@@ -2445,7 +2499,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "coeff_d": 1.0,
             "sweep_mode": "Hold C1, sweep C2",
             "serpentine": True,
-            "ramp_to_zero": False
+            "ramp_to_zero": False,
+            "gate_output_1": DEFAULT_GATE_OUTPUTS[1],
+            "gate_output_2": DEFAULT_GATE_OUTPUTS[2],
         }
         self.stored_settings = defaults.copy()
         if os.path.exists(storage_path):
@@ -2491,6 +2547,19 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.stored_settings["c2_name"] = "Vc2"
             except Exception as e:
                 print(f"Error loading value_storage: {e}")
+        self.gate_outputs = self.stored_gate_outputs()
+
+    def stored_gate_outputs(self):
+        """Saved V1/V2 outputs; the Keysight channels when not offered or invalid."""
+        if not self.allow_dac_gate_outputs:
+            return dict(DEFAULT_GATE_OUTPUTS)
+        try:
+            return normalize_gate_outputs({
+                axis: self.stored_settings.get(f"gate_output_{axis}") or DEFAULT_GATE_OUTPUTS[axis]
+                for axis in (1, 2)})
+        except ValueError as exc:
+            print(f"Ignoring the saved gate outputs ({exc}); using the Keysight channels.")
+            return dict(DEFAULT_GATE_OUTPUTS)
 
     def save_storage(self):
         if getattr(self, "plotter_mode", False):
@@ -2567,6 +2636,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 current_data["dual_gate"]["serpentine"] = self.serpentine_box.isChecked()
             if hasattr(self, "ramp_zero_box"):
                 current_data["dual_gate"]["ramp_to_zero"] = self.ramp_zero_box.isChecked()
+            if self.allow_dac_gate_outputs and hasattr(self, "gate_outputs"):
+                current_data["dual_gate"]["gate_output_1"] = self.gate_outputs[1]
+                current_data["dual_gate"]["gate_output_2"] = self.gate_outputs[2]
 
             # Purge deprecated root-level keys and legacy c1/c2 compliance keys
             deprecated_keys = [
@@ -2694,6 +2766,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.update_variable_names()
         self.update_coordinates_from_ui()
         self.on_compliance_changed()
+        self.set_gate_output_combos()
+        self.apply_gate_output_ui()
 
     def create_scientific_validator(self, minimum, maximum, decimals):
         validator = QtGui.QDoubleValidator(minimum, maximum, decimals, self)
@@ -2757,10 +2831,12 @@ class MainWindow(QtWidgets.QMainWindow):
         col1_layout.setSpacing(10)
         col1_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Keysight Channel 1 SMU Controls
+        # Channel 1 controls: Keysight CH1 or a uVoltDAQ DAC output drives V1
         ch1_box = QtWidgets.QGroupBox("Keysight channel 1")
+        self.ch1_box = ch1_box
         ch1_layout = QtWidgets.QVBoxLayout(ch1_box)
         ch1_layout.setSpacing(8)
+        ch1_layout.addWidget(self.build_gate_output_row(1))
 
         grid1 = QtWidgets.QGridLayout()
         grid1.setSpacing(6)
@@ -2885,10 +2961,12 @@ class MainWindow(QtWidgets.QMainWindow):
         col2_layout.setSpacing(10)
         col2_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Keysight Channel 2 SMU Controls
+        # Channel 2 controls: Keysight CH2 or a uVoltDAQ DAC output drives V2
         ch2_box = QtWidgets.QGroupBox("Keysight channel 2")
+        self.ch2_box = ch2_box
         ch2_layout = QtWidgets.QVBoxLayout(ch2_box)
         ch2_layout.setSpacing(8)
+        ch2_layout.addWidget(self.build_gate_output_row(2))
 
         grid2 = QtWidgets.QGridLayout()
         grid2.setSpacing(6)
@@ -3629,83 +3707,200 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(self, "live_status_worker") and self.live_status_worker:
                 self.live_status_worker.resume()
 
-    # --- Live Parameter Readout ---
-    # --- Live Parameter Readout (On Demand) ---
-    def read_channel_one(self):
-        if getattr(self, "plotter_mode", False):
+    # --- Gate outputs (Keysight channel or uVoltDAQ DAC output) ---
+    def gate_is_dac(self, axis):
+        return is_dac_output(getattr(self, "gate_outputs", DEFAULT_GATE_OUTPUTS)[axis])
+
+    def gate_channel(self, axis):
+        """The channel driving V{axis}; a DAC output ramps at this gate's ramp rate."""
+        return resolve_gate_channel(self.station, self.gate_outputs[axis], axis,
+                                    getattr(self, f"ch{axis}_ramp_rate").value())
+
+    def build_gate_output_row(self, axis):
+        """Output selector for V{axis}: its Keysight channel or a uVoltDAQ DAC output."""
+        row = QtWidgets.QWidget()
+        layout = QtWidgets.QGridLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(QtWidgets.QLabel("Output:"), 0, 0)
+        combo = QtWidgets.QComboBox()
+        for key, label in gate_output_options(axis):
+            combo.addItem(label, key)
+        combo.setToolTip(
+            f"Instrument output driving V{axis}. A uVoltDAQ output (±{DAC_RANGE_V:g} V, lower noise) "
+            "has no current readback, current compliance or output switch: its currents are saved "
+            "as NaN. Changing this never changes a voltage; wire the gate to the selected output.")
+        with QtCore.QSignalBlocker(combo):
+            combo.setCurrentIndex(combo.findData(self.gate_outputs[axis]))
+        combo.currentIndexChanged.connect(lambda _index, a=axis: self.on_gate_output_changed(a))
+        layout.addWidget(combo, 0, 1)
+        info = QtWidgets.QLabel()
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #b45309; font-size: 11px;")
+        info.hide()
+        layout.addWidget(info, 1, 0, 1, 2)
+        setattr(self, f"ch{axis}_output_combo", combo)
+        setattr(self, f"ch{axis}_output_info", info)
+        setattr(self, f"ch{axis}_output_row", row)
+        if not self.allow_dac_gate_outputs:
+            row.hide()  # Position DGS drives its gates with the Keysight only.
+        return row
+
+    def set_gate_output_combos(self):
+        """Show the present outputs without triggering a change."""
+        for axis in (1, 2):
+            combo = getattr(self, f"ch{axis}_output_combo", None)
+            if combo is not None:
+                with QtCore.QSignalBlocker(combo):
+                    combo.setCurrentIndex(combo.findData(self.gate_outputs[axis]))
+
+    def dac_status_text(self):
+        dac = getattr(self.station, "dac", None)
+        if dac is None:
+            return " The uVoltDAQ is not initialized."
+        return " SIMULATED: connect it in the Device Manager." if getattr(dac, "simulated", False) else ""
+
+    def on_gate_output_changed(self, axis):
+        """Route V{axis} to another output. Never writes to an instrument."""
+        combo = getattr(self, f"ch{axis}_output_combo")
+        requested = dict(self.gate_outputs)
+        requested[axis] = combo.currentData()
+        ramp = self.ramp_worker
+        dashboard = getattr(self, "dashboard", None)
+        try:
+            if not self.allow_dac_gate_outputs:
+                raise ValueError("This panel drives both gates with the Keysight.")
+            if (self.plotter_mode or self.is_running or (ramp is not None and ramp.isRunning())
+                    or (dashboard is not None and dashboard.measurement_active())):
+                raise ValueError("Finish the active measurement or ramp before changing a gate output.")
+            requested = normalize_gate_outputs(requested)
+            if is_dac_output(requested[axis]):
+                find_dac(self.station)
+        except Exception as exc:
+            self.set_gate_output_combos()
+            QtWidgets.QMessageBox.warning(self, "Gate output", str(exc))
+            return
+        self.gate_outputs = requested
+        if not is_dac_output(requested[axis]):
+            self.sync_keysight_channel(axis)
+        self.apply_gate_output_ui()
+        self.show_gate_setpoint(axis)
+        self.save_storage()
+        self.status_lbl.setText(f"Status: V{axis} is driven by {gate_output_label(requested[axis])}. "
+                                "No voltage was changed.")
+
+    def sync_keysight_channel(self, axis):
+        """Show a Keysight channel's actual output state and source mode (read only)."""
+        was_paused = self.pause_status_polling()
+        try:
+            channel = getattr(self.station.smu, f"ch{axis}")
+            self.on_output_updated(f"Channel {axis}", bool(channel.output()))
+            mode = getattr(self, f"ch{axis}_mode")
+            with QtCore.QSignalBlocker(mode):
+                mode.setCurrentText(channel.source_mode())
+        except Exception as exc:
+            button = getattr(self, f"ch{axis}_out_btn")
+            with QtCore.QSignalBlocker(button):
+                button.setChecked(False)
+                button.setText("Unknown")
+            print(f"Could not read Keysight channel {axis} state ({exc})")
+        finally:
+            try:
+                self.station.smu.return_to_local()
+            except Exception:
+                pass
+            self.resume_status_polling(was_paused)
+
+    def show_gate_setpoint(self, axis):
+        """Fill the setpoint field and last reading from the selected output (read only)."""
+        if getattr(self, f"ch{axis}_mode").currentText() != "VOLT":
             return
         was_paused = self.pause_status_polling()
         try:
-            smu = self.station.smu
-            v = smu.ch1.volt()
-            i = smu.ch1.measure_curr()
-            try:
-                smu.return_to_local()
-            except Exception:
-                pass
-            
-            def fmt(curr):
-                if abs(curr) < 1e-6:
-                    return f"{curr*1e9:.2f} nA"
-                elif abs(curr) < 1e-3:
-                    return f"{curr*1e6:.2f} uA"
-                else:
-                    return f"{curr*1e3:.2f} mA"
+            value = float(self.gate_channel(axis).volt())
+        except Exception:
+            return
+        finally:
+            self.resume_status_polling(was_paused)
+        box = getattr(self, f"ch{axis}_setpoint")
+        with QtCore.QSignalBlocker(box):
+            box.setValue(value)
+        getattr(self, f"ch{axis}_live_volt_lbl").setText(f"Voltage: {value:.4f} V")
 
-            self.ch1_live_volt_lbl.setText(f"Voltage: {v:.4f} V")
-            self.ch1_live_curr_lbl.setText(f"Current: {fmt(i)}")
+    def apply_gate_output_ui(self):
+        """Show each gate's controls for its present output. Reads and writes nothing."""
+        inputs_enabled = getattr(self, "_inputs_enabled", True)
+        for axis in (1, 2):
+            dac = self.gate_is_dac(axis)
+            label = gate_output_label(self.gate_outputs[axis])
+            box = getattr(self, f"ch{axis}_box", None)
+            if box is not None:
+                box.setTitle(f"Channel {axis} · {label}" if dac else f"Keysight channel {axis}")
+            info = getattr(self, f"ch{axis}_output_info", None)
+            if info is not None:
+                info.setText(f"±{DAC_RANGE_V:g} V voltage source: no current readback, current "
+                             f"compliance or output switch.{self.dac_status_text()}" if dac else "")
+                info.setVisible(dac)
+            button = getattr(self, f"ch{axis}_out_btn")
+            mode = getattr(self, f"ch{axis}_mode")
+            if dac:
+                with QtCore.QSignalBlocker(button):
+                    button.setChecked(True)
+                    button.setText("Always on")
+                    button.setStyleSheet("")
+                with QtCore.QSignalBlocker(mode):
+                    mode.setCurrentText("VOLT")
+                getattr(self, f"ch{axis}_live_curr_lbl").setText("Current: n/a (no readback)")
+            button.setEnabled(inputs_enabled and not dac)
+            mode.setEnabled(inputs_enabled and not dac)
+            button.setToolTip("The uVoltDAQ has no output switch: it always drives its setpoint." if dac else "")
+            tab = getattr(self, f"tab{axis + 1}", None)
+            if tab is not None and hasattr(self, "right_panel"):
+                self.right_panel.setTabText(self.right_panel.indexOf(tab),
+                                            f"IV channel {axis}" + (" (no current)" if dac else ""))
+        self.update_setpoint_ranges()
+        self._update_compliance_controls(force=True)
+
+    # --- Live Parameter Readout (On Demand) ---
+    def read_channel(self, axis):
+        if getattr(self, "plotter_mode", False):
+            return
+        dac = self.gate_is_dac(axis)
+        volt_lbl = getattr(self, f"ch{axis}_live_volt_lbl")
+        curr_lbl = getattr(self, f"ch{axis}_live_curr_lbl")
+        was_paused = self.pause_status_polling()
+        try:
+            channel = self.gate_channel(axis)
+            v = channel.volt()
+            i = channel.measure_curr()
+            if not dac:
+                try:
+                    self.station.smu.return_to_local()
+                except Exception:
+                    pass
+            volt_lbl.setText(f"Voltage: {v:.4f} V")
+            curr_lbl.setText(f"Current: {format_gate_current(i)}")
         except Exception as e:
-            self.ch1_live_volt_lbl.setText("Voltage: Error")
-            self.ch1_live_curr_lbl.setText("Current: Error")
+            volt_lbl.setText("Voltage: Error")
+            curr_lbl.setText("Current: Error")
             err_msg = str(e)
+            instrument = "uVoltDAQ" if dac else "Keysight SMU"
             if "VI_ERROR_RSRC_LOCKED" in err_msg or "locked" in err_msg.lower():
                 QtWidgets.QMessageBox.warning(
                     self, "Resource Locked",
-                    "Failed to read Channel 1:\nThe instrument connection is locked by another process.\n\n"
-                    "Please ensure no other Python instances, Jupyter notebooks, or software programs are communicating with the Keysight SMU, then try again."
+                    f"Failed to read Channel {axis}:\nThe instrument connection is locked by another process.\n\n"
+                    f"Please ensure no other Python instances, Jupyter notebooks, or software programs are communicating with the {instrument}, then try again."
                 )
             else:
-                QtWidgets.QMessageBox.warning(self, "Read Error", f"Failed to read Channel 1:\n{e}")
+                QtWidgets.QMessageBox.warning(self, "Read Error", f"Failed to read Channel {axis}:\n{e}")
         finally:
             self.resume_status_polling(was_paused)
+
+    def read_channel_one(self):
+        self.read_channel(1)
 
     def read_channel_two(self):
-        if getattr(self, "plotter_mode", False):
-            return
-        was_paused = self.pause_status_polling()
-        try:
-            smu = self.station.smu
-            v = smu.ch2.volt()
-            i = smu.ch2.measure_curr()
-            try:
-                smu.return_to_local()
-            except Exception:
-                pass
-            
-            def fmt(curr):
-                if abs(curr) < 1e-6:
-                    return f"{curr*1e9:.2f} nA"
-                elif abs(curr) < 1e-3:
-                    return f"{curr*1e6:.2f} uA"
-                else:
-                    return f"{curr*1e3:.2f} mA"
-
-            self.ch2_live_volt_lbl.setText(f"Voltage: {v:.4f} V")
-            self.ch2_live_curr_lbl.setText(f"Current: {fmt(i)}")
-        except Exception as e:
-            self.ch2_live_volt_lbl.setText("Voltage: Error")
-            self.ch2_live_curr_lbl.setText("Current: Error")
-            err_msg = str(e)
-            if "VI_ERROR_RSRC_LOCKED" in err_msg or "locked" in err_msg.lower():
-                QtWidgets.QMessageBox.warning(
-                    self, "Resource Locked",
-                    "Failed to read Channel 2:\nThe instrument connection is locked by another process.\n\n"
-                    "Please ensure no other Python instances, Jupyter notebooks, or software programs are communicating with the Keysight SMU, then try again."
-                )
-            else:
-                QtWidgets.QMessageBox.warning(self, "Read Error", f"Failed to read Channel 2:\n{e}")
-        finally:
-            self.resume_status_polling(was_paused)
+        self.read_channel(2)
 
     def on_live_status_updated(self, b_val, v1_val, v2_val):
         self._last_polled_b = b_val
@@ -3853,15 +4048,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_ch1_setpoint_enter(self):
         """Enter key pressed in Setpoint 1 - execute background ramping."""
-        val = self.ch1_setpoint.value()
-        mode = self.ch1_mode.currentText().lower() # 'volt' or 'curr'
-        self.ramp_channel(self.station.smu.ch1, val, mode, "Channel 1")
+        self.on_setpoint_enter(1)
 
     def on_ch2_setpoint_enter(self):
         """Enter key pressed in Setpoint 2 - execute background ramping."""
-        val = self.ch2_setpoint.value()
-        mode = self.ch2_mode.currentText().lower() # 'volt' or 'curr'
-        self.ramp_channel(self.station.smu.ch2, val, mode, "Channel 2")
+        self.on_setpoint_enter(2)
+
+    def on_setpoint_enter(self, axis):
+        val = getattr(self, f"ch{axis}_setpoint").value()
+        mode = getattr(self, f"ch{axis}_mode").currentText().lower()  # 'volt' or 'curr'
+        try:
+            channel = self.gate_channel(axis)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Gate output", str(exc))
+            return
+        self.ramp_channel(channel, val, mode, f"Channel {axis}")
 
     def ramp_channel(self, channel, target, param_name, ch_name):
         if getattr(self, "plotter_mode", False) or self.is_running:
@@ -3939,20 +4140,9 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.critical(self, 'Compliance Error' if compliance_failed else 'Ramping Error', err_msg)
 
     def on_ramp_progress(self, ch_name, volt_val, curr_val):
-        def fmt(curr):
-            if abs(curr) < 1e-6:
-                return f"{curr*1e9:.2f} nA"
-            elif abs(curr) < 1e-3:
-                return f"{curr*1e6:.2f} uA"
-            else:
-                return f"{curr*1e3:.2f} mA"
-
-        if ch_name == "Channel 1":
-            self.ch1_live_volt_lbl.setText(f"Voltage: {volt_val:.4f} V")
-            self.ch1_live_curr_lbl.setText(f"Current: {fmt(curr_val)}")
-        else:
-            self.ch2_live_volt_lbl.setText(f"Voltage: {volt_val:.4f} V")
-            self.ch2_live_curr_lbl.setText(f"Current: {fmt(curr_val)}")
+        axis = 1 if ch_name == "Channel 1" else 2
+        getattr(self, f"ch{axis}_live_volt_lbl").setText(f"Voltage: {volt_val:.4f} V")
+        getattr(self, f"ch{axis}_live_curr_lbl").setText(f"Current: {format_gate_current(curr_val)}")
 
     def on_ch1_stop_clicked(self):
         if self.ramp_worker and self.ramp_worker.isRunning() and self.ramp_worker.ch_name == "Channel 1":
@@ -3975,7 +4165,8 @@ class MainWindow(QtWidgets.QMainWindow):
             button.setStyleSheet(f"background-color: {'#10b981' if enabled else '#f1f5f9'}; color: {'white' if enabled else '#475569'}; font-weight: bold;")
 
     def _toggle_output(self, axis, enabled):
-        if self.plotter_mode:
+        if self.plotter_mode or self.gate_is_dac(axis):
+            # A uVoltDAQ gate has no output switch to toggle.
             return
         channel = getattr(self.station.smu, f'ch{axis}')
         if enabled:
@@ -4006,7 +4197,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if (self.plotter_mode or not self.editable_current_compliance
                 or self.is_running or self._applying_compliance
                 or (self.ramp_worker and self.ramp_worker.isRunning())
-                or getattr(self, f'ch{axis}_mode').currentText() != 'VOLT'):
+                or getattr(self, f'ch{axis}_mode').currentText() != 'VOLT'
+                or self.gate_is_dac(axis)):
             self._update_compliance_controls(force=True)
             return
         dashboard = getattr(self, 'dashboard', None)
@@ -4043,6 +4235,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_compliance_controls(self, force=False):
         for axis in (1, 2):
             box = getattr(self, f'ch{axis}_compliance')
+            if self.gate_is_dac(axis):
+                # The uVoltDAQ has neither current compliance nor current readback.
+                with QtCore.QSignalBlocker(box):
+                    box.setReadOnly(True)
+                    box.setRange(-1.0, 1e12)
+                    box.setSpecialValueText('n/a (uVoltDAQ)')
+                    box.setValue(-1.0)
+                    box.setToolTip('The uVoltDAQ has no current compliance or current readback.')
+                    box.setStyleSheet('')
+                getattr(self, f'ch{axis}_compliance_lbl').setText('Current limit:')
+                continue
             current_mode = getattr(self, f'ch{axis}_mode').currentText() == 'CURR'
             value = self._compliance_setting(axis)
             editable = self.editable_current_compliance and not current_mode and not self.plotter_mode
@@ -4071,11 +4274,15 @@ class MainWindow(QtWidgets.QMainWindow):
         was_paused = self.pause_status_polling()
         try:
             if write_hardware:
-                self.station.smu.ch1.source_mode(self.ch1_mode.currentText())
-                self.station.smu.ch2.source_mode(self.ch2_mode.currentText())
+                # A uVoltDAQ gate is always a voltage source; its Keysight channel is left alone.
+                for axis in (1, 2):
+                    if not self.gate_is_dac(axis):
+                        getattr(self.station.smu, f'ch{axis}').source_mode(getattr(self, f'ch{axis}_mode').currentText())
         except Exception as exc:
             # A blocked mode change must not leave the GUI claiming another mode.
             for axis in (1, 2):
+                if self.gate_is_dac(axis):
+                    continue
                 box = getattr(self, f'ch{axis}_mode')
                 with QtCore.QSignalBlocker(box):
                     box.setCurrentText(getattr(self.station.smu, f'ch{axis}').source_mode())
@@ -4085,16 +4292,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.resume_status_polling(was_paused)
 
         self._compliance_edits.clear()
-        for axis in (1, 2):
-            current_mode = getattr(self, f'ch{axis}_mode').currentText() == 'CURR'
-            box = getattr(self, f'ch{axis}_setpoint')
-            getattr(self, f'ch{axis}_setpoint_lbl').setText('Setpoint (A):' if current_mode else 'Setpoint (V):')
-            box.setDecimals(9 if current_mode else 4)
-            box.setRange(-GATE_CURRENT_COMPLIANCE_A, GATE_CURRENT_COMPLIANCE_A) if current_mode else box.setRange(-GATE_MAX_ABS_VOLTAGE_V, GATE_MAX_ABS_VOLTAGE_V)
-            box.setSingleStep(1e-9 if current_mode else 0.001)
+        self.update_setpoint_ranges()
         self._update_compliance_controls(force=True)
         if write_hardware:
             self.on_compliance_changed()
+
+    def update_setpoint_ranges(self):
+        """Setpoint units and limits for each gate's source mode and output."""
+        for axis in (1, 2):
+            current_mode = getattr(self, f'ch{axis}_mode').currentText() == 'CURR'
+            box = getattr(self, f'ch{axis}_setpoint')
+            limit = DAC_RANGE_V if self.gate_is_dac(axis) else GATE_MAX_ABS_VOLTAGE_V
+            getattr(self, f'ch{axis}_setpoint_lbl').setText('Setpoint (A):' if current_mode else 'Setpoint (V):')
+            box.setDecimals(9 if current_mode else 4)
+            if current_mode:
+                box.setRange(-GATE_CURRENT_COMPLIANCE_A, GATE_CURRENT_COMPLIANCE_A)
+            else:
+                box.setRange(-limit, limit)
+            box.setSingleStep(1e-9 if current_mode else 0.001)
 
     def on_ch1_ramping_params_changed(self):
         if getattr(self, "plotter_mode", False):
@@ -4134,13 +4349,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def set_inputs_enabled(self, enabled: bool):
         """Enable or disable all configuration inputs and manual control buttons during sweeps."""
-        # Keysight controls
-        self.ch1_out_btn.setEnabled(enabled)
-        self.ch2_out_btn.setEnabled(enabled)
+        self._inputs_enabled = enabled
+        # Gate outputs. A uVoltDAQ gate has no output switch or source mode.
+        for axis in (1, 2):
+            combo = getattr(self, f'ch{axis}_output_combo', None)
+            if combo is not None:
+                combo.setEnabled(enabled)
+        self.ch1_out_btn.setEnabled(enabled and not self.gate_is_dac(1))
+        self.ch2_out_btn.setEnabled(enabled and not self.gate_is_dac(2))
         self.ch1_setpoint.setEnabled(enabled)
         self.ch2_setpoint.setEnabled(enabled)
-        self.ch1_mode.setEnabled(enabled)
-        self.ch2_mode.setEnabled(enabled)
+        self.ch1_mode.setEnabled(enabled and not self.gate_is_dac(1))
+        self.ch2_mode.setEnabled(enabled and not self.gate_is_dac(2))
         self.ch1_ramp_rate.setEnabled(enabled)
         self.ch2_ramp_rate.setEnabled(enabled)
         self.ch1_compliance.setEnabled(enabled)
@@ -4195,9 +4415,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 'c': self.coeff_c.value(), 'd': self.coeff_d.value(),
                 'c1_start': self.c1_start.value(), 'c1_end': self.c1_end.value(), 'c1_pts': self.c1_pts.value(),
                 'c2_start': self.c2_start.value(), 'c2_end': self.c2_end.value(), 'c2_pts': self.c2_pts.value(),
+                'gate_outputs': self.gate_outputs,
             })
             if self.ch1_mode.currentText() != 'VOLT' or self.ch2_mode.currentText() != 'VOLT':
                 raise ValueError('Gate sweeps require both DC sources in voltage mode.')
+            if any(self.gate_is_dac(axis) for axis in (1, 2)):
+                find_dac(self.station)
         except Exception as exc:
             self.status_lbl.setText(f'Sweep blocked: {exc}')
             QtWidgets.QMessageBox.critical(self, 'Gate protection', str(exc))
@@ -4209,7 +4432,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.station.live_status_paused = True
 
         # Clear the SMU VISA session to discard any unread response or dirty buffer from active status workers
-        smu = getattr(self.station, "smu", None)
+        keysight_axes = [axis for axis in (1, 2) if not self.gate_is_dac(axis)]
+        smu = getattr(self.station, "smu", None) if keysight_axes else None
         if smu is not None and not smu.simulated:
             try:
                 smu.visa_handle.clear()
@@ -4217,13 +4441,20 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+        # uVoltDAQ gates have no current compliance; it is recorded as NaN.
+        self.measurement_current_compliance = {axis: math.nan for axis in (1, 2)}
         if smu is not None:
             try:
-                smu.enforce_current_compliance()
-                self.measurement_current_compliance = {
+                if len(keysight_axes) == 2:
+                    smu.enforce_current_compliance()
+                else:
+                    # Only the Keysight channel that drives a gate; the other is left alone.
+                    for axis in keysight_axes:
+                        getattr(smu, f'ch{axis}').enforce_current_compliance()
+                self.measurement_current_compliance.update({
                     axis: getattr(getattr(smu, f'ch{axis}'), 'current_compliance_target', GATE_CURRENT_COMPLIANCE_A)
-                    for axis in (1, 2)
-                }
+                    for axis in keysight_axes
+                })
             except Exception as e:
                 self.station.live_status_paused = False
                 self.live_status_worker.resume()
@@ -4274,8 +4505,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.data_spectra = np.zeros((c2_pts_actual, c1_pts_actual, num_pixels))
         self.data_raw_spectra = np.zeros((c2_pts_actual, c1_pts_actual, num_spectra, num_pixels))
-        self.data_current_ch1 = np.zeros((c2_pts_actual, c1_pts_actual))
-        self.data_current_ch2 = np.zeros((c2_pts_actual, c1_pts_actual))
+        # A uVoltDAQ gate has no current readback: its currents stay NaN.
+        current_shape = (c2_pts_actual, c1_pts_actual)
+        self.data_current_ch1 = np.full(current_shape, np.nan) if self.gate_is_dac(1) else np.zeros(current_shape)
+        self.data_current_ch2 = np.full(current_shape, np.nan) if self.gate_is_dac(2) else np.zeros(current_shape)
         self.data_measured_volt_ch1 = np.zeros((c2_pts_actual, c1_pts_actual))
         self.data_measured_volt_ch2 = np.zeros((c2_pts_actual, c1_pts_actual))
         self.data_measured_b = np.zeros((c2_pts_actual, c1_pts_actual))
@@ -4332,6 +4565,8 @@ class MainWindow(QtWidgets.QMainWindow):
             'settling_time': self.settling_box.value(),
             'num_pixels': num_pixels,
             'wl_axis': wavelengths,
+            'gate_outputs': dict(self.gate_outputs),
+            'gate_ramp_rates': {1: self.ch1_ramp_rate.value(), 2: self.ch2_ramp_rate.value()},
         }
 
         # Calculate total expected duration
@@ -4374,6 +4609,17 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             prev_v1 = 0.0
             prev_v2 = 0.0
+        # Gates on uVoltDAQ outputs start from their DAC setpoints.
+        for axis in (1, 2):
+            if self.gate_is_dac(axis):
+                try:
+                    start_value = float(self.gate_channel(axis).volt())
+                except Exception:
+                    start_value = 0.0
+                if axis == 1:
+                    prev_v1 = start_value
+                else:
+                    prev_v2 = start_value
 
         v_points = []
         is_c2_outer = (self.sweep_mode_combo.currentText() == "Hold C2, sweep C1")
@@ -4441,6 +4687,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sweep_start_time = time.time()
         self.measurement_started_at = new_measurement_start(self.sweep_start_time)
         self.measurement_device_modes = measurement_device_modes(self.station)
+        self.measurement_gate_outputs = dict(self.gate_outputs)
         self.total_paused_time = 0.0
         self.pause_start_time = None
 
@@ -4456,7 +4703,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.station.live_status_paused = True
 
         # Clear SMU VISA session to discard any unread response or dirty buffer from active status workers
-        smu = getattr(self.station, "smu", None)
+        smu = getattr(self.station, "smu", None) if uses_keysight(self.gate_outputs) else None
         if smu is not None and not getattr(smu, "simulated", False):
             try:
                 smu.visa_handle.clear()
@@ -5117,18 +5364,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 max_val += 1
             self.gatemap_colorbar.setLevels(min_val, max_val)
 
-        # Update Tab 2 and Tab 3 current heatmaps
-        self.t2_heatmap_img.setImage(self.data_current_ch1)
-        if np.any(self.data_measured_mask):
-            c1_meas = self.data_current_ch1[self.data_measured_mask]
-            self.t2_colorbar.setLevels(np.min(c1_meas), np.max(c1_meas))
-
-        self.t3_heatmap_img.setImage(self.data_current_ch2)
-        if np.any(self.data_measured_mask):
-            c2_meas = self.data_current_ch2[self.data_measured_mask]
-            self.t3_colorbar.setLevels(np.min(c2_meas), np.max(c2_meas))
-
-
+        # Update Tab 2 and Tab 3 current heatmaps. A gate without current
+        # readback (uVoltDAQ) has only NaN currents: hide its map and say why.
+        for image, colorbar, plot, title, data in (
+                (self.t2_heatmap_img, self.t2_colorbar, self.t2_heatmap_win, "Top Gate Current Heatmap", self.data_current_ch1),
+                (self.t3_heatmap_img, self.t3_colorbar, self.t3_heatmap_win, "Bottom Gate Current Heatmap", self.data_current_ch2)):
+            measured = data[self.data_measured_mask]
+            has_current = bool(np.isfinite(measured).any())
+            image.setVisible(has_current)
+            text = title if has_current else f"{title}: no current readback"
+            if plot.getPlotItem().titleLabel.text != text:
+                plot.setTitle(text)
+            if has_current:
+                image.setImage(data)
+                colorbar.setLevels(*finite_plot_levels(measured))
 
     def on_integration_region_changed(self):
         """Called dynamically as the shaded spectral region is dragged."""
@@ -5409,6 +5658,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 limits = getattr(self, 'measurement_current_compliance', {})
                 for axis in (1, 2):
                     f.attrs[f'current_compliance_ch{axis}_A'] = limits.get(axis, self._compliance_setting(axis))
+                outputs = getattr(self, 'measurement_gate_outputs', None) or self.gate_outputs
+                for axis in (1, 2):
+                    f.attrs[f'gate_output_ch{axis}'] = outputs[axis]
+                    f.attrs[f'gate_output_ch{axis}_label'] = gate_output_label(outputs[axis])
+                    if is_dac_output(outputs[axis]):
+                        f.attrs[f'current_ch{axis}_note'] = 'Not measured: the uVoltDAQ has no current readback (NaN).'
+                        f.attrs[f'measured_volt_ch{axis}_note'] = 'uVoltDAQ DAC setpoint readback, not a measured voltage.'
                 # Store full value_storage JSON as a dataset for full state recovery
                 try:
                     storage_path = os.path.join(parent_dir, "value_storage")
