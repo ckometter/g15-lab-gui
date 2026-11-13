@@ -40,7 +40,7 @@ from measurement_acquisition import acquire_sweep_spectrum
 from sweep_timing import (MIN_POINTS_TO_STORE, PHASE_FIELDS, STORAGE_KEY, TIMING_FIELDS, SweepEstimate,
                           default_point_overhead, expected_end_text, stored_point_overhead, summary_text,
                           timing_summary)
-from gate_safety import check_gate_limits, validate_gate_limit
+from gate_safety import DEFAULT_GATE_LIMITS_V, check_gate_limits, validate_gate_limits
 
 # Setup pyqtgraph themes (Light Theme)
 pg.setConfigOption('background', '#ffffff')
@@ -211,7 +211,7 @@ def validate_dgs_parameters(params):
     """Linear transform extrema occur at corners; preflight before any motion.
 
     Gates driven by a uVoltDAQ output must also stay within the DAC range, and
-    every gate within its user limit (params['gate_limits'], {1: |V|, 2: |V|}).
+    every gate within its user window (params['gate_limits'], {1: (lowest, highest), 2: ...}).
     """
     x = [params['c1_start'], params['c1_end'] if params['c1_pts'] > 1 else params['c1_start']]
     y = [params['c2_start'], params['c2_end'] if params['c2_pts'] > 1 else params['c2_start']]
@@ -2557,9 +2557,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "ramp_to_zero": False,
             "gate_output_1": DEFAULT_GATE_OUTPUTS[1],
             "gate_output_2": DEFAULT_GATE_OUTPUTS[2],
-            # Largest |V| per gate (V); the SMU range means no extra limit.
-            "v1_max_abs": GATE_MAX_ABS_VOLTAGE_V,
-            "v2_max_abs": GATE_MAX_ABS_VOLTAGE_V,
+            # Allowed voltage window per gate (V) until the user sets one.
+            "v1_min": DEFAULT_GATE_LIMITS_V[0],
+            "v1_max": DEFAULT_GATE_LIMITS_V[1],
+            "v2_min": DEFAULT_GATE_LIMITS_V[0],
+            "v2_max": DEFAULT_GATE_LIMITS_V[1],
         }
         self.stored_settings = defaults.copy()
         if os.path.exists(storage_path):
@@ -2700,8 +2702,9 @@ class MainWindow(QtWidgets.QMainWindow):
             # Overhead per point measured in a sweep, for the next sweep's first estimate.
             if getattr(self, "measured_point_overhead_s", None) is not None:
                 current_data["dual_gate"][STORAGE_KEY] = round(self.measured_point_overhead_s, 4)
-            for axis, limit in self.gate_limits().items():
-                current_data["dual_gate"][f"v{axis}_max_abs"] = limit
+            for axis, (lowest, highest) in self.gate_limits().items():
+                current_data["dual_gate"][f"v{axis}_min"] = lowest
+                current_data["dual_gate"][f"v{axis}_max"] = highest
 
             # Purge deprecated root-level keys and legacy c1/c2 compliance keys
             deprecated_keys = [
@@ -2825,10 +2828,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ramp_zero_box.setChecked(self.stored_settings.get("ramp_to_zero", False))
         self.ramp_zero_box.blockSignals(False)
 
-        for axis, box in getattr(self, "gate_limit_boxes", {}).items():
-            box.blockSignals(True)
-            box.setValue(self.stored_gate_limit(axis))
-            box.blockSignals(False)
+        for axis, boxes in getattr(self, "gate_limit_boxes", {}).items():
+            for box, value in zip(boxes, self.stored_gate_limits(axis)):
+                box.blockSignals(True)
+                box.setValue(value)
+                box.blockSignals(False)
 
         self.update_step_calculations()
         self.update_variable_names()
@@ -3237,25 +3241,34 @@ class MainWindow(QtWidgets.QMainWindow):
         matrix_grid.addWidget(self.v2_c2_label, 1, 4)
 
         gate_layout.addLayout(matrix_grid)
-        # Per-gate voltage limits: no sweep point (after the matrix) or setpoint goes beyond them.
-        limits_layout = QtWidgets.QHBoxLayout()
+        # Per-gate voltage windows: no sweep point (after the matrix) or setpoint goes outside them.
+        limits_grid = QtWidgets.QGridLayout()
+        limits_grid.setSpacing(6)
         self.gate_limit_boxes = {}
-        for axis in (1, 2):
-            limits_layout.addWidget(QtWidgets.QLabel(f"Limit |ch{axis}| ≤"))
-            box = QtWidgets.QDoubleSpinBox()
-            box.setRange(0.001, GATE_MAX_ABS_VOLTAGE_V)
-            box.setDecimals(3)
-            box.setSingleStep(0.1)
-            box.setKeyboardTracking(False)
-            box.setValue(self.stored_gate_limit(axis))
-            box.setToolTip(f"Largest |voltage| for channel {axis}, in volts. A sweep whose matrix would take "
-                           f"channel {axis} beyond it does not start; a larger setpoint is refused.")
-            box.editingFinished.connect(self.on_gate_limits_changed)
-            self.gate_limit_boxes[axis] = box
-            limits_layout.addWidget(box)
-            limits_layout.addWidget(QtWidgets.QLabel("V"))
-        limits_layout.addStretch()
-        gate_layout.addLayout(limits_layout)
+        for row, axis in enumerate((1, 2)):
+            limits_grid.addWidget(QtWidgets.QLabel(f"ch{axis} allowed from"), row, 0)
+            lowest, highest = self.stored_gate_limits(axis)
+            boxes = []
+            for side, low, high, value in (("lowest", -GATE_MAX_ABS_VOLTAGE_V, 0.0, lowest),
+                                           ("highest", 0.0, GATE_MAX_ABS_VOLTAGE_V, highest)):
+                box = QtWidgets.QDoubleSpinBox()
+                box.setRange(low, high)
+                box.setDecimals(3)
+                box.setSingleStep(0.1)
+                box.setKeyboardTracking(False)
+                box.setValue(value)
+                box.setToolTip(f"The {side} voltage channel {axis} may get, in volts. Both limits include 0 V. "
+                               f"A sweep whose matrix would take channel {axis} outside them does not start; "
+                               "a setpoint outside them is refused.")
+                box.editingFinished.connect(self.on_gate_limits_changed)
+                boxes.append(box)
+            limits_grid.addWidget(boxes[0], row, 1)
+            limits_grid.addWidget(QtWidgets.QLabel("to"), row, 2)
+            limits_grid.addWidget(boxes[1], row, 3)
+            limits_grid.addWidget(QtWidgets.QLabel("V"), row, 4)
+            self.gate_limit_boxes[axis] = tuple(boxes)
+        limits_grid.setColumnStretch(5, 1)
+        gate_layout.addLayout(limits_grid)
         self.det_label = QtWidgets.QLabel()
         self.det_label.setWordWrap(True)
         gate_layout.addWidget(self.det_label)
@@ -4063,27 +4076,35 @@ class MainWindow(QtWidgets.QMainWindow):
             self.reset_plot_scaling(reset_spectrum=False)
             self.save_storage()
 
-    def stored_gate_limit(self, axis):
-        """The saved limit |V| for a gate; the SMU range when none or unusable is saved."""
-        try:
-            return validate_gate_limit(self.stored_settings.get(f"v{axis}_max_abs", GATE_MAX_ABS_VOLTAGE_V), axis)
-        except (TypeError, ValueError):
-            return float(GATE_MAX_ABS_VOLTAGE_V)
+    def stored_gate_limits(self, axis):
+        """The saved (lowest, highest) voltage for a gate. A missing or unusable side gets
+        the default on that side (DEFAULT_GATE_LIMITS_V, -1 V to +1 V)."""
+        window = []
+        for key, default in ((f"v{axis}_min", DEFAULT_GATE_LIMITS_V[0]), (f"v{axis}_max", DEFAULT_GATE_LIMITS_V[1])):
+            try:
+                value = float(self.stored_settings.get(key, default))
+                validate_gate_limits(*((value, 0.0) if default < 0 else (0.0, value)), axis)
+            except (TypeError, ValueError):
+                value = float(default)
+            window.append(value)
+        return tuple(window)
 
     def gate_limits(self):
-        """{1: max |V1|, 2: max |V2|}: no sweep point or setpoint may go beyond them."""
-        return {axis: float(box.value()) for axis, box in (getattr(self, "gate_limit_boxes", None) or {}).items()}
+        """{1: (lowest, highest), 2: (...)} in volts: no sweep point or setpoint goes outside them."""
+        return {axis: (float(low.value()), float(high.value()))
+                for axis, (low, high) in (getattr(self, "gate_limit_boxes", None) or {}).items()}
 
     def on_gate_limits_changed(self):
         if getattr(self, "plotter_mode", False):
             return
-        for axis, limit in self.gate_limits().items():
-            self.stored_settings[f"v{axis}_max_abs"] = limit
+        for axis, (lowest, highest) in self.gate_limits().items():
+            self.stored_settings[f"v{axis}_min"] = lowest
+            self.stored_settings[f"v{axis}_max"] = highest
         self.update_det_label()
         self.save_storage()
 
     def check_setpoint_limit(self, axis, value, what="setpoint"):
-        """Show why a voltage beyond the gate limit is refused; True when it is within."""
+        """Show why a voltage outside the gate's window is refused; True when it is inside."""
         try:
             check_gate_limits(value if axis == 1 else (), value if axis == 2 else (), self.gate_limits())
             return True
@@ -4514,8 +4535,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.coeff_b.setEnabled(enabled)
         self.coeff_c.setEnabled(enabled)
         self.coeff_d.setEnabled(enabled)
-        for box in getattr(self, "gate_limit_boxes", {}).values():
-            box.setEnabled(enabled)
+        for boxes in getattr(self, "gate_limit_boxes", {}).values():
+            for box in boxes:
+                box.setEnabled(enabled)
 
         # Control Variables
         self.c1_start.setEnabled(enabled)
@@ -5788,8 +5810,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     f.create_dataset("measured_b", data=self.data_measured_b)
                 f.create_dataset("measured_mask", data=self.data_measured_mask)
                 self.write_sweep_timing(f)
-                for axis, limit in (getattr(self, "measurement_gate_limits", None) or {}).items():
-                    f.attrs[f"gate_limit_ch{axis}_V"] = limit
+                for axis, (lowest, highest) in (getattr(self, "measurement_gate_limits", None) or {}).items():
+                    f.attrs[f"gate_limit_ch{axis}_min_V"] = lowest
+                    f.attrs[f"gate_limit_ch{axis}_max_V"] = highest
 
                 # Save background and reference if available
                 single_win = getattr(self, "single_spectra_window", None)

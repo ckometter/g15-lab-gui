@@ -27,8 +27,8 @@ the values but never apply them to hardware automatically.
 The voltage range and ramp bounds remain configured in code. Both gate channels use the SMU range of -210 through +210 V **after**
 any coordinate calculation. A complete sweep is checked before motion starts;
 the driver also checks every requested voltage and its initial source readback.
-A rejected sweep is not silently clipped. Dual Gate Sweep adds a limit per gate,
-set in the GUI (see [Per-gate voltage limits](#per-gate-voltage-limits-dual-gate-sweep)).
+A rejected sweep is not silently clipped. Dual Gate Sweep adds a lowest and a
+highest voltage per gate, set in the GUI (see [Per-gate voltage limits](#per-gate-voltage-limits-dual-gate-sweep)).
 
 Position DGS compliance fields remain read-only; voltage compliance in current
 source mode is also read-only. Incorrect readbacks remain visible in red; a
@@ -103,28 +103,34 @@ the driver, within the voltage cap.
 
 ## Per-gate voltage limits (Dual Gate Sweep)
 
-The **Gate Variable** box has **Limit |ch1| ≤** and **Limit |ch2| ≤** fields: the
-largest |voltage| each physical channel may get, after the matrix. They are
-saved as `dual_gate.v1_max_abs` and `dual_gate.v2_max_abs` (volts); the default,
-210 V, is the SMU range, so no extra limit.
+The **Gate Variable** box has a voltage window for each physical channel,
+after the matrix: **ch1 allowed from** [lowest] **to** [highest] **V**, and the
+same for ch2. The negative and positive sides are set separately, for example
+-3 V to +4 V. The lowest is at most 0 V and the highest at least 0 V, because
+switching an output on and the optional end ramp pass through 0 V. They are
+saved as `dual_gate.v1_min`, `v1_max`, `v2_min` and `v2_max` (volts). The
+default is -1 V to +1 V for both channels (`DEFAULT_GATE_LIMITS_V` in
+`gate_safety.py`); it also replaces a missing or unusable saved value. Widen a
+window before sweeping or setting a gate beyond it.
 
 - Below the matrix the tab shows the voltage range each channel will cover,
-  for example `ch1: -3.300 to +3.600 V`. When a sweep would take a channel beyond
-  its limit, the line says which channel and voltage (`Sweep disabled: Channel 1
-  would reach +4.2 V, beyond its limit of ±4 V.`) and **Begin** is disabled.
-  With a matrix, the corners of the swept rectangle are the extremes.
+  for example `ch1: -3.300 to +3.600 V`. When a sweep would take a channel outside
+  its window, the line names the channel, the voltage and the side, for example
+  `Sweep disabled: Channel 1 would reach +4.2 V, above its highest allowed +4 V.`,
+  and **Begin** is disabled. With a matrix, the corners of the swept rectangle
+  are the extremes.
 - The sweep is checked again before it starts and at every point before its
-  ramp; a point beyond a limit stops the sweep. Points are never clipped or
+  ramp; a point outside a window stops the sweep. Points are never clipped or
   skipped.
-- A manual voltage setpoint beyond the limit is refused, and so is switching an
-  output on whose programmed setpoint is beyond it. Ramping toward 0 V, including
-  the optional end ramp, stays within the limits.
-- The limits are locked during a sweep and recorded in the file as
-  `gate_limit_ch1_V` and `gate_limit_ch2_V`.
-- Position DGS uses its panel's limits for every pixel; changes made there are
+- A manual voltage setpoint outside the window is refused, and so is switching
+  an output on whose programmed setpoint is outside it. Ramping toward 0 V,
+  including the optional end ramp, stays inside the windows.
+- The windows are locked during a sweep and recorded in the file as
+  `gate_limit_ch1_min_V`, `gate_limit_ch1_max_V` and the same for ch2.
+- Position DGS uses its panel's windows for every pixel; changes made there are
   not saved, like its other settings.
 - In current-source mode the voltage is bounded by the Keysight's voltage
-  compliance, not by these limits. A uVoltDAQ gate also keeps its +/-10 V range.
+  compliance, not by these windows. A uVoltDAQ gate also keeps its +/-10 V range.
 
 ## uVoltDAQ gate outputs in Dual Gate Sweep
 

@@ -771,20 +771,27 @@ class DashboardWorkflowTests(unittest.TestCase):
         self.errors.assert_not_called()
 
     def set_gate_limits(self, window, ch1, ch2):
-        window.gate_limit_boxes[1].setValue(ch1)
-        window.gate_limit_boxes[2].setValue(ch2)
+        """Set each channel's (lowest, highest) voltage as typed into the panel."""
+        for axis, window_limits in ((1, ch1), (2, ch2)):
+            for box, value in zip(window.gate_limit_boxes[axis], window_limits):
+                box.setValue(value)
         window.on_gate_limits_changed()
 
-    def test_gate_limits_block_a_matrix_sweep_beyond_them_and_are_saved(self):
+    def limit_values(self, window):
+        return tuple(tuple(box.value() for box in window.gate_limit_boxes[axis]) for axis in (1, 2))
+
+    def test_gate_limits_block_a_matrix_sweep_outside_them_and_are_saved(self):
         window = self.gate_sweep((3, 3))
-        # VG1 = ch1 + ch2 and VG2 = ch1 - ch2, so ch1 = (VG1 + VG2) / 2 reaches 0.4 V in a corner.
+        self.assertEqual(self.limit_values(window), ((-1, 1), (-1, 1)))  # Default until set.
+        # VG1 = ch1 + ch2 and VG2 = ch1 - ch2: ch1 = (VG1 + VG2) / 2 runs from 0 to +0.4 V and
+        # ch2 = (VG1 - VG2) / 2 from -0.2 to +0.2 V.
         for name, value in (("coeff_a", 1), ("coeff_b", 1), ("coeff_c", 1), ("coeff_d", -1)):
             getattr(window, name).setValue(value)
         for axis in (1, 2):
             getattr(window, f"c{axis}_end").setValue(0.4)
-        self.set_gate_limits(window, 0.3, 210)
+        self.set_gate_limits(window, (-210, 0.3), (-210, 210))
         window.on_sweep_range_changed()
-        self.assertIn("Sweep disabled: Channel 1 would reach +0.4 V, beyond its limit of ±0.3 V",
+        self.assertIn("Sweep disabled: Channel 1 would reach +0.4 V, above its highest allowed +0.3 V",
                       window.det_label.text())
         self.assertFalse(window.begin_btn.isEnabled())
         window.begin_sweep()
@@ -792,41 +799,56 @@ class DashboardWorkflowTests(unittest.TestCase):
         self.errors.assert_called_once()
         self.assertIn("Channel 1 would reach +0.4 V", self.errors.call_args.args[2])
         self.assertEqual((self.station.smu.ch1.volt(), self.station.smu.ch2.volt()), (0.0, 0.0))
-        # At 0.4 V the panel shows each channel's range, and the sweep runs.
-        self.set_gate_limits(window, 0.4, 210)
+        # The negative side has its own limit.
+        self.set_gate_limits(window, (-210, 0.4), (-0.1, 210))
+        self.assertIn("Sweep disabled: Channel 2 would reach -0.2 V, below its lowest allowed -0.1 V",
+                      window.det_label.text())
+        self.assertFalse(window.begin_btn.isEnabled())
+        # Inside both windows the panel shows each channel's range, and the sweep runs.
+        self.set_gate_limits(window, (-210, 0.4), (-0.2, 210))
         self.assertIn("ch1: +0.000 to +0.400 V, ch2: -0.200 to +0.200 V", window.det_label.text())
         self.assertTrue(window.begin_btn.isEnabled())
         window.begin_sweep()
-        self.assertFalse(window.gate_limit_boxes[1].isEnabled())
+        self.assertFalse(any(box.isEnabled() for box in window.gate_limit_boxes[1]))
         self.wait_for(lambda: not window.is_running, timeout=10)
         self.assertTrue(np.all(window.data_measured_mask))
-        self.assertTrue(window.gate_limit_boxes[1].isEnabled())
+        self.assertTrue(all(box.isEnabled() for box in window.gate_limit_boxes[1]))
         stored = json.loads((self.directory / "value_storage").read_text())["dual_gate"]
-        self.assertEqual((stored["v1_max_abs"], stored["v2_max_abs"]), (0.4, 210))
+        self.assertEqual(tuple(stored[key] for key in ("v1_min", "v1_max", "v2_min", "v2_max")),
+                         (-210, 0.4, -0.2, 210))
         files = list(self.directory.rglob("*gate_sweep*.h5"))
         self.assertEqual(len(files), 1)
         with h5py.File(files[0]) as data:
-            self.assertEqual((data.attrs["gate_limit_ch1_V"], data.attrs["gate_limit_ch2_V"]), (0.4, 210))
-            self.assertLessEqual(np.max(np.abs(data["v1_grid"][()])), 0.4 + 1e-9)
+            self.assertEqual(tuple(data.attrs[f"gate_limit_ch{axis}_{side}_V"]
+                                   for axis in (1, 2) for side in ("min", "max")), (-210, 0.4, -0.2, 210))
+            self.assertLessEqual(np.max(data["v1_grid"][()]), 0.4 + 1e-9)
+            self.assertGreaterEqual(np.min(data["v2_grid"][()]), -0.2 - 1e-9)
         self.errors.assert_called_once()
-        # The saved limits come back after a reload; an unusable one falls back to the SMU range.
-        self.set_gate_limits(window, 1.0, 1.0)
-        (self.directory / "value_storage").write_text(json.dumps(
-            {"dual_gate": {**stored, "v1_max_abs": 0.7, "v2_max_abs": "unusable"}}))
+        # The saved limits come back after a reload; an unusable side gets the default (-1 V / +1 V).
+        self.set_gate_limits(window, (-5, 5), (-5, 5))
+        (self.directory / "value_storage").write_text(json.dumps({"dual_gate": {
+            **stored, "v1_min": -0.7, "v1_max": "unusable", "v2_min": 5, "v2_max": 3}}))
         window.reload_gui_from_storage()
-        self.assertEqual((window.gate_limit_boxes[1].value(), window.gate_limit_boxes[2].value()), (0.7, 210))
+        self.assertEqual(self.limit_values(window), ((-0.7, 1), (-1, 3)))
 
-    def test_manual_setpoint_or_switch_on_beyond_the_gate_limit_is_refused(self):
+    def test_manual_setpoint_or_switch_on_outside_the_gate_limits_is_refused(self):
         window = self.gate_sweep((2, 2))
         smu = self.station.smu
-        self.set_gate_limits(window, 0.2, 0.2)
         with patch.object(QtWidgets.QMessageBox, "warning") as warning:
-            window.ch1_setpoint.setValue(0.5)
-            window.on_setpoint_enter(1)
+            # The default window is -1 V to +1 V.
+            window.ch2_setpoint.setValue(1.5)
+            window.on_setpoint_enter(2)
             QtTest.QTest.qWait(200)
-            self.assertEqual(smu.ch1.volt(), 0.0)
-            self.assertIn("The setpoint is refused. Channel 1 would reach +0.5 V, beyond its limit of ±0.2 V",
-                          warning.call_args.args[2])
+            self.assertEqual(smu.ch2.volt(), 0.0)
+            self.assertIn("Channel 2 would reach +1.5 V, above its highest allowed +1 V", warning.call_args.args[2])
+            self.set_gate_limits(window, (-0.3, 0.2), (-0.2, 0.2))
+            for value, message in ((0.5, "+0.5 V, above its highest allowed +0.2 V"),
+                                   (-0.4, "-0.4 V, below its lowest allowed -0.3 V")):
+                window.ch1_setpoint.setValue(value)
+                window.on_setpoint_enter(1)
+                QtTest.QTest.qWait(200)
+                self.assertEqual(smu.ch1.volt(), 0.0)
+                self.assertIn(f"The setpoint is refused. Channel 1 would reach {message}", warning.call_args.args[2])
             window.ch1_setpoint.setValue(0.1)
             window.on_setpoint_enter(1)
             self.wait_for(lambda: smu.ch1.volt() == 0.1)
