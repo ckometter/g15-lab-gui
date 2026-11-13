@@ -770,6 +770,80 @@ class DashboardWorkflowTests(unittest.TestCase):
             self.wait_for(lambda: not window.is_running, timeout=20)
         self.errors.assert_not_called()
 
+    def set_gate_limits(self, window, ch1, ch2):
+        window.gate_limit_boxes[1].setValue(ch1)
+        window.gate_limit_boxes[2].setValue(ch2)
+        window.on_gate_limits_changed()
+
+    def test_gate_limits_block_a_matrix_sweep_beyond_them_and_are_saved(self):
+        window = self.gate_sweep((3, 3))
+        # VG1 = ch1 + ch2 and VG2 = ch1 - ch2, so ch1 = (VG1 + VG2) / 2 reaches 0.4 V in a corner.
+        for name, value in (("coeff_a", 1), ("coeff_b", 1), ("coeff_c", 1), ("coeff_d", -1)):
+            getattr(window, name).setValue(value)
+        for axis in (1, 2):
+            getattr(window, f"c{axis}_end").setValue(0.4)
+        self.set_gate_limits(window, 0.3, 210)
+        window.on_sweep_range_changed()
+        self.assertIn("Sweep disabled: Channel 1 would reach +0.4 V, beyond its limit of ±0.3 V",
+                      window.det_label.text())
+        self.assertFalse(window.begin_btn.isEnabled())
+        window.begin_sweep()
+        self.assertFalse(window.is_running)
+        self.errors.assert_called_once()
+        self.assertIn("Channel 1 would reach +0.4 V", self.errors.call_args.args[2])
+        self.assertEqual((self.station.smu.ch1.volt(), self.station.smu.ch2.volt()), (0.0, 0.0))
+        # At 0.4 V the panel shows each channel's range, and the sweep runs.
+        self.set_gate_limits(window, 0.4, 210)
+        self.assertIn("ch1: +0.000 to +0.400 V, ch2: -0.200 to +0.200 V", window.det_label.text())
+        self.assertTrue(window.begin_btn.isEnabled())
+        window.begin_sweep()
+        self.assertFalse(window.gate_limit_boxes[1].isEnabled())
+        self.wait_for(lambda: not window.is_running, timeout=10)
+        self.assertTrue(np.all(window.data_measured_mask))
+        self.assertTrue(window.gate_limit_boxes[1].isEnabled())
+        stored = json.loads((self.directory / "value_storage").read_text())["dual_gate"]
+        self.assertEqual((stored["v1_max_abs"], stored["v2_max_abs"]), (0.4, 210))
+        files = list(self.directory.rglob("*gate_sweep*.h5"))
+        self.assertEqual(len(files), 1)
+        with h5py.File(files[0]) as data:
+            self.assertEqual((data.attrs["gate_limit_ch1_V"], data.attrs["gate_limit_ch2_V"]), (0.4, 210))
+            self.assertLessEqual(np.max(np.abs(data["v1_grid"][()])), 0.4 + 1e-9)
+        self.errors.assert_called_once()
+        # The saved limits come back after a reload; an unusable one falls back to the SMU range.
+        self.set_gate_limits(window, 1.0, 1.0)
+        (self.directory / "value_storage").write_text(json.dumps(
+            {"dual_gate": {**stored, "v1_max_abs": 0.7, "v2_max_abs": "unusable"}}))
+        window.reload_gui_from_storage()
+        self.assertEqual((window.gate_limit_boxes[1].value(), window.gate_limit_boxes[2].value()), (0.7, 210))
+
+    def test_manual_setpoint_or_switch_on_beyond_the_gate_limit_is_refused(self):
+        window = self.gate_sweep((2, 2))
+        smu = self.station.smu
+        self.set_gate_limits(window, 0.2, 0.2)
+        with patch.object(QtWidgets.QMessageBox, "warning") as warning:
+            window.ch1_setpoint.setValue(0.5)
+            window.on_setpoint_enter(1)
+            QtTest.QTest.qWait(200)
+            self.assertEqual(smu.ch1.volt(), 0.0)
+            self.assertIn("The setpoint is refused. Channel 1 would reach +0.5 V, beyond its limit of ±0.2 V",
+                          warning.call_args.args[2])
+            window.ch1_setpoint.setValue(0.1)
+            window.on_setpoint_enter(1)
+            self.wait_for(lambda: smu.ch1.volt() == 0.1)
+            self.wait_for(lambda: not (window.ramp_worker and window.ramp_worker.isRunning()))
+            # Switching on ramps to the programmed setpoint: refused while that is beyond the limit.
+            smu.ch2.output(False)
+            smu.ch2.volt(0.5)
+            window.on_output_updated("Channel 2", False)
+            self.wait_for(window.ch2_out_btn.isEnabled)  # Controls unlock once the manual ramp is reported.
+            warning.reset_mock()
+            window.ch2_out_btn.click()
+            QtTest.QTest.qWait(200)
+            self.assertIn("The output switch-on is refused. Channel 2 would reach +0.5 V", warning.call_args.args[2])
+            self.assertFalse(smu.ch2.output())
+            self.assertFalse(window.ch2_out_btn.isChecked())
+        self.errors.assert_not_called()
+
     def test_dgs_optional_end_ramp_returns_gates_to_zero_and_is_persisted(self):
         window = self.dashboard.dual_window
         self.dashboard.tab_widget.setCurrentIndex(1)

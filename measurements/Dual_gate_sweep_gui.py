@@ -40,6 +40,7 @@ from measurement_acquisition import acquire_sweep_spectrum
 from sweep_timing import (MIN_POINTS_TO_STORE, PHASE_FIELDS, STORAGE_KEY, TIMING_FIELDS, SweepEstimate,
                           default_point_overhead, expected_end_text, stored_point_overhead, summary_text,
                           timing_summary)
+from gate_safety import check_gate_limits, validate_gate_limit
 
 # Setup pyqtgraph themes (Light Theme)
 pg.setConfigOption('background', '#ffffff')
@@ -209,7 +210,8 @@ def format_gate_current(curr):
 def validate_dgs_parameters(params):
     """Linear transform extrema occur at corners; preflight before any motion.
 
-    Gates driven by a uVoltDAQ output must also stay within the DAC range.
+    Gates driven by a uVoltDAQ output must also stay within the DAC range, and
+    every gate within its user limit (params['gate_limits'], {1: |V|, 2: |V|}).
     """
     x = [params['c1_start'], params['c1_end'] if params['c1_pts'] > 1 else params['c1_start']]
     y = [params['c2_start'], params['c2_end'] if params['c2_pts'] > 1 else params['c2_start']]
@@ -217,6 +219,7 @@ def validate_dgs_parameters(params):
     v1, v2 = transform_c_to_v(xx, yy, *(params[k] for k in ('a', 'b', 'c', 'd')))
     validate_gate_targets(v1, v2)
     validate_gate_output_targets(v1, v2, normalize_gate_outputs(params.get('gate_outputs')))
+    check_gate_limits(v1, v2, params.get('gate_limits'))
 
 
 def require_voltage_source_modes(smu):
@@ -593,8 +596,10 @@ class SweepWorker(QtCore.QThread):
                         i = idx_outer
                         j = idx_inner
 
-                    # 1. Transform to physical voltages
+                    # 1. Transform to physical voltages; each must be within its gate limit
+                    #    (all corners were checked before the first write; this is a second check).
                     v1, v2 = transform_c_to_v(c1, c2, a, b, c, d)
+                    check_gate_limits(v1, v2, self.params.get('gate_limits'))
 
                     # 2. Ramp physical voltages (blocking hardware set call, with interrupt retry loop)
                     self.voltage_updated.emit(c1, c2, v1, v2)
@@ -2552,6 +2557,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "ramp_to_zero": False,
             "gate_output_1": DEFAULT_GATE_OUTPUTS[1],
             "gate_output_2": DEFAULT_GATE_OUTPUTS[2],
+            # Largest |V| per gate (V); the SMU range means no extra limit.
+            "v1_max_abs": GATE_MAX_ABS_VOLTAGE_V,
+            "v2_max_abs": GATE_MAX_ABS_VOLTAGE_V,
         }
         self.stored_settings = defaults.copy()
         if os.path.exists(storage_path):
@@ -2692,6 +2700,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # Overhead per point measured in a sweep, for the next sweep's first estimate.
             if getattr(self, "measured_point_overhead_s", None) is not None:
                 current_data["dual_gate"][STORAGE_KEY] = round(self.measured_point_overhead_s, 4)
+            for axis, limit in self.gate_limits().items():
+                current_data["dual_gate"][f"v{axis}_max_abs"] = limit
 
             # Purge deprecated root-level keys and legacy c1/c2 compliance keys
             deprecated_keys = [
@@ -2814,6 +2824,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ramp_zero_box.blockSignals(True)
         self.ramp_zero_box.setChecked(self.stored_settings.get("ramp_to_zero", False))
         self.ramp_zero_box.blockSignals(False)
+
+        for axis, box in getattr(self, "gate_limit_boxes", {}).items():
+            box.blockSignals(True)
+            box.setValue(self.stored_gate_limit(axis))
+            box.blockSignals(False)
 
         self.update_step_calculations()
         self.update_variable_names()
@@ -3222,6 +3237,25 @@ class MainWindow(QtWidgets.QMainWindow):
         matrix_grid.addWidget(self.v2_c2_label, 1, 4)
 
         gate_layout.addLayout(matrix_grid)
+        # Per-gate voltage limits: no sweep point (after the matrix) or setpoint goes beyond them.
+        limits_layout = QtWidgets.QHBoxLayout()
+        self.gate_limit_boxes = {}
+        for axis in (1, 2):
+            limits_layout.addWidget(QtWidgets.QLabel(f"Limit |ch{axis}| ≤"))
+            box = QtWidgets.QDoubleSpinBox()
+            box.setRange(0.001, GATE_MAX_ABS_VOLTAGE_V)
+            box.setDecimals(3)
+            box.setSingleStep(0.1)
+            box.setKeyboardTracking(False)
+            box.setValue(self.stored_gate_limit(axis))
+            box.setToolTip(f"Largest |voltage| for channel {axis}, in volts. A sweep whose matrix would take "
+                           f"channel {axis} beyond it does not start; a larger setpoint is refused.")
+            box.editingFinished.connect(self.on_gate_limits_changed)
+            self.gate_limit_boxes[axis] = box
+            limits_layout.addWidget(box)
+            limits_layout.addWidget(QtWidgets.QLabel("V"))
+        limits_layout.addStretch()
+        gate_layout.addLayout(limits_layout)
         self.det_label = QtWidgets.QLabel()
         self.det_label.setWordWrap(True)
         gate_layout.addWidget(self.det_label)
@@ -4029,8 +4063,37 @@ class MainWindow(QtWidgets.QMainWindow):
             self.reset_plot_scaling(reset_spectrum=False)
             self.save_storage()
 
+    def stored_gate_limit(self, axis):
+        """The saved limit |V| for a gate; the SMU range when none or unusable is saved."""
+        try:
+            return validate_gate_limit(self.stored_settings.get(f"v{axis}_max_abs", GATE_MAX_ABS_VOLTAGE_V), axis)
+        except (TypeError, ValueError):
+            return float(GATE_MAX_ABS_VOLTAGE_V)
+
+    def gate_limits(self):
+        """{1: max |V1|, 2: max |V2|}: no sweep point or setpoint may go beyond them."""
+        return {axis: float(box.value()) for axis, box in (getattr(self, "gate_limit_boxes", None) or {}).items()}
+
+    def on_gate_limits_changed(self):
+        if getattr(self, "plotter_mode", False):
+            return
+        for axis, limit in self.gate_limits().items():
+            self.stored_settings[f"v{axis}_max_abs"] = limit
+        self.update_det_label()
+        self.save_storage()
+
+    def check_setpoint_limit(self, axis, value, what="setpoint"):
+        """Show why a voltage beyond the gate limit is refused; True when it is within."""
+        try:
+            check_gate_limits(value if axis == 1 else (), value if axis == 2 else (), self.gate_limits())
+            return True
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "Gate limit", f"The {what} is refused. {exc}")
+            return False
+
     def update_det_label(self):
-        """Recompute and display the determinant of the gate transformation matrix."""
+        """Show the matrix determinant and the voltage range each gate will cover, and
+        disable Begin when the matrix is singular or a gate would exceed its limit."""
         a = self.coeff_a.value()
         b = self.coeff_b.value()
         c = self.coeff_c.value()
@@ -4043,6 +4106,16 @@ class MainWindow(QtWidgets.QMainWindow):
         except ValueError as error:
             valid = False
             text = f"Sweep disabled: {error}"
+        grids = (getattr(self, 'v1_grid', None), getattr(self, 'v2_grid', None))
+        if (valid and not getattr(self, 'plotter_mode', False)
+                and all(grid is not None and np.size(grid) and np.isfinite(grid).all() for grid in grids)):
+            try:
+                check_gate_limits(grids[0], grids[1], self.gate_limits())
+                text += " · " + ", ".join(f"ch{axis}: {np.min(grid):+.3f} to {np.max(grid):+.3f} V"
+                                          for axis, grid in zip((1, 2), grids))
+            except ValueError as error:
+                valid = False
+                text = f"Sweep disabled: {error}"
         if hasattr(self, 'det_label'):
             self.det_label.setText(text)
             color = '#16a34a' if valid else '#dc2626'
@@ -4112,6 +4185,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_setpoint_enter(self, axis):
         val = getattr(self, f"ch{axis}_setpoint").value()
         mode = getattr(self, f"ch{axis}_mode").currentText().lower()  # 'volt' or 'curr'
+        if mode == 'volt' and not self.check_setpoint_limit(axis, val):
+            return
         try:
             channel = self.gate_channel(axis)
         except Exception as exc:
@@ -4225,6 +4300,17 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         channel = getattr(self.station.smu, f'ch{axis}')
         if enabled:
+            # Switching on ramps to the programmed setpoint, which must be within the gate limit.
+            was_paused = self.pause_status_polling()
+            try:
+                setpoint = float(channel.volt()) if channel.source_mode() == 'VOLT' else None
+            except Exception:
+                setpoint = None
+            finally:
+                self.resume_status_polling(was_paused)
+            if setpoint is not None and not self.check_setpoint_limit(axis, setpoint, "output switch-on"):
+                self.on_output_updated(f'Channel {axis}', False)
+                return
             self.ramp_channel(channel, True, 'output', f'Channel {axis}')
         else:
             # OFF remains immediate; do not wait behind a running ramp.
@@ -4428,7 +4514,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.coeff_b.setEnabled(enabled)
         self.coeff_c.setEnabled(enabled)
         self.coeff_d.setEnabled(enabled)
-        
+        for box in getattr(self, "gate_limit_boxes", {}).values():
+            box.setEnabled(enabled)
+
         # Control Variables
         self.c1_start.setEnabled(enabled)
         self.c1_end.setEnabled(enabled)
@@ -4471,6 +4559,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 'c1_start': self.c1_start.value(), 'c1_end': self.c1_end.value(), 'c1_pts': self.c1_pts.value(),
                 'c2_start': self.c2_start.value(), 'c2_end': self.c2_end.value(), 'c2_pts': self.c2_pts.value(),
                 'gate_outputs': self.gate_outputs,
+                'gate_limits': self.gate_limits(),
             })
             if self.ch1_mode.currentText() != 'VOLT' or self.ch2_mode.currentText() != 'VOLT':
                 raise ValueError('Gate sweeps require both DC sources in voltage mode.')
@@ -4624,6 +4713,7 @@ class MainWindow(QtWidgets.QMainWindow):
             'wl_axis': wavelengths,
             'gate_outputs': dict(self.gate_outputs),
             'gate_ramp_rates': {1: self.ch1_ramp_rate.value(), 2: self.ch2_ramp_rate.value()},
+            'gate_limits': self.gate_limits(),
         }
 
         # Calculate total expected duration
@@ -4734,6 +4824,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.measurement_started_at = new_measurement_start(self.sweep_start_time)
         self.measurement_device_modes = measurement_device_modes(self.station)
         self.measurement_gate_outputs = dict(self.gate_outputs)
+        self.measurement_gate_limits = self.gate_limits()
         self.total_paused_time = 0.0
         self.pause_start_time = None
 
@@ -5697,6 +5788,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     f.create_dataset("measured_b", data=self.data_measured_b)
                 f.create_dataset("measured_mask", data=self.data_measured_mask)
                 self.write_sweep_timing(f)
+                for axis, limit in (getattr(self, "measurement_gate_limits", None) or {}).items():
+                    f.attrs[f"gate_limit_ch{axis}_V"] = limit
 
                 # Save background and reference if available
                 single_win = getattr(self, "single_spectra_window", None)

@@ -87,3 +87,33 @@ def validate_map_gate_targets(params, x_values, y_values):
         validate_gate_targets(v1, v2)
         channels.update((1, 2))
     return channels
+
+
+def validate_gate_limit(value, channel=None):
+    """A user's maximum |voltage| for one gate: above 0 V and within the SMU range."""
+    limit = float(value)
+    label = f"Channel {channel}" if channel is not None else "Gate channel"
+    if not math.isfinite(limit) or not 0 < limit <= GATE_MAX_ABS_VOLTAGE_V:
+        raise ValueError(f"{label}: the voltage limit must be above 0 V and at most "
+                         f"{GATE_MAX_ABS_VOLTAGE_V:g} V.")
+    return limit
+
+
+def check_gate_limits(channel_1_values, channel_2_values, limits):
+    """Refuse any physical target beyond its gate's limit (|V| <= limit) before a write.
+
+    ``limits`` maps channel 1 and 2 to a maximum |V|; a channel without one is not
+    limited here (the SMU range still applies). Allows 1 nV for rounding in the matrix.
+    """
+    import numpy as np
+
+    for channel, values in enumerate((channel_1_values, channel_2_values), 1):
+        limit = (limits or {}).get(channel)
+        if limit is None:
+            continue
+        limit = validate_gate_limit(limit, channel)
+        array = np.asarray(values, dtype=float).ravel()
+        beyond = np.abs(array) > limit + 1e-9
+        if np.any(beyond):
+            worst = array[beyond][np.argmax(np.abs(array[beyond]))]
+            raise ValueError(f"Channel {channel} would reach {worst:+.4g} V, beyond its limit of ±{limit:g} V.")

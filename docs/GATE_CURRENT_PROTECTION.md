@@ -27,7 +27,8 @@ the values but never apply them to hardware automatically.
 The voltage range and ramp bounds remain configured in code. Both gate channels use the SMU range of -210 through +210 V **after**
 any coordinate calculation. A complete sweep is checked before motion starts;
 the driver also checks every requested voltage and its initial source readback.
-A rejected sweep is not silently clipped.
+A rejected sweep is not silently clipped. Dual Gate Sweep adds a limit per gate,
+set in the GUI (see [Per-gate voltage limits](#per-gate-voltage-limits-dual-gate-sweep)).
 
 Position DGS compliance fields remain read-only; voltage compliance in current
 source mode is also read-only. Incorrect readbacks remain visible in red; a
@@ -99,6 +100,31 @@ the driver, within the voltage cap.
   record the acquisition weights and physical target grids.
 - No physical instrument was used for validation. Recheck instrument readbacks
   after relaunch before using a sample.
+
+## Per-gate voltage limits (Dual Gate Sweep)
+
+The **Gate Variable** box has **Limit |ch1| ≤** and **Limit |ch2| ≤** fields: the
+largest |voltage| each physical channel may get, after the matrix. They are
+saved as `dual_gate.v1_max_abs` and `dual_gate.v2_max_abs` (volts); the default,
+210 V, is the SMU range, so no extra limit.
+
+- Below the matrix the tab shows the voltage range each channel will cover,
+  for example `ch1: -3.300 to +3.600 V`. When a sweep would take a channel beyond
+  its limit, the line says which channel and voltage (`Sweep disabled: Channel 1
+  would reach +4.2 V, beyond its limit of ±4 V.`) and **Begin** is disabled.
+  With a matrix, the corners of the swept rectangle are the extremes.
+- The sweep is checked again before it starts and at every point before its
+  ramp; a point beyond a limit stops the sweep. Points are never clipped or
+  skipped.
+- A manual voltage setpoint beyond the limit is refused, and so is switching an
+  output on whose programmed setpoint is beyond it. Ramping toward 0 V, including
+  the optional end ramp, stays within the limits.
+- The limits are locked during a sweep and recorded in the file as
+  `gate_limit_ch1_V` and `gate_limit_ch2_V`.
+- Position DGS uses its panel's limits for every pixel; changes made there are
+  not saved, like its other settings.
+- In current-source mode the voltage is bounded by the Keysight's voltage
+  compliance, not by these limits. A uVoltDAQ gate also keeps its +/-10 V range.
 
 ## uVoltDAQ gate outputs in Dual Gate Sweep
 
