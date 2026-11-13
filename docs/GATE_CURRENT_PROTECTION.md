@@ -12,8 +12,12 @@ DEFAULT_GATE_RAMP_RATE_V_PER_S = 0.1
 ```
 
 The connection default is 100 nA per channel. In Dual Gate Sweep, edit either
-**Current limit** field (in amperes), then press Enter or leave the edited field.
-The GUI applies the value on a background worker and verifies instrument
+**Current limit** field, then press Enter or leave the edited field. Type the
+value in amperes (`1e-8`, `0.00000001`) or with an SI prefix (`10 nA`, `10n`).
+Text the field cannot read is never applied: Enter keeps the previous limit and
+the status line says so. Like every number field with a unit, the field keeps
+such text as typed rather than dropping characters, which would make `1 nA` read
+as 1 A. The GUI applies the value on a background worker and verifies instrument
 readback. The accepted range is 1 nA through 3 A; the instrument must confirm
 the setting for its operating range. See the [Keysight compliance guide](https://www.keysight.com/us/en/assets/9018-01860/user-manuals/9018-01860.pdf)
 and [B2902B specifications](https://www.keysight.com/zz/en/product/B2902B/precision-smu-2ch-100fa-resolution-210v-3a-dc-10-5a-pulse.html).
