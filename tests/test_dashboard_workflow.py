@@ -711,6 +711,65 @@ class DashboardWorkflowTests(unittest.TestCase):
             self.assertEqual(json.loads(data.attrs["device_modes"])["smu"], "simulated")
         self.errors.assert_not_called()
 
+    def gate_sweep(self, points, settling=0.0):
+        window = self.dashboard.dual_window
+        self.dashboard.tab_widget.setCurrentIndex(1)
+        for axis, count in zip((1, 2), points):
+            getattr(window, f"c{axis}_start").setValue(0)
+            getattr(window, f"c{axis}_end").setValue(0.01)
+            getattr(window, f"c{axis}_pts").setValue(count)
+        window.exposure_box.setValue(0.01)
+        window.settling_box.setValue(settling)
+        return window
+
+    def test_gate_sweep_saves_the_time_of_every_step_and_shows_a_dated_estimate(self):
+        from sweep_timing import STORAGE_KEY, TIMING_FIELDS
+        window = self.gate_sweep((2, 2), settling=0.02)
+        with patch.object(QtWidgets.QMessageBox, "information") as finished:
+            window.begin_sweep()
+            # Before any point: the first guess, with the day, the total and the pace.
+            self.assertRegex(window.lbl_expected_end.text(),
+                             r"^Expected End: about (today|tomorrow) \d\d:\d\d · .+ in total · "
+                             r"\d+\.\d\d s per point \(first guess")
+            self.wait_for(lambda: not window.is_running, timeout=10)
+        # After three points the estimate is this sweep's own pace.
+        self.assertRegex(window.lbl_expected_end.text(), r"^Expected End: (today|tomorrow) \d\d:\d\d · ")
+        self.assertIn("4 points in", finished.call_args.args[2])
+        self.assertIn("s per point on average: camera", finished.call_args.args[2])
+        files = list(self.directory.rglob("*gate_sweep*.h5"))
+        self.assertEqual(len(files), 1)
+        with h5py.File(files[0]) as data:
+            timing = data["timing"]
+            self.assertEqual(set(timing), set(TIMING_FIELDS))
+            for name in TIMING_FIELDS:
+                self.assertEqual(timing[name].shape, (2, 2))
+                self.assertTrue(np.all(np.isfinite(timing[name][()])), name)
+            self.assertTrue(np.all(timing["settle_s"][()] >= 0.015))
+            self.assertTrue(np.all(timing["point_s"][()] >= timing["settle_s"][()] + timing["spectrum_s"][()]))
+            self.assertIn("4 points in", timing.attrs["summary"])
+            self.assertEqual(timing.attrs["point_overhead_basis"], "measured")
+        # A simulated camera's pace is not kept for the next sweep.
+        stored = json.loads((self.directory / "value_storage").read_text()).get("dual_gate", {})
+        self.assertNotIn(STORAGE_KEY, stored)
+        self.errors.assert_not_called()
+
+    def test_measured_pace_of_a_physical_camera_is_the_next_first_estimate(self):
+        from sweep_timing import STORAGE_KEY
+        import measurements.Dual_gate_sweep_gui as dgs
+        modes = {"camera": "physical", "smu": "simulated"}
+        window = self.gate_sweep((5, 4))  # 20 points: enough to keep
+        with patch.object(dgs, "measurement_device_modes", return_value=modes):
+            window.begin_sweep()
+            self.wait_for(lambda: not window.is_running, timeout=20)
+        stored = json.loads((self.directory / "value_storage").read_text())["dual_gate"][STORAGE_KEY]
+        self.assertGreaterEqual(stored, 0.0)
+        self.assertLess(stored, 60.0)
+        with patch.object(dgs, "measurement_device_modes", return_value=modes):
+            window.begin_sweep()
+            self.assertRegex(window.lbl_expected_end.text(), r"^Expected End: about .+ \(pace of the last sweep\)$")
+            self.wait_for(lambda: not window.is_running, timeout=20)
+        self.errors.assert_not_called()
+
     def test_dgs_optional_end_ramp_returns_gates_to_zero_and_is_persisted(self):
         window = self.dashboard.dual_window
         self.dashboard.tab_widget.setCurrentIndex(1)

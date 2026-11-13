@@ -1,22 +1,24 @@
+import contextlib
 import os
 import sys
 import json
 import time
 import math
 import re
+from time import perf_counter  # durations; unaffected when a test replaces the time module
 import h5py
 import numpy as np
 from PyQt6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 try:
-    from .utils import EnhancedViewBox, calculate_expected_duration, configure_plot_axes, update_current_slice
+    from .utils import EnhancedViewBox, configure_plot_axes, update_current_slice
 except ImportError:
     import sys
     import os
     _measurements_dir = os.path.dirname(os.path.abspath(__file__))
     if _measurements_dir not in sys.path:
         sys.path.insert(0, _measurements_dir)
-    from utils import EnhancedViewBox, calculate_expected_duration, configure_plot_axes, update_current_slice
+    from utils import EnhancedViewBox, configure_plot_axes, update_current_slice
 
 # Ensure parent directory is in path for importing station_setup
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -35,6 +37,9 @@ from gui_safety import install_parameter_wheel_guard
 from measurement_data_paths import dated_measurement_filename, dated_measurement_path
 from measurement_data_paths import measurement_data_dir, measurement_start_text, new_measurement_start, measurement_device_modes
 from measurement_acquisition import acquire_sweep_spectrum
+from sweep_timing import (MIN_POINTS_TO_STORE, PHASE_FIELDS, STORAGE_KEY, TIMING_FIELDS, SweepEstimate,
+                          default_point_overhead, expected_end_text, stored_point_overhead, summary_text,
+                          timing_summary)
 
 # Setup pyqtgraph themes (Light Theme)
 pg.setConfigOption('background', '#ffffff')
@@ -332,6 +337,8 @@ class SweepWorker(QtCore.QThread):
     Communicates back to the main thread via Qt signals.
     """
     point_measured = QtCore.pyqtSignal(int, int, float, float, float, float, np.ndarray, float, float, float, float, float, np.ndarray)
+    # (i, j, {name: seconds}) for every point, sent just before point_measured; see sweep_timing.
+    point_timing = QtCore.pyqtSignal(int, int, object)
     progress_updated = QtCore.pyqtSignal(int, int)
     status_updated = QtCore.pyqtSignal(str)
     voltage_updated = QtCore.pyqtSignal(float, float, float, float)
@@ -348,6 +355,8 @@ class SweepWorker(QtCore.QThread):
         self.pause_cond = QtCore.QWaitCondition()
         self._control = self
         self._cancel_generation = 0
+        # Seconds spent waiting while paused, so that point timings exclude pauses.
+        self.paused_seconds = 0.0
         # Validated in _do_run, before any write; Keysight CH1/CH2 by default.
         self.gate_outputs = dict(params.get('gate_outputs') or DEFAULT_GATE_OUTPUTS)
         self._dac_gates = {}
@@ -422,9 +431,13 @@ class SweepWorker(QtCore.QThread):
         control = self._control
         control.mutex.lock()
         try:
+            waiting_since = None
             while control._is_paused:
+                waiting_since = waiting_since or perf_counter()
                 control.status_updated.emit('Status: Paused')
                 control.pause_cond.wait(control.mutex)
+            if waiting_since is not None:
+                control.paused_seconds += perf_counter() - waiting_since
             if not control._is_running:
                 return None
             self.gate(1).ramp_stop_requested = False
@@ -435,15 +448,32 @@ class SweepWorker(QtCore.QThread):
 
     def check_pause_and_stop(self):
         self.mutex.lock()
+        waiting_since = None
         while self._is_paused:
+            waiting_since = waiting_since or perf_counter()
             self.status_updated.emit("Status: Paused")
             self.pause_cond.wait(self.mutex)
+        if waiting_since is not None:
+            self.paused_seconds += perf_counter() - waiting_since
         if not self._is_running:
             self.mutex.unlock()
             self.return_keysight_to_local()
             return False
         self.mutex.unlock()
         return True
+
+    def paused_total(self):
+        """Pause seconds so far, counted where the pauses are waited out (Position DGS: its scan)."""
+        return getattr(self._control, 'paused_seconds', 0.0)
+
+    @contextlib.contextmanager
+    def timed(self, timing, name):
+        """Add the active seconds spent inside the block to timing[name], pauses excluded."""
+        started, paused = perf_counter(), self.paused_total()
+        try:
+            yield
+        finally:
+            timing[name] += perf_counter() - started - (self.paused_total() - paused)
 
     def run(self):
         try:
@@ -523,6 +553,8 @@ class SweepWorker(QtCore.QThread):
 
             total_points = len(c1_arr) * len(c2_arr)
             point_count = 0
+            # A point's time runs from the end of the previous point (the first: from here).
+            point_started, paused_before = perf_counter(), self.paused_total()
 
             # Outer loop holds one gate fixed while the inner loop sweeps the other.
             if sweep_mode == "Hold C2, sweep C1":
@@ -545,6 +577,7 @@ class SweepWorker(QtCore.QThread):
                     # Thread pause / stop safety check
                     if not self.check_pause_and_stop():
                         return
+                    timing = dict.fromkeys(PHASE_FIELDS, 0.0)
 
                     val_inner = inner_arr[idx_inner]
 
@@ -573,10 +606,12 @@ class SweepWorker(QtCore.QThread):
                         if generation is None:
                             return
                         try:
-                            self.gate(1).set_r.volt(v1)
+                            with self.timed(timing, 'ramp_v1_s'):
+                                self.gate(1).set_r.volt(v1)
                             if not self.check_pause_and_stop():
                                 return
-                            self.gate(2).set_r.volt(v2)
+                            with self.timed(timing, 'ramp_v2_s'):
+                                self.gate(2).set_r.volt(v2)
                         except GateRampCancelled:
                             # Resume retries this entire point, with a fresh ramp
                             # readback, before starting its full settling delay.
@@ -592,13 +627,14 @@ class SweepWorker(QtCore.QThread):
                             continue
                         break
 
-                    # 3. Wait settling time
-                    if settling_time > 0:
-                        sleep_end = time.time() + settling_time
-                        while time.time() < sleep_end:
-                            if not self.check_pause_and_stop():
-                                return
-                            time.sleep(0.05)
+                    # 3. Wait settling time (exactly: no rounding up to the 0.05 s check interval)
+                    with self.timed(timing, 'settle_s'):
+                        if settling_time > 0:
+                            sleep_end = time.time() + settling_time
+                            while time.time() < sleep_end:
+                                if not self.check_pause_and_stop():
+                                    return
+                                time.sleep(min(0.05, max(0.0, sleep_end - time.time())))
 
                     if not self.check_pause_and_stop():
                         return
@@ -606,29 +642,33 @@ class SweepWorker(QtCore.QThread):
                     # 4. Read actual gate voltage and current (before spectrum, so values
                     #    reflect the settled state, not the state after a long exposure).
                     #    uVoltDAQ gates: NaN current, voltage = confirmed setpoint.
-                    curr_ch1, meas_v1 = self.read_gate(1)
-                    curr_ch2, meas_v2 = self.read_gate(2)
+                    with self.timed(timing, 'readback_v1_s'):
+                        curr_ch1, meas_v1 = self.read_gate(1)
+                    with self.timed(timing, 'readback_v2_s'):
+                        curr_ch2, meas_v2 = self.read_gate(2)
 
                     meas_b = 0.0
                     magnet = getattr(self.station, 'magnet', None)
                     if magnet is not None:
-                        try:
-                            meas_b = magnet.output_field()
-                        except Exception:
+                        with self.timed(timing, 'field_s'):
                             try:
-                                meas_b = magnet.field()
+                                meas_b = magnet.output_field()
                             except Exception:
-                                pass
+                                try:
+                                    meas_b = magnet.field()
+                                except Exception:
+                                    pass
 
                     # 5. Acquire spectrum
                     if not self.check_pause_and_stop():
                         return
                     try:
-                        spectrum, raw_frames = acquire_sweep_spectrum(
-                            camera, pixels=num_pixels, frames=num_spectra,
-                            average=do_average or accum_method == "Average",
-                            wavelengths=self.params.get('wl_axis'),
-                        )
+                        with self.timed(timing, 'spectrum_s'):
+                            spectrum, raw_frames = acquire_sweep_spectrum(
+                                camera, pixels=num_pixels, frames=num_spectra,
+                                average=do_average or accum_method == "Average",
+                                wavelengths=self.params.get('wl_axis'),
+                            )
                     except Exception:
                         if not self._control._is_running:
                             return
@@ -637,8 +677,14 @@ class SweepWorker(QtCore.QThread):
                     if not self.check_pause_and_stop():
                         return
 
-                    # 6. Emit results
+                    # 6. Emit results, with how long the point took (pauses excluded)
                     point_count += 1
+                    now, paused = perf_counter(), self.paused_total()
+                    timing['paused_s'] = paused - paused_before
+                    timing['point_s'] = now - point_started - timing['paused_s']
+                    timing['finished_at'] = time.time()
+                    point_started, paused_before = now, paused
+                    self.point_timing.emit(i, j, timing)
                     self.point_measured.emit(i, j, c1, c2, v1, v2, spectrum, curr_ch1, curr_ch2, meas_v1, meas_v2, meas_b, raw_frames)
                     self.progress_updated.emit(point_count, total_points)
 
@@ -1066,6 +1112,8 @@ class MainWindow(QtWidgets.QMainWindow):
     editable_current_compliance = True
     # Each gate may be driven by its Keysight channel or a uVoltDAQ DAC output.
     allow_dac_gate_outputs = True
+    # Expected End shows the estimated end, duration and pace (Position DGS: its own count).
+    estimate_sweep_time = True
 
     def __init__(self, station, embed=False):
         super().__init__()
@@ -2053,6 +2101,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.lbl_expected_end = QtWidgets.QLabel("Expected End: --:--:--")
         self.lbl_expected_end.setStyleSheet("color: #0F172A; font-weight: bold;")
+        # The estimate names the day, duration and pace, which can take two lines.
+        self.lbl_expected_end.setWordWrap(True)
         meas_layout.addWidget(self.lbl_expected_end)
 
         self.status_lbl = QtWidgets.QLabel("Status: Idle")
@@ -2639,6 +2689,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.allow_dac_gate_outputs and hasattr(self, "gate_outputs"):
                 current_data["dual_gate"]["gate_output_1"] = self.gate_outputs[1]
                 current_data["dual_gate"]["gate_output_2"] = self.gate_outputs[2]
+            # Overhead per point measured in a sweep, for the next sweep's first estimate.
+            if getattr(self, "measured_point_overhead_s", None) is not None:
+                current_data["dual_gate"][STORAGE_KEY] = round(self.measured_point_overhead_s, 4)
 
             # Purge deprecated root-level keys and legacy c1/c2 compliance keys
             deprecated_keys = [
@@ -3304,6 +3357,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.lbl_expected_end = QtWidgets.QLabel("Expected End: --:--:--")
         self.lbl_expected_end.setStyleSheet("color: #0F172A; font-weight: bold;")
+        # The estimate names the day, duration and pace, which can take two lines.
+        self.lbl_expected_end.setWordWrap(True)
         meas_layout.addWidget(self.lbl_expected_end)
 
         self.status_lbl = QtWidgets.QLabel("Status: Idle")
@@ -4513,6 +4568,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.data_measured_volt_ch2 = np.zeros((c2_pts_actual, c1_pts_actual))
         self.data_measured_b = np.zeros((c2_pts_actual, c1_pts_actual))
         self.data_measured_mask = np.zeros((c2_pts_actual, c1_pts_actual), dtype=bool)
+        # How long each step of every point took (sweep_timing); NaN until measured.
+        self.data_timing = {name: np.full((c2_pts_actual, c1_pts_actual), np.nan) for name in TIMING_FIELDS}
 
         # Initialize heatmap images with zero arrays of the correct size
         # so pyqtgraph can resolve their size when setRect is called
@@ -4664,26 +4721,15 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 num_spectra = 1
 
-        self.sweep_total_duration = calculate_expected_duration(
-            v_points=v_points,
-            b_points=[curr_b] * len(v_points),
-            exposure_time=self.exposure_box.value(),
-            settling_time=self.settling_box.value(),
-            num_spectra=num_spectra,
-            sweep_rate_b=0.5 / 60.0,
-            initial_b=curr_b,
-            initial_v1=prev_v1,
-            initial_v2=prev_v2,
-            ramp_rate_v1=self.ch1_ramp_rate.value(),
-            ramp_rate_v2=self.ch2_ramp_rate.value()
-        )
-        self.sweep_v_points = v_points
-        self.sweep_b_points = [curr_b] * len(v_points)
-        self.sweep_num_spectra = num_spectra
-        self.sweep_rate_b = 0.5 / 60.0
-        self.sweep_initial_v1 = prev_v1
-        self.sweep_initial_v2 = prev_v2
-        self.sweep_initial_b = curr_b
+        # Expected duration: the modelled waits plus an overhead per point, first the
+        # one measured in the last sweep, then this sweep's own pace (sweep_timing).
+        stored_overhead = stored_point_overhead(storage_path)
+        self.sweep_estimate = SweepEstimate(
+            v_points, (prev_v1, prev_v2), (self.ch1_ramp_rate.value(), self.ch2_ramp_rate.value()),
+            exposure=self.exposure_box.value(), frames=num_spectra, settling=self.settling_box.value(),
+            overhead=default_point_overhead(num_spectra) if stored_overhead is None else stored_overhead,
+            basis='default' if stored_overhead is None else 'stored')
+        self.sweep_total_duration = self.sweep_estimate.total()
         self.sweep_start_time = time.time()
         self.measurement_started_at = new_measurement_start(self.sweep_start_time)
         self.measurement_device_modes = measurement_device_modes(self.station)
@@ -4691,7 +4737,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.total_paused_time = 0.0
         self.pause_start_time = None
 
-        self.lbl_expected_end.setText("Expected End: (waiting for measurements)")
+        if self.estimate_sweep_time and self.sweep_estimate.points:
+            self.lbl_expected_end.setText(expected_end_text(
+                self.sweep_total_duration, self.sweep_total_duration, self.sweep_estimate.points,
+                basis=self.sweep_estimate.basis))
+        else:
+            self.lbl_expected_end.setText("Expected End: (waiting for measurements)")
 
         self.is_running = True
         self.is_paused = False
@@ -4727,6 +4778,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "field": curr_b,
         }
         self.sweep_worker = self.create_sweep_worker(params)
+        self.sweep_worker.point_timing.connect(self.on_point_timing)
         self.sweep_worker.point_measured.connect(self.on_point_measured)
         self.sweep_worker.progress_updated.connect(self.on_progress_updated)
         self.sweep_worker.status_updated.connect(self.status_lbl.setText)
@@ -4788,6 +4840,7 @@ class MainWindow(QtWidgets.QMainWindow):
         was_running = self.is_running
         if self.is_running:
             self.trigger_autosave(was_interrupted=True)
+            self.sweep_timing_report()
         if self.sweep_worker and self.sweep_worker.isRunning():
             self.sweep_worker.stop()
             self.sweep_worker.wait()
@@ -4843,61 +4896,72 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_target_vc1.setText(f"{c1_label} = {c1:.4f} V (V1 = {meas_v1:.4f} V)")
         self.lbl_target_vc2.setText(f"{c2_label} = {c2:.4f} V (V2 = {meas_v2:.4f} V)")
 
+    def on_point_timing(self, i, j, timing):
+        """Keep how long each step of point (i, j) took; saved with the data (sweep_timing)."""
+        data = getattr(self, "data_timing", None)
+        if not data:
+            return
+        for name, seconds in timing.items():
+            if name in data:
+                data[name][j, i] = seconds
+
     def on_progress_updated(self, current, total):
         pct = int(100 * current / total)
         self.progress_bar.setValue(pct)
-        
-        if getattr(self, "sweep_start_time", None) is not None:
-            if current < 3:
-                self.lbl_expected_end.setText("Expected End: (waiting for measurements)")
-                return
 
-            current_pause_overhead = 0.0
-            if self.is_paused and getattr(self, "pause_start_time", None) is not None:
-                current_pause_overhead = time.time() - self.pause_start_time
-                
-            total_elapsed_paused = self.total_paused_time + current_pause_overhead
-            active_elapsed_time = time.time() - self.sweep_start_time - total_elapsed_paused
-
-            # Get remaining points
-            remaining_v = self.sweep_v_points[current:]
-            remaining_b = self.sweep_b_points[current:]
-
-            if current > 0 and current <= len(self.sweep_v_points):
-                last_v1, last_v2 = self.sweep_v_points[current - 1]
-                last_b = self.sweep_b_points[current - 1]
-            else:
-                last_v1, last_v2 = self.sweep_initial_v1, self.sweep_initial_v2
-                last_b = self.sweep_initial_b
-
-            predicted_remaining = calculate_expected_duration(
-                v_points=remaining_v,
-                b_points=remaining_b,
-                exposure_time=self.exposure_box.value(),
-                settling_time=self.settling_box.value(),
-                num_spectra=self.sweep_num_spectra,
-                sweep_rate_b=self.sweep_rate_b,
-                initial_b=last_b,
-                initial_v1=last_v1,
-                initial_v2=last_v2,
-                ramp_rate_v1=self.ch1_ramp_rate.value(),
-                ramp_rate_v2=self.ch2_ramp_rate.value()
-            )
-
-            predicted_elapsed = self.sweep_total_duration - predicted_remaining
-            if predicted_elapsed > 0 and active_elapsed_time > 0:
-                scale_factor = active_elapsed_time / predicted_elapsed
-                scale_factor = max(0.5, min(2.0, scale_factor))
-            else:
-                scale_factor = 1.0
-
-            dynamic_remaining = predicted_remaining * scale_factor
-            expected_end = time.time() + dynamic_remaining
-            
-            time_str = time.strftime("%H:%M:%S", time.localtime(expected_end))
-            self.lbl_expected_end.setText(f"Expected End: {time_str}")
-        else:
+        estimate = getattr(self, "sweep_estimate", None)
+        if getattr(self, "sweep_start_time", None) is None or estimate is None or not total:
             self.lbl_expected_end.setText("Expected End: --:--:--")
+            return
+        paused = self.total_paused_time
+        if self.is_paused and getattr(self, "pause_start_time", None) is not None:
+            paused += time.time() - self.pause_start_time
+        active_elapsed = time.time() - self.sweep_start_time - paused
+        # From a few points on, the overhead per point is this sweep's own pace.
+        seconds_left = estimate.update(current, active_elapsed)
+        self.lbl_expected_end.setText(expected_end_text(
+            seconds_left, active_elapsed + seconds_left, total, basis=estimate.basis))
+        # Kept (save_storage) as the next sweep's first estimate, when measured on hardware.
+        if (estimate.basis == "measured" and current >= MIN_POINTS_TO_STORE
+                and getattr(self, "measurement_device_modes", {}).get("camera") == "physical"):
+            self.measured_point_overhead_s = max(0.0, estimate.overhead)
+
+    def sweep_timing_report(self):
+        """Print and return the summary of how long the sweep's points took, or None."""
+        estimate = getattr(self, "sweep_estimate", None)
+        if estimate is None:
+            return None
+        summary = timing_summary(getattr(self, "data_timing", None) or {},
+                                 exposure=estimate.exposure, frames=estimate.frames)
+        if summary is None:
+            return None
+        text = summary_text(summary)
+        print(f"Dual-gate sweep timing: {text}")
+        return text
+
+    def write_sweep_timing(self, f):
+        """Save how long each step of every point took, with its summary (sweep_timing)."""
+        timing = getattr(self, "data_timing", None)
+        estimate = getattr(self, "sweep_estimate", None)
+        if not timing or estimate is None:
+            return
+        summary = timing_summary(timing, exposure=estimate.exposure, frames=estimate.frames)
+        if summary is None:
+            return
+        group = f.create_group("timing")
+        for name, values in timing.items():
+            group.create_dataset(name, data=values)
+        group.attrs["description"] = (
+            "Seconds per point, pauses excluded; NaN where not measured. point_s runs from the end "
+            "of the previous point; paused_s is the pause time within the point; finished_at is "
+            "the Unix time at its end.")
+        group.attrs["summary"] = summary_text(summary)
+        group.attrs["mean_point_s"] = summary["point_s"]
+        for label, seconds in summary["parts"].items():
+            group.attrs[f"mean_{label.replace(' ', '_')}_s"] = seconds
+        group.attrs["exposure_per_point_s"] = summary["exposure_s"]
+        group.attrs["point_overhead_s"] = estimate.overhead
+        group.attrs["point_overhead_basis"] = estimate.basis
 
     def on_sweep_voltage_updated(self, c1, c2, v1, v2):
         self.ch1_setpoint.setValue(v1)
@@ -4920,7 +4984,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'live_status_worker') and self.live_status_worker:
             self.live_status_worker.resume()
         self.station.live_status_paused = False
-        QtWidgets.QMessageBox.information(self, "Sweep Complete", "Electrostatic gate sweep finished successfully!")
+        timing = self.sweep_timing_report()
+        QtWidgets.QMessageBox.information(self, "Sweep Complete", "Electrostatic gate sweep finished successfully!"
+                                          + (f"\n\n{timing}" if timing else ""))
 
     def on_sweep_error(self, err_msg):
         self.trigger_autosave(was_interrupted=True)
@@ -4933,6 +4999,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'live_status_worker') and self.live_status_worker:
             self.live_status_worker.resume()
         self.station.live_status_paused = False
+        self.sweep_timing_report()
         QtWidgets.QMessageBox.critical(self, "Sweep Error", f"Measurement aborted due to error:\n{err_msg}")
 
     def prompt_save_on_interrupt(self):
@@ -5629,6 +5696,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if self.data_measured_b is not None and self.data_measured_b.size > 0:
                     f.create_dataset("measured_b", data=self.data_measured_b)
                 f.create_dataset("measured_mask", data=self.data_measured_mask)
+                self.write_sweep_timing(f)
 
                 # Save background and reference if available
                 single_win = getattr(self, "single_spectra_window", None)

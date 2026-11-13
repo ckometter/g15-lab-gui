@@ -3,7 +3,7 @@
 | Index | Tab | Module (`measurements/`) | Measures |
 |---|---|---|---|
 | 0 | Single Spectra | `single_spectra_gui.py` | spectra, live view |
-| 1 | Dual-Gate Sweep | `Dual_gate_sweep_gui.py` | spectra vs two gates, Keysight or uVoltDAQ outputs |
+| 1 | Dual-Gate Sweep | `Dual_gate_sweep_gui.py` | spectra vs two gates, Keysight or uVoltDAQ outputs; time per point and estimate ([SWEEP_TIMING.md](SWEEP_TIMING.md)) |
 | 2 | B/V Sweep | `B_V_sweep_gui.py` | spectra vs field and gate |
 | 3 | Vector Map | `photoluminescence_map_gui.py` | spectra vs scanner position |
 | 4 | Scalar Map | `scalar_map_gui.py` | power meter vs scanner position |
