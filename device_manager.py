@@ -10,8 +10,14 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 import station_setup
 from station_devices import DEVICE_LABELS, DEVICE_NAMES, configure_device, ensure_simulated_devices
+from drivers.qpg_uvoltdaq import READBACK_TOLERANCE_V
 from drivers.remote_client import NIRvanaSocketWrapper
 from device_manager_theme import COLORS, DEVICE_MANAGER_QSS
+
+
+def format_setpoints(setpoints):
+    """'DAC0 +0.120 V, DAC1 +0.000 V, ...' for the uVoltDAQ outputs."""
+    return ", ".join(f"DAC{channel} {value:+.3f} V" for channel, value in sorted(setpoints.items()))
 
 
 class StatusDelegate(QtWidgets.QStyledItemDelegate):
@@ -124,6 +130,33 @@ class ConnectionScanWorker(QtCore.QThread):
             self.scanned.emit({'error': str(exc)})
 
 
+class DacInitializationWorker(QtCore.QThread):
+    """Optionally ramp the uVoltDAQ outputs to 0 V, then send INITIALIZE."""
+
+    progress = QtCore.pyqtSignal(str)
+    done = QtCore.pyqtSignal(bool, str)  # success, details
+
+    def __init__(self, dac, ramp_first, parent=None):
+        super().__init__(parent)
+        self.dac, self.ramp_first = dac, ramp_first
+
+    def run(self):
+        lines = []
+        try:
+            if self.ramp_first:
+                start = self.dac.ramp_outputs_to_zero(
+                    lambda step, steps: self.progress.emit(f"uVoltDAQ: ramping the outputs to 0 V, step {step} of {steps}."))
+                lines.append(f"Ramped to 0 V from {format_setpoints(start)}.")
+            self.progress.emit("uVoltDAQ: sending INITIALIZE.")
+            reply = self.dac.initialize_outputs()
+            lines.append(f"INITIALIZE sent; reply: {reply}" if reply else "INITIALIZE sent; no reply.")
+            lines.append("All four outputs read 0 V: normal mode.")
+            self.done.emit(True, "\n".join(lines))
+        except Exception as exc:
+            lines.append(f"{type(exc).__name__}: {exc}")
+            self.done.emit(False, "\n".join(lines))
+
+
 class DeviceManagerWindow(QtWidgets.QMainWindow):
     """Inspect and reconnect individual devices while the dashboard is idle."""
 
@@ -133,8 +166,11 @@ class DeviceManagerWindow(QtWidgets.QMainWindow):
         self._open_dashboard_callback = open_dashboard
         self.worker = None
         self.scan_worker = None
+        self.dac_worker = None
+        self._dac_device_change = False
         self.results = {}
         self.rows = {}
+        self.connect_buttons = {}
         self.dashboard = None
         self._last_health = None
         self.setWindowTitle("G15 Lab Device Manager")
@@ -194,7 +230,7 @@ class DeviceManagerWindow(QtWidgets.QMainWindow):
             3, QtWidgets.QHeaderView.ResizeMode.Fixed
         )
         self.table.setColumnWidth(1, 150)
-        self.table.setColumnWidth(3, 160)
+        self.table.setColumnWidth(3, 250)
         layout.addWidget(self.table, 3)
 
         for row, name in enumerate(DEVICE_NAMES):
@@ -210,7 +246,23 @@ class DeviceManagerWindow(QtWidgets.QMainWindow):
             button.clicked.connect(
                 lambda checked=False, device=name: self.initialize_devices((device,), recheck=True)
             )
-            self.table.setCellWidget(row, 3, button)
+            self.connect_buttons[name] = button
+            if name == "dac":
+                # After power-on the uVoltDAQ outputs are tri-state until INITIALIZE.
+                self.dac_init_button = QtWidgets.QPushButton("Initialize")
+                self.dac_init_button.setToolTip(
+                    "After the uVoltDAQ is powered on: send INITIALIZE, which switches the outputs from "
+                    "tri-state to normal mode and sets all four to 0 V. Asks first. Connecting never sends it.")
+                self.dac_init_button.clicked.connect(self.initialize_dac)
+                cell = QtWidgets.QWidget()
+                cell_layout = QtWidgets.QHBoxLayout(cell)
+                cell_layout.setContentsMargins(0, 0, 0, 0)
+                cell_layout.setSpacing(4)
+                cell_layout.addWidget(button)
+                cell_layout.addWidget(self.dac_init_button)
+                self.table.setCellWidget(row, 3, cell)
+            else:
+                self.table.setCellWidget(row, 3, button)
 
         self.log_tabs = QtWidgets.QTabWidget()
         self.details = QtWidgets.QPlainTextEdit()
@@ -253,10 +305,24 @@ class DeviceManagerWindow(QtWidgets.QMainWindow):
         self.health_timer.timeout.connect(self.refresh_health)
         self.health_timer.start()
         self.update_summary()
+        self.update_dac_button()
 
     def is_busy(self):
-        return ((self.worker is not None and self.worker.isRunning())
-                or (self.scan_worker is not None and self.scan_worker.isRunning()))
+        return any(worker is not None and worker.isRunning()
+                   for worker in (self.worker, self.scan_worker, self.dac_worker))
+
+    def update_dac_button(self):
+        """Initialize is offered once the uVoltDAQ is connected and nothing else runs."""
+        connected = "dac" in getattr(self.station, "components", {})
+        self.dac_init_button.setEnabled(connected and not self.is_busy())
+
+    def set_device_controls_enabled(self, enabled):
+        self.all_button.setEnabled(enabled)
+        self.scan_button.setEnabled(enabled)
+        for name, row in self.rows.items():
+            self.table.cellWidget(row, 1).setEnabled(enabled)
+            self.connect_buttons[name].setEnabled(enabled)
+        self.update_dac_button()
 
     def scan_connections(self):
         if self.is_busy():
@@ -307,17 +373,13 @@ class DeviceManagerWindow(QtWidgets.QMainWindow):
         if self.dashboard is not None and not self.dashboard.prepare_device_change():
             self.readiness.setText("A device is still busy. Wait for polling or movement to finish, then retry.")
             return
-        self.all_button.setEnabled(False)
-        self.scan_button.setEnabled(False)
         self.dashboard_button.setEnabled(self.dashboard is not None)
-        for row in range(self.table.rowCount()):
-            self.table.cellWidget(row, 3).setEnabled(False)
-            self.table.cellWidget(row, 1).setEnabled(False)
         self.worker = InitializationWorker(self.station, requests, self)
         self.worker.device_started.connect(self.on_device_started)
         self.worker.device_finished.connect(self.on_device_finished)
         self.worker.finished.connect(self.on_worker_finished)
         self.worker.start()
+        self.set_device_controls_enabled(False)
         self.readiness.setText(
             "Checking devices. NIRvana needs two complete spectra; CSV export can take up to 180 s per check."
         )
@@ -340,16 +402,15 @@ class DeviceManagerWindow(QtWidgets.QMainWindow):
         self.update_summary()
 
     def on_worker_finished(self):
+        if self.worker is not None:
+            self.worker.wait(2000)  # "finished" can arrive just before the thread has stopped.
         if self.dashboard is not None and getattr(self.dashboard, "devices_changing", False):
             # Keep a complete station even after a strict Physical-mode failure.
             self.fill_missing_devices()
             self.dashboard.finish_device_change()
-        self.all_button.setEnabled(True)
-        self.scan_button.setEnabled(True)
-        for name, row in self.rows.items():
-            self.table.cellWidget(row, 1).setEnabled(True)
-            self.table.cellWidget(row, 3).setEnabled(True)
-            self.table.cellWidget(row, 3).setText("Connect / Retry")
+        self.set_device_controls_enabled(True)
+        for button in self.connect_buttons.values():
+            button.setText("Connect / Retry")
         self.dashboard_button.setEnabled(True)
         self.update_summary()
 
@@ -366,7 +427,107 @@ class DeviceManagerWindow(QtWidgets.QMainWindow):
             return
         if self.dashboard is None:
             self.fill_missing_devices()
+            self.update_dac_button()
         self._open_dashboard_callback()
+
+    # --- uVoltDAQ INITIALIZE -------------------------------------------------------
+
+    def dac_initialize_dialog(self, setpoints, simulated, ramp_seconds):
+        """The confirmation box and its buttons: {'ramp', 'now', 'cancel'} ('ramp' only when needed)."""
+        nonzero = [channel for channel, value in sorted(setpoints.items()) if abs(value) > READBACK_TOLERANCE_V]
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        box.setWindowTitle("Initialize the uVoltDAQ" + (" (simulated)" if simulated else ""))
+        text = ("INITIALIZE switches the uVoltDAQ outputs from tri-state (their state after power-on) to "
+                "normal mode and sets all four outputs to 0 V at once, without a ramp.\n\n"
+                f"Present setpoints: {format_setpoints(setpoints)}.")
+        buttons = {}
+        if nonzero:
+            names = ", ".join(f"DAC{channel}" for channel in nonzero)
+            one = len(nonzero) == 1
+            text += (f"\n\n{names} {'is' if one else 'are'} not at 0 V. Ramp to 0 V first takes "
+                     f"{'it' if one else 'them'} to 0 V together at the outputs' ramp rates "
+                     f"(about {ramp_seconds:.0f} s), then initializes. Initialize now drops "
+                     f"{'it' if one else 'them'} to 0 V at once.")
+            buttons["ramp"] = box.addButton("Ramp to 0 V first, then initialize",
+                                            QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            buttons["now"] = box.addButton("Initialize now", QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
+        else:
+            buttons["now"] = box.addButton("Initialize", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        buttons["cancel"] = box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(buttons.get("ramp") or buttons["now"])
+        box.setText(text)
+        return box, buttons
+
+    def choose_dac_initialization(self, setpoints, simulated, ramp_seconds):
+        """Ask; return 'ramp', 'now' or None (cancelled)."""
+        box, buttons = self.dac_initialize_dialog(setpoints, simulated, ramp_seconds)
+        box.exec()
+        clicked = box.clickedButton()
+        for choice, button in buttons.items():
+            if clicked is button:
+                return None if choice == "cancel" else choice
+        return None
+
+    def initialize_dac(self):
+        """Ask, then (optionally ramp the outputs to 0 V and) send INITIALIZE to the uVoltDAQ."""
+        if self.is_busy():
+            return
+        if self.dashboard is not None and self.dashboard.measurement_active():
+            self.readiness.setText("Finish or stop the active measurement before initializing the uVoltDAQ.")
+            return
+        dac = getattr(self.station, "components", {}).get("dac")
+        if dac is None:
+            self.readiness.setText("Connect the uVoltDAQ first (Connect / Check).")
+            return
+        try:
+            setpoints = dac.setpoints()
+            ramp_seconds = sum(abs(value) / float(dac.dac(channel).ramp_rate())
+                               for channel, value in setpoints.items() if abs(value) > READBACK_TOLERANCE_V)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "uVoltDAQ", f"The DAC setpoints could not be read, so "
+                                                             f"INITIALIZE was not sent.\n\n{exc}")
+            return
+        choice = self.choose_dac_initialization(setpoints, getattr(dac, "simulated", False), ramp_seconds)
+        if choice is None:
+            return
+        if self.dashboard is not None and not self.dashboard.prepare_device_change():
+            self.readiness.setText("A device is still busy. Wait for polling or movement to finish, then retry.")
+            return
+        self._dac_device_change = self.dashboard is not None
+        self.dac_worker = DacInitializationWorker(dac, choice == "ramp", self)
+        self.dac_worker.progress.connect(self.readiness.setText)
+        self.dac_worker.done.connect(self.on_dac_initialized)
+        self.dac_worker.finished.connect(self.on_dac_worker_finished)
+        self.dac_worker.start()
+        self.set_device_controls_enabled(False)
+        self.set_device_status("dac", "Initializing...", "busy")
+
+    def on_dac_initialized(self, success, details):
+        dac = getattr(self.station, "components", {}).get("dac")
+        if success:
+            status = "SIMULATED (initialized)" if getattr(dac, "simulated", False) else "INITIALIZED (outputs 0 V)"
+        else:
+            status = "INITIALIZE FAILED"
+        stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        earlier = self.results.get("dac", (True, "", ""))[2]
+        everything = "\n\n".join(part for part in (earlier, f"[{stamp}] {details}") if part)
+        self.results["dac"] = (success, status, everything)
+        self.set_device_status("dac", status, self.status_kind(success, status))
+        self.table.item(self.rows["dac"], 2).setToolTip(everything)
+        self.table.selectRow(self.rows["dac"])
+        self.show_selected_details()
+        self.append_log(f"\n[{stamp}] {DEVICE_LABELS['dac']}: {status}\n{details}\n")
+        if not success:
+            QtWidgets.QMessageBox.critical(self, "uVoltDAQ", f"INITIALIZE failed.\n\n{details}")
+
+    def on_dac_worker_finished(self):
+        self.dac_worker.wait(2000)  # "finished" can arrive just before the thread has stopped.
+        if self._dac_device_change and self.dashboard is not None:
+            self.dashboard.finish_device_change()
+        self._dac_device_change = False
+        self.set_device_controls_enabled(True)
+        self.update_summary()
 
     @staticmethod
     def status_kind(success, status):
