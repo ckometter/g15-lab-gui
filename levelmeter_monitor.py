@@ -109,11 +109,25 @@ def _amount_rate(times, levels):
     return rate if rate > 0.05 else None
 
 
-def helium_rate(times, levels):
-    """(middle-section mm/h, where it comes from): since the last refill, else before it, else typical."""
-    times, levels = np.asarray(times, dtype=float), np.asarray(levels, dtype=float)
+def _last_refill_start(levels):
+    """Index of the first reading after the last refill step in ``levels``; 0 without one."""
     steps = np.flatnonzero(np.diff(levels) > REFILL_STEP_MM)
-    start = int(steps[-1]) + 1 if steps.size else 0
+    return int(steps[-1]) + 1 if steps.size else 0
+
+
+def helium_rate(times, levels):
+    """(middle-section mm/h, where it comes from).
+
+    Measured over the last 24 h since the last refill. Until that is possible after a refill, the
+    rate from before the refill but at least TYPICAL_RATE: use can rise after a refill (after the
+    12 Nov 2026 refill the level fell about twice as fast as before it), and a forecast that is too
+    late is the costly mistake. The rate before the refill only uses readings after the refill
+    before that one; fitted across that jump it came out far too low (13 Nov 2026). On the October
+    and November refills this cut the late forecasts of the first day after a refill from 10.5 h
+    to 5.7 h late (90th percentile).
+    """
+    times, levels = np.asarray(times, dtype=float), np.asarray(levels, dtype=float)
+    start = _last_refill_start(levels)
     rate = _amount_rate(times[start:], levels[start:])
     if rate is not None:
         return rate, "measured over the last 24 h"
@@ -121,9 +135,11 @@ def helium_rate(times, levels):
         before = start - 1
         while before > 0 and levels[before] - levels[before - 1] > REFILL_STEP_MM:
             before -= 1
-        rate = _amount_rate(times[:before + 1], levels[:before + 1])
-        if rate is not None:
+        earlier = _last_refill_start(levels[:before + 1])
+        rate = _amount_rate(times[earlier:before + 1], levels[earlier:before + 1])
+        if rate is not None and rate >= TYPICAL_RATE:
             return rate, "rate from before the last refill"
+        return TYPICAL_RATE, "typical rate until the new one is measured"
     return TYPICAL_RATE, "typical rate, too few recent readings"
 
 
