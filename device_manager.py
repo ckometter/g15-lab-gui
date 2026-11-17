@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import math
 import traceback
 import warnings
 from datetime import datetime
@@ -10,7 +11,8 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 import station_setup
 from station_devices import DEVICE_LABELS, DEVICE_NAMES, configure_device, ensure_simulated_devices
-from drivers.qpg_uvoltdaq import READBACK_TOLERANCE_V
+from drivers.qpg_uvoltdaq import INITIALIZE_RAMP_RATE_V_PER_S, READBACK_TOLERANCE_V
+from gate_safety import GATE_MAX_RAMP_STEP_V
 from drivers.remote_client import NIRvanaSocketWrapper
 from device_manager_theme import COLORS, DEVICE_MANAGER_QSS
 
@@ -446,9 +448,9 @@ class DeviceManagerWindow(QtWidgets.QMainWindow):
             names = ", ".join(f"DAC{channel}" for channel in nonzero)
             one = len(nonzero) == 1
             text += (f"\n\n{names} {'is' if one else 'are'} not at 0 V. Ramp to 0 V first takes "
-                     f"{'it' if one else 'them'} to 0 V together at the outputs' ramp rates "
-                     f"(about {ramp_seconds:.0f} s), then initializes. Initialize now drops "
-                     f"{'it' if one else 'them'} to 0 V at once.")
+                     f"{'it' if one else 'them'} to 0 V together at {INITIALIZE_RAMP_RATE_V_PER_S:g} V/s, "
+                     f"in steps of at most {GATE_MAX_RAMP_STEP_V:g} V (about {max(1, math.ceil(ramp_seconds))} s), "
+                     f"then initializes. Initialize now drops {'it' if one else 'them'} to 0 V at once.")
             buttons["ramp"] = box.addButton("Ramp to 0 V first, then initialize",
                                             QtWidgets.QMessageBox.ButtonRole.AcceptRole)
             buttons["now"] = box.addButton("Initialize now", QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
@@ -482,8 +484,7 @@ class DeviceManagerWindow(QtWidgets.QMainWindow):
             return
         try:
             setpoints = dac.setpoints()
-            ramp_seconds = sum(abs(value) / float(dac.dac(channel).ramp_rate())
-                               for channel, value in setpoints.items() if abs(value) > READBACK_TOLERANCE_V)
+            ramp_seconds = dac.zero_ramp_seconds(setpoints)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "uVoltDAQ", f"The DAC setpoints could not be read, so "
                                                              f"INITIALIZE was not sent.\n\n{exc}")

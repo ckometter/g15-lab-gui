@@ -174,9 +174,13 @@ Manager once the DAC is connected:
   works, as for **Connect / Retry**.
 - It reads the four setpoints and asks first. If any output is not at 0 V, it
   offers **Ramp to 0 V first, then initialize**: the outputs ramp to 0 V
-  together, along a straight line in steps of at most 0.05 V at their ramp rates,
-  so the voltage between outputs only shrinks. **Initialize now** drops them to
-  0 V at once.
+  together, along a straight line in steps of at most 0.05 V at 1 V/s
+  (`INITIALIZE_RAMP_RATE_V_PER_S` in `drivers/qpg_uvoltdaq.py`), so the voltage
+  between outputs only shrinks. 10 V takes about 10 s however many outputs move:
+  each step only sets the outputs, and their setpoints are read before and after
+  the ramp. (Until 17 Nov 2026 it used each output's ramp rate, 0.1 V/s by
+  default, and read every output back at each step: 10 V took 100 s or more.)
+  **Initialize now** drops them to 0 V at once.
 - A one-line reply and no reply are both accepted (the reply is not documented).
   Afterwards every output must read 0 V; otherwise the row turns red and names
   the output and voltage. The result is in the Application log and the device

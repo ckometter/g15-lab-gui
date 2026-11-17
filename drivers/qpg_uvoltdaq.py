@@ -7,7 +7,11 @@ setpoint, moves in increments no larger than the gate-safety step at the
 channel's ramp rate, and confirms the final setpoint. ``INITIALIZE`` is never
 sent automatically, so existing output voltages are retained on connection;
 ``initialize_outputs()`` sends it only when asked (Device Manager button).
+The optional ramp before it, ``ramp_outputs_to_zero()``, moves all outputs
+together at ``INITIALIZE_RAMP_RATE_V_PER_S`` in the same small steps, reading
+the setpoints only before and after.
 """
+import contextlib
 import math
 import random
 import threading
@@ -23,6 +27,10 @@ DAC_RANGE_V = 10.0
 READBACK_TOLERANCE_V = 1e-3
 # The reply to INITIALIZE is not documented: wait this long for one line, then go on without.
 INITIALIZE_REPLY_TIMEOUT_MS = 1500
+# The ramp to 0 V before INITIALIZE: all outputs together, steps of at most GATE_MAX_RAMP_STEP_V
+# (20 per second at 1 V/s), so 10 V takes about 10 s. At the 0.1 V/s gate default it took 100 s
+# and more, as each output's step also waited and read back in turn (17 Nov 2026).
+INITIALIZE_RAMP_RATE_V_PER_S = 1.0
 
 
 class UVoltDacChannel(InstrumentChannel):
@@ -158,20 +166,63 @@ class QPGuVoltDAQ(VisaInstrument):
         """{output: setpoint in V} for all four outputs, as the DAC reports them."""
         return {channel: float(self.dac(channel).voltage()) for channel in range(4)}
 
+    @staticmethod
+    def zero_ramp_seconds(setpoints):
+        """How long ramp_outputs_to_zero() takes from these setpoints, apart from the DAC's replies."""
+        largest = max((abs(value) for value in setpoints.values() if abs(value) > READBACK_TOLERANCE_V), default=0.0)
+        return largest / INITIALIZE_RAMP_RATE_V_PER_S
+
+    def _wait_until(self, deadline, channels):
+        while True:
+            if any(channel.ramp_stop_requested for channel in channels):
+                raise GateRampCancelled("uVoltDAQ: the ramp to 0 V stopped at its last setpoint.")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 0.02))
+
     def ramp_outputs_to_zero(self, callback=None):
-        """Ramp every nonzero output to 0 V together, along a straight line in steps of
-        at most GATE_MAX_RAMP_STEP_V at each output's ramp rate, so the voltage between
-        outputs only shrinks. callback(step, steps) after each step. Returns the start values."""
+        """Ramp every nonzero output to 0 V together, along a straight line, before INITIALIZE.
+
+        All moving outputs step at once, the largest by at most GATE_MAX_RAMP_STEP_V,
+        at INITIALIZE_RAMP_RATE_V_PER_S, so the voltage between outputs only shrinks.
+        Each step is one SET per moving output, sent on schedule so that the DAC's
+        reply time overlaps the wait; the setpoints are read only before and after.
+        callback(step, steps) after each step. Returns the start values.
+        """
         start = self.setpoints()
         moving = {channel: value for channel, value in start.items() if abs(value) > READBACK_TOLERANCE_V}
         if not moving:
             return start
-        steps = math.ceil(max(abs(value) for value in moving.values()) / GATE_MAX_RAMP_STEP_V - 1e-12)
-        for index in range(1, steps + 1):
-            for channel, value in moving.items():
-                self.dac(channel).ramp_to(0.0 if index == steps else value * (1 - index / steps))
-            if callback is not None:
-                callback(index, steps)
+        largest = max(abs(value) for value in moving.values())
+        steps = math.ceil(largest / GATE_MAX_RAMP_STEP_V - 1e-12)
+        step_seconds = largest / steps / INITIALIZE_RAMP_RATE_V_PER_S
+        channels = [self.dac(channel) for channel in sorted(moving)]
+        with contextlib.ExitStack() as held:
+            for channel in channels:
+                held.enter_context(channel._ramp_lock)
+                channel.ramping = True
+            try:
+                began = time.monotonic()
+                for index in range(1, steps + 1):
+                    if not self.simulated:
+                        self._wait_until(began + index * step_seconds, channels)
+                    elif any(channel.ramp_stop_requested for channel in channels):
+                        raise GateRampCancelled("uVoltDAQ: the ramp to 0 V stopped at its last setpoint.")
+                    for channel, value in moving.items():
+                        target = 0.0 if index == steps else value * (1 - index / steps)
+                        self.dac(channel)._write_step(target)
+                        self.dac(channel).voltage.cache.set(target)
+                    if callback is not None:
+                        callback(index, steps)
+                for channel in moving:
+                    actual = float(self.dac(channel)._get_voltage())
+                    if not math.isfinite(actual) or abs(actual) > READBACK_TOLERANCE_V:
+                        raise RuntimeError(f"DAC{channel} reads {actual:g} V after the ramp to 0 V; "
+                                           "INITIALIZE was not sent.")
+            finally:
+                for channel in channels:
+                    channel.ramping = False
         return start
 
     def initialize_outputs(self):
