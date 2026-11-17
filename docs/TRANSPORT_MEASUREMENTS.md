@@ -17,7 +17,7 @@ without Qt, so scripts can reuse it.
 |---|---|---|
 | `lockin` | SR830 lock-in 1 (`lia_I`, also the capacitance bridge lock-in) | `LOCKIN_ADDRESS = 'GPIB0::9::INSTR'` |
 | `lockin2` | SR830 lock-in 2 (`lia_V`) | `LOCKIN2_ADDRESS = 'GPIB0::10::INSTR'` |
-| `dac` | QPG uVoltDAQ (`uvolt`) | `DAC_ADDRESS = 'ASRL15::INSTR'` |
+| `dac` | QPG uVoltDAQ (`uvolt`) | `DAC_ADDRESS = 'ASRL5::INSTR'` |
 | `smu` | Keysight B2902B | optional gate outputs |
 
 Connect them in the **Device Manager**. **Current read by** selects the

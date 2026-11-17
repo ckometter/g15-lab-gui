@@ -36,7 +36,7 @@ Physical or Simulation, then **Connect / Retry**). Checks are readback only.
 |---|---|---|
 | `lockin` | SR830 lock-in 1 (`lia1` in the g15 station.yaml; also the Transport tab's current lock-in) | `LOCKIN_ADDRESS = 'GPIB0::9::INSTR'` |
 | `awg` | Siglent SDG2042X (`awg`) | any USB VISA resource with Siglent vendor ID `F4EC`, else `AWG_ADDRESS` |
-| `dac` | QPG uVoltDAQ 4O4I (`da`) | `DAC_ADDRESS = 'ASRL15::INSTR'`; connecting never sends `INITIALIZE`, so present voltages are kept. After power-on, use **Initialize** in its Device Manager row (outputs to 0 V; see [GATE_CURRENT_PROTECTION.md](GATE_CURRENT_PROTECTION.md#initializing-the-uvoltdaq-after-power-on)) |
+| `dac` | QPG uVoltDAQ 4O4I (`da`) | `DAC_ADDRESS = 'ASRL5::INSTR'`; connecting never sends `INITIALIZE`, so present voltages are kept. After power-on, use **Initialize** in its Device Manager row (outputs to 0 V; see [GATE_CURRENT_PROTECTION.md](GATE_CURRENT_PROTECTION.md#initializing-the-uvoltdaq-after-power-on)) |
 | `smu` | Keysight B2902B (existing) | optional electrode outputs |
 
 ## Wiring and settings
