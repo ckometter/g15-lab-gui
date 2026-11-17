@@ -14,6 +14,7 @@ from qcodes.station import Station
 
 import station_setup
 from drivers.remote_client import ClientLightFieldCamera, ClientLightFieldMonochromator, NIRvanaSocketWrapper
+from visa_serial_lock import wait_for_serial_lock
 
 
 DEVICE_NAMES = (
@@ -50,6 +51,11 @@ DEVICE_LABELS = {
     "dac": "QPG uVoltDAQ DAC/ADC (gate voltages)",
 }
 
+# Searches for USB instruments; never includes serial ports (see _physical_powermeter).
+USB_RESOURCES = "USB?*::INSTR"
+# Devices opened on a serial VISA port (ASRL), named as in their messages.
+SERIAL_VISA_DEVICES = {"piezo150": "The ANC150", "piezo300": "The ANC300", "dac": "The uVoltDAQ"}
+
 
 def create_station(db_path):
     """Create the shared QCoDeS station once, before any device is opened."""
@@ -74,8 +80,10 @@ def _physical_powermeter():
     # PyVISA reuses one manager per backend. Closing it here also closes the
     # ANC300, SMU and every other already-open VISA resource in this process.
     # Discovery borrows the manager; PyVISA owns its process-exit cleanup.
+    # USB only: a search that includes serial ports waits on NI-VISA's serial lock,
+    # which hangs for good when its holder is stuck (see visa_serial_lock.py).
     addresses = [
-        address for address in manager.list_resources()
+        address for address in manager.list_resources(USB_RESOURCES)
         if "1313" in address and "USB" in address
     ]
     if fallback not in addresses:
@@ -97,7 +105,7 @@ def _physical_awg():
     # Borrow the shared manager without closing it (see _physical_powermeter).
     manager = pyvisa.ResourceManager()
     try:
-        found = [address for address in manager.list_resources()
+        found = [address for address in manager.list_resources(USB_RESOURCES)
                  if "USB" in address.upper() and "F4EC" in address.upper()]
     except Exception as exc:
         print(f"VISA enumeration failed ({exc}); trying the configured AWG address.")
@@ -124,6 +132,10 @@ def initialize_device(station, name, *, simulated, spectrometer_type=None):
     component = None
     verification_status = "VERIFIED (readback)"
     try:
+        if not simulated and name in SERIAL_VISA_DEVICES:
+            # Opening any serial VISA port waits on NI-VISA's shared serial lock; fail
+            # with the fix instead of hanging when its holder is stuck.
+            wait_for_serial_lock(SERIAL_VISA_DEVICES[name])
         if name == "smu":
             address = "simulated" if simulated else "USB0::0x2A8D::0x9201::MY61390757::INSTR"
             component = station_setup.KeysightB2902B(name, address=address, configure_defaults=False)

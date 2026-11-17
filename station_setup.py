@@ -218,7 +218,7 @@ def initialize_station(simulated: bool = False, simulated_devices: dict = None, 
         try:
             import pyvisa
             rm = pyvisa.ResourceManager()
-            resources = rm.list_resources()
+            resources = rm.list_resources('USB?*::INSTR')  # never wait on NI-VISA's serial lock
             # Search for USB resources containing Thorlabs Vendor ID '1313'
             pm_addresses = [r for r in resources if '1313' in r and 'USB' in r]
             if pm_addresses:
