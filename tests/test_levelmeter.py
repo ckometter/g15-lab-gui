@@ -60,15 +60,29 @@ class DewarShapeTests(unittest.TestCase):
         self.assertAlmostEqual(float(lm.amount(500) - lm.amount(499)), 1.0)
         self.assertAlmostEqual(float(lm.amount(300) - lm.amount(297)), 1.0)
 
-    def test_rate_ignores_the_neck_and_uses_the_rate_from_before_a_refill(self):
+    def test_after_a_refill_the_rate_from_before_counts_but_at_least_the_typical_rate(self):
         now = time.time()
-        before_t, before_l = falling(now - 7200, 30, 400.0, -3.0)  # near the bottom: 1 mm/h of helium
         after_t = now - np.arange(5, -1, -1) * 600.0
         after_l = np.linspace(752.0, 740.0, 6)                      # only neck readings since the refill
-        rate, source = lm.helium_rate(np.r_[before_t, after_t], np.r_[before_l, after_l])
-        self.assertAlmostEqual(rate, 1.0, places=6)
+        fast_t, fast_l = falling(now - 7200, 30, 600.0, -5.0)       # middle section: 5 mm/h of helium
+        rate, source = lm.helium_rate(np.r_[fast_t, after_t], np.r_[fast_l, after_l])
+        self.assertAlmostEqual(rate, 5.0, places=6)
         self.assertIn("before the last refill", source)
+        # Slower before the refill: use often rises after one, so the forecast assumes the typical rate.
+        slow_t, slow_l = falling(now - 7200, 30, 400.0, -3.0)       # near the bottom: 1 mm/h of helium
+        self.assertEqual(lm.helium_rate(np.r_[slow_t, after_t], np.r_[slow_l, after_l]),
+                         (lm.TYPICAL_RATE, "typical rate until the new one is measured"))
         self.assertEqual(lm.helium_rate(after_t, after_l), (lm.TYPICAL_RATE, "typical rate, too few recent readings"))
+
+    def test_the_rate_before_a_refill_does_not_reach_across_the_refill_before_it(self):
+        now = time.time()
+        first_t, first_l = falling(now - 14 * 3600, 10, 500.0, -1.0)   # before refill A: slow
+        second_t, second_l = falling(now - 7200, 10, 640.0, -5.0)      # refill A, then 5 mm/h for 10 h
+        after_t = now - np.arange(5, -1, -1) * 600.0
+        after_l = np.linspace(752.0, 740.0, 6)                         # refill B: neck readings only
+        rate, source = lm.helium_rate(np.r_[first_t, second_t, after_t], np.r_[first_l, second_l, after_l])
+        self.assertAlmostEqual(rate, 5.0, places=6)  # Only the 10 h between the refills.
+        self.assertIn("before the last refill", source)
 
 
 class LevelmeterStateTests(unittest.TestCase):

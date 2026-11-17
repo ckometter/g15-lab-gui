@@ -9,6 +9,11 @@ The existing dashboard and measurement data are retained. Device changes
 require idle measurements and motion; polling is paused during replacement.
 **Auto** may fall back to clearly labelled simulation when hardware is absent.
 
+The uVoltDAQ row also has **Initialize**, for after the DAC has been powered on:
+it sends `INITIALIZE` (outputs from tri-state to normal mode, all four at 0 V)
+after asking, and can ramp nonzero outputs to 0 V first. See
+[GATE_CURRENT_PROTECTION.md](GATE_CURRENT_PROTECTION.md#initializing-the-uvoltdaq-after-power-on).
+
 The separate-process manager was reverted because it did not initialize
 reliably alongside the GUI. Close the old processes and relaunch this version
 once to restore the shared manager/dashboard workflow.

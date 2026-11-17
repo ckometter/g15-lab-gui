@@ -12,8 +12,12 @@ DEFAULT_GATE_RAMP_RATE_V_PER_S = 0.1
 ```
 
 The connection default is 100 nA per channel. In Dual Gate Sweep, edit either
-**Current limit** field (in amperes), then press Enter or leave the edited field.
-The GUI applies the value on a background worker and verifies instrument
+**Current limit** field, then press Enter or leave the edited field. Type the
+value in amperes (`1e-8`, `0.00000001`) or with an SI prefix (`10 nA`, `10n`).
+Text the field cannot read is never applied: Enter keeps the previous limit and
+the status line says so. Like every number field with a unit, the field keeps
+such text as typed rather than dropping characters, which would make `1 nA` read
+as 1 A. The GUI applies the value on a background worker and verifies instrument
 readback. The accepted range is 1 nA through 3 A; the instrument must confirm
 the setting for its operating range. See the [Keysight compliance guide](https://www.keysight.com/us/en/assets/9018-01860/user-manuals/9018-01860.pdf)
 and [B2902B specifications](https://www.keysight.com/zz/en/product/B2902B/precision-smu-2ch-100fa-resolution-210v-3a-dc-10-5a-pulse.html).
@@ -27,7 +31,8 @@ the values but never apply them to hardware automatically.
 The voltage range and ramp bounds remain configured in code. Both gate channels use the SMU range of -210 through +210 V **after**
 any coordinate calculation. A complete sweep is checked before motion starts;
 the driver also checks every requested voltage and its initial source readback.
-A rejected sweep is not silently clipped.
+A rejected sweep is not silently clipped. Dual Gate Sweep adds a lowest and a
+highest voltage per gate, set in the GUI (see [Per-gate voltage limits](#per-gate-voltage-limits-dual-gate-sweep)).
 
 Position DGS compliance fields remain read-only; voltage compliance in current
 source mode is also read-only. Incorrect readbacks remain visible in red; a
@@ -100,6 +105,37 @@ the driver, within the voltage cap.
 - No physical instrument was used for validation. Recheck instrument readbacks
   after relaunch before using a sample.
 
+## Per-gate voltage limits (Dual Gate Sweep)
+
+The **Gate Variable** box has a voltage window for each physical channel,
+after the matrix: **ch1 allowed from** [lowest] **to** [highest] **V**, and the
+same for ch2. The negative and positive sides are set separately, for example
+-3 V to +4 V. The lowest is at most 0 V and the highest at least 0 V, because
+switching an output on and the optional end ramp pass through 0 V. They are
+saved as `dual_gate.v1_min`, `v1_max`, `v2_min` and `v2_max` (volts). The
+default is -1 V to +1 V for both channels (`DEFAULT_GATE_LIMITS_V` in
+`gate_safety.py`); it also replaces a missing or unusable saved value. Widen a
+window before sweeping or setting a gate beyond it.
+
+- Below the matrix the tab shows the voltage range each channel will cover,
+  for example `ch1: -3.300 to +3.600 V`. When a sweep would take a channel outside
+  its window, the line names the channel, the voltage and the side, for example
+  `Sweep disabled: Channel 1 would reach +4.2 V, above its highest allowed +4 V.`,
+  and **Begin** is disabled. With a matrix, the corners of the swept rectangle
+  are the extremes.
+- The sweep is checked again before it starts and at every point before its
+  ramp; a point outside a window stops the sweep. Points are never clipped or
+  skipped.
+- A manual voltage setpoint outside the window is refused, and so is switching
+  an output on whose programmed setpoint is outside it. Ramping toward 0 V,
+  including the optional end ramp, stays inside the windows.
+- The windows are locked during a sweep and recorded in the file as
+  `gate_limit_ch1_min_V`, `gate_limit_ch1_max_V` and the same for ch2.
+- Position DGS uses its panel's windows for every pixel; changes made there are
+  not saved, like its other settings.
+- In current-source mode the voltage is bounded by the Keysight's voltage
+  compliance, not by these windows. A uVoltDAQ gate also keeps its +/-10 V range.
+
 ## uVoltDAQ gate outputs in Dual Gate Sweep
 
 Each Dual Gate channel box has an **Output** selector. V1 is driven by Keysight
@@ -125,3 +161,25 @@ compliance or output switch. For a gate on a DAC output:
   confirmed; an unused Keysight channel is left untouched.
 
 Position DGS always drives both gates with the Keysight.
+
+### Initializing the uVoltDAQ after power-on
+
+After the uVoltDAQ is powered on, its outputs are tri-state until it receives
+`INITIALIZE`, which switches them to normal mode and sets all four to 0 V at
+once, without a ramp. Connecting never sends it, so a DAC that is already in
+use keeps its voltages. Use **Initialize** in the uVoltDAQ row of the Device
+Manager once the DAC is connected:
+
+- It is refused while a measurement runs. Dashboard polling pauses while it
+  works, as for **Connect / Retry**.
+- It reads the four setpoints and asks first. If any output is not at 0 V, it
+  offers **Ramp to 0 V first, then initialize**: the outputs ramp to 0 V
+  together, along a straight line in steps of at most 0.05 V at their ramp rates,
+  so the voltage between outputs only shrinks. **Initialize now** drops them to
+  0 V at once.
+- A one-line reply and no reply are both accepted (the reply is not documented).
+  Afterwards every output must read 0 V; otherwise the row turns red and names
+  the output and voltage. The result is in the Application log and the device
+  details.
+- The GUI cannot tell whether the DAC is in tri-state, so initialize it whenever
+  it has been powered off. A simulated DAC simply sets its outputs to 0 V.

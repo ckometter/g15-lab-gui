@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import h5py
 import numpy as np
-from PyQt6 import QtWidgets, QtTest
+from PyQt6 import QtCore, QtWidgets, QtTest
 from qcodes.station import Station
 from lab_gui import LabMainWindow
 from measurements.position_tab import PositionTab
@@ -501,6 +501,79 @@ class DashboardWorkflowTests(unittest.TestCase):
         self.assertEqual(self.station.smu.ch1.curr_limit(), 2e-6)
         self.errors.assert_not_called()
 
+    def type_and_enter(self, box, text):
+        """Type into a spin box as a user does: replace its number, then press Enter."""
+        box.selectAll()
+        QtTest.QTest.keyClicks(box, text)
+        QtTest.QTest.keyClick(box, QtCore.Qt.Key.Key_Return)
+
+    def wait_for_compliance(self, window):
+        self.wait_for(lambda: not window._applying_compliance
+                      and not (window.ramp_worker and window.ramp_worker.isRunning()))
+
+    def test_typed_current_limit_is_applied_on_enter(self):
+        window = self.dashboard.dual_window
+        self.dashboard.tab_widget.setCurrentIndex(1)
+        # Each entry differs from the last, so a value that was not read cannot pass.
+        for axis, typed, limit in ((1, '1e-8', 1e-8), (2, '0.00000002', 2e-8),
+                                   (1, '30 nA', 3e-8), (2, '40n', 4e-8)):
+            with self.subTest(typed=typed):
+                box = getattr(window, f'ch{axis}_compliance')
+                other = getattr(self.station.smu, f'ch{3 - axis}').curr_limit()
+                self.type_and_enter(box, typed)
+                self.wait_for_compliance(window)
+                channel = getattr(self.station.smu, f'ch{axis}')
+                self.assertEqual(channel.curr_limit(), limit)
+                self.assertEqual(channel.current_compliance_target, limit)
+                self.assertEqual(getattr(self.station.smu, f'ch{3 - axis}').curr_limit(), other)
+                self.assertEqual(box.text(), f'{limit / 1e-8:.1f}e-8 A')
+                self.assertIn('applied and verified', window.status_lbl.text())
+        self.errors.assert_not_called()
+
+    def test_unreadable_current_limit_is_not_applied_and_says_why(self):
+        window = self.dashboard.dual_window
+        with patch.object(self.station.smu.ch1.curr_limit, 'set') as setter:
+            # Read up to the unknown text, "1 E-9" would be 1 A and "10 x" 10 A.
+            for typed in ('1 E-9', '10 x', 'ten'):
+                with self.subTest(typed=typed):
+                    window.status_lbl.setText('')
+                    self.type_and_enter(window.ch1_compliance, typed)
+                    setter.assert_not_called()
+                    self.assertFalse(window._applying_compliance)
+                    self.assertEqual(window.ch1_compliance.text(), '1.0e-7 A')
+                    self.assertIn(f'"{typed}" is not a current', window.status_lbl.text())
+        self.assertEqual(self.station.smu.ch1.curr_limit(), 1e-7)
+        self.errors.assert_not_called()
+
+    def test_typed_current_limit_is_written_and_read_back_on_a_b2902b(self):
+        from fake_b2902b import connect_fake_b2902b
+        window = self.dashboard.dual_window
+        self.assertTrue(self.dashboard.prepare_device_change())
+        remove_device(self.station, 'smu')
+        smu, resource = connect_fake_b2902b('smu')
+        self.station.add_component(smu, update_snapshot=False)
+        self.dashboard.finish_device_change()
+        self.assertFalse(self.station.smu.simulated)
+        for axis in (1, 2):
+            self.assertEqual(resource.settings[f':SENS{axis}:CURR:PROT'], 1e-7)
+        for axis, typed in ((1, '1e-8'), (2, '0.00000001')):
+            with self.subTest(typed=typed):
+                resource.commands.clear()
+                box = getattr(window, f'ch{axis}_compliance')
+                self.type_and_enter(box, typed)
+                self.wait_for_compliance(window)
+                write = resource.commands.index(f':SENS{axis}:CURR:PROT 1.000000e-08')
+                self.assertIn(f':SENS{axis}:CURR:PROT?', resource.commands[write + 1:])
+                self.assertEqual(resource.settings[f':SENS{axis}:CURR:PROT'], 1e-8)
+                self.assertEqual(getattr(smu, f'ch{axis}').current_compliance_target, 1e-8)
+                self.assertEqual(box.text(), '1.0e-8 A')
+                self.assertIn('applied and verified', window.status_lbl.text())
+        # A typed limit changes only the current limit: no voltage, mode or output command.
+        self.assertFalse(any(command.startswith((':SOUR', ':OUTP')) and not command.endswith('?')
+                             for command in resource.commands))
+        self.assertEqual(resource.unexpected, [])
+        self.errors.assert_not_called()
+
     def test_failed_compliance_update_reports_error_and_keeps_previous_target(self):
         window = self.dashboard.dual_window
         with patch.object(self.station.smu.ch1.curr_limit, 'set', side_effect=RuntimeError('Write failed')):
@@ -709,6 +782,161 @@ class DashboardWorkflowTests(unittest.TestCase):
                 self.assertIn(name, data)
             self.assertEqual(data["spectra"].shape, (2, 2, 512))
             self.assertEqual(json.loads(data.attrs["device_modes"])["smu"], "simulated")
+        self.errors.assert_not_called()
+
+    def gate_sweep(self, points, settling=0.0):
+        window = self.dashboard.dual_window
+        self.dashboard.tab_widget.setCurrentIndex(1)
+        for axis, count in zip((1, 2), points):
+            getattr(window, f"c{axis}_start").setValue(0)
+            getattr(window, f"c{axis}_end").setValue(0.01)
+            getattr(window, f"c{axis}_pts").setValue(count)
+        window.exposure_box.setValue(0.01)
+        window.settling_box.setValue(settling)
+        return window
+
+    def test_gate_sweep_saves_the_time_of_every_step_and_shows_a_dated_estimate(self):
+        from sweep_timing import STORAGE_KEY, TIMING_FIELDS
+        window = self.gate_sweep((2, 2), settling=0.02)
+        with patch.object(QtWidgets.QMessageBox, "information") as finished:
+            window.begin_sweep()
+            # Before any point: the first guess, with the day, the total and the pace.
+            self.assertRegex(window.lbl_expected_end.text(),
+                             r"^Expected End: about (today|tomorrow) \d\d:\d\d · .+ in total · "
+                             r"\d+\.\d\d s per point \(first guess")
+            self.wait_for(lambda: not window.is_running, timeout=10)
+        # After three points the estimate is this sweep's own pace.
+        self.assertRegex(window.lbl_expected_end.text(), r"^Expected End: (today|tomorrow) \d\d:\d\d · ")
+        self.assertIn("4 points in", finished.call_args.args[2])
+        self.assertIn("s per point on average: camera", finished.call_args.args[2])
+        files = list(self.directory.rglob("*gate_sweep*.h5"))
+        self.assertEqual(len(files), 1)
+        with h5py.File(files[0]) as data:
+            timing = data["timing"]
+            self.assertEqual(set(timing), set(TIMING_FIELDS))
+            for name in TIMING_FIELDS:
+                self.assertEqual(timing[name].shape, (2, 2))
+                self.assertTrue(np.all(np.isfinite(timing[name][()])), name)
+            self.assertTrue(np.all(timing["settle_s"][()] >= 0.015))
+            self.assertTrue(np.all(timing["point_s"][()] >= timing["settle_s"][()] + timing["spectrum_s"][()]))
+            self.assertIn("4 points in", timing.attrs["summary"])
+            self.assertEqual(timing.attrs["point_overhead_basis"], "measured")
+        # A simulated camera's pace is not kept for the next sweep.
+        stored = json.loads((self.directory / "value_storage").read_text()).get("dual_gate", {})
+        self.assertNotIn(STORAGE_KEY, stored)
+        self.errors.assert_not_called()
+
+    def test_measured_pace_of_a_physical_camera_is_the_next_first_estimate(self):
+        from sweep_timing import STORAGE_KEY
+        import measurements.Dual_gate_sweep_gui as dgs
+        modes = {"camera": "physical", "smu": "simulated"}
+        window = self.gate_sweep((5, 4))  # 20 points: enough to keep
+        with patch.object(dgs, "measurement_device_modes", return_value=modes):
+            window.begin_sweep()
+            self.wait_for(lambda: not window.is_running, timeout=20)
+        stored = json.loads((self.directory / "value_storage").read_text())["dual_gate"][STORAGE_KEY]
+        self.assertGreaterEqual(stored, 0.0)
+        self.assertLess(stored, 60.0)
+        with patch.object(dgs, "measurement_device_modes", return_value=modes):
+            window.begin_sweep()
+            self.assertRegex(window.lbl_expected_end.text(), r"^Expected End: about .+ \(pace of the last sweep\)$")
+            self.wait_for(lambda: not window.is_running, timeout=20)
+        self.errors.assert_not_called()
+
+    def set_gate_limits(self, window, ch1, ch2):
+        """Set each channel's (lowest, highest) voltage as typed into the panel."""
+        for axis, window_limits in ((1, ch1), (2, ch2)):
+            for box, value in zip(window.gate_limit_boxes[axis], window_limits):
+                box.setValue(value)
+        window.on_gate_limits_changed()
+
+    def limit_values(self, window):
+        return tuple(tuple(box.value() for box in window.gate_limit_boxes[axis]) for axis in (1, 2))
+
+    def test_gate_limits_block_a_matrix_sweep_outside_them_and_are_saved(self):
+        window = self.gate_sweep((3, 3))
+        self.assertEqual(self.limit_values(window), ((-1, 1), (-1, 1)))  # Default until set.
+        # VG1 = ch1 + ch2 and VG2 = ch1 - ch2: ch1 = (VG1 + VG2) / 2 runs from 0 to +0.4 V and
+        # ch2 = (VG1 - VG2) / 2 from -0.2 to +0.2 V.
+        for name, value in (("coeff_a", 1), ("coeff_b", 1), ("coeff_c", 1), ("coeff_d", -1)):
+            getattr(window, name).setValue(value)
+        for axis in (1, 2):
+            getattr(window, f"c{axis}_end").setValue(0.4)
+        self.set_gate_limits(window, (-210, 0.3), (-210, 210))
+        window.on_sweep_range_changed()
+        self.assertIn("Sweep disabled: Channel 1 would reach +0.4 V, above its highest allowed +0.3 V",
+                      window.det_label.text())
+        self.assertFalse(window.begin_btn.isEnabled())
+        window.begin_sweep()
+        self.assertFalse(window.is_running)
+        self.errors.assert_called_once()
+        self.assertIn("Channel 1 would reach +0.4 V", self.errors.call_args.args[2])
+        self.assertEqual((self.station.smu.ch1.volt(), self.station.smu.ch2.volt()), (0.0, 0.0))
+        # The negative side has its own limit.
+        self.set_gate_limits(window, (-210, 0.4), (-0.1, 210))
+        self.assertIn("Sweep disabled: Channel 2 would reach -0.2 V, below its lowest allowed -0.1 V",
+                      window.det_label.text())
+        self.assertFalse(window.begin_btn.isEnabled())
+        # Inside both windows the panel shows each channel's range, and the sweep runs.
+        self.set_gate_limits(window, (-210, 0.4), (-0.2, 210))
+        self.assertIn("ch1: +0.000 to +0.400 V, ch2: -0.200 to +0.200 V", window.det_label.text())
+        self.assertTrue(window.begin_btn.isEnabled())
+        window.begin_sweep()
+        self.assertFalse(any(box.isEnabled() for box in window.gate_limit_boxes[1]))
+        self.wait_for(lambda: not window.is_running, timeout=10)
+        self.assertTrue(np.all(window.data_measured_mask))
+        self.assertTrue(all(box.isEnabled() for box in window.gate_limit_boxes[1]))
+        stored = json.loads((self.directory / "value_storage").read_text())["dual_gate"]
+        self.assertEqual(tuple(stored[key] for key in ("v1_min", "v1_max", "v2_min", "v2_max")),
+                         (-210, 0.4, -0.2, 210))
+        files = list(self.directory.rglob("*gate_sweep*.h5"))
+        self.assertEqual(len(files), 1)
+        with h5py.File(files[0]) as data:
+            self.assertEqual(tuple(data.attrs[f"gate_limit_ch{axis}_{side}_V"]
+                                   for axis in (1, 2) for side in ("min", "max")), (-210, 0.4, -0.2, 210))
+            self.assertLessEqual(np.max(data["v1_grid"][()]), 0.4 + 1e-9)
+            self.assertGreaterEqual(np.min(data["v2_grid"][()]), -0.2 - 1e-9)
+        self.errors.assert_called_once()
+        # The saved limits come back after a reload; an unusable side gets the default (-1 V / +1 V).
+        self.set_gate_limits(window, (-5, 5), (-5, 5))
+        (self.directory / "value_storage").write_text(json.dumps({"dual_gate": {
+            **stored, "v1_min": -0.7, "v1_max": "unusable", "v2_min": 5, "v2_max": 3}}))
+        window.reload_gui_from_storage()
+        self.assertEqual(self.limit_values(window), ((-0.7, 1), (-1, 3)))
+
+    def test_manual_setpoint_or_switch_on_outside_the_gate_limits_is_refused(self):
+        window = self.gate_sweep((2, 2))
+        smu = self.station.smu
+        with patch.object(QtWidgets.QMessageBox, "warning") as warning:
+            # The default window is -1 V to +1 V.
+            window.ch2_setpoint.setValue(1.5)
+            window.on_setpoint_enter(2)
+            QtTest.QTest.qWait(200)
+            self.assertEqual(smu.ch2.volt(), 0.0)
+            self.assertIn("Channel 2 would reach +1.5 V, above its highest allowed +1 V", warning.call_args.args[2])
+            self.set_gate_limits(window, (-0.3, 0.2), (-0.2, 0.2))
+            for value, message in ((0.5, "+0.5 V, above its highest allowed +0.2 V"),
+                                   (-0.4, "-0.4 V, below its lowest allowed -0.3 V")):
+                window.ch1_setpoint.setValue(value)
+                window.on_setpoint_enter(1)
+                QtTest.QTest.qWait(200)
+                self.assertEqual(smu.ch1.volt(), 0.0)
+                self.assertIn(f"The setpoint is refused. Channel 1 would reach {message}", warning.call_args.args[2])
+            window.ch1_setpoint.setValue(0.1)
+            window.on_setpoint_enter(1)
+            self.wait_for(lambda: smu.ch1.volt() == 0.1)
+            self.wait_for(lambda: not (window.ramp_worker and window.ramp_worker.isRunning()))
+            # Switching on ramps to the programmed setpoint: refused while that is beyond the limit.
+            smu.ch2.output(False)
+            smu.ch2.volt(0.5)
+            window.on_output_updated("Channel 2", False)
+            self.wait_for(window.ch2_out_btn.isEnabled)  # Controls unlock once the manual ramp is reported.
+            warning.reset_mock()
+            window.ch2_out_btn.click()
+            QtTest.QTest.qWait(200)
+            self.assertIn("The output switch-on is refused. Channel 2 would reach +0.5 V", warning.call_args.args[2])
+            self.assertFalse(smu.ch2.output())
+            self.assertFalse(window.ch2_out_btn.isChecked())
         self.errors.assert_not_called()
 
     def test_dgs_optional_end_ramp_returns_gates_to_zero_and_is_persisted(self):

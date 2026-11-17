@@ -35,7 +35,7 @@ from drivers.qpg_uvoltdaq import QPGuVoltDAQ
 LOCKIN_ADDRESS = 'GPIB0::9::INSTR'           # SR830 "lia1" / "lia_I": bridge, or transport current
 LOCKIN2_ADDRESS = 'GPIB0::10::INSTR'         # SR830 "lia_V": transport four-probe voltage
 AWG_ADDRESS = 'USB0::0xF4EC::0x1103::SDG1PA0C900083::INSTR'  # Siglent SDG2042X "awg"
-DAC_ADDRESS = 'ASRL15::INSTR'                # QPG uVoltDAQ 4O4I "da"
+DAC_ADDRESS = 'ASRL5::INSTR'                # QPG uVoltDAQ 4O4I "da"
 
 # Spectrometer configuration switch
 # Options: 'lightfieldG15', 'wingspecG15', 'lightfieldG11', 'winspecG11'

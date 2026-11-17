@@ -27,6 +27,8 @@ class PositionDGSWindow(MainWindow):
     editable_current_compliance = False
     # Position scans drive both gates with the Keysight; no uVoltDAQ selection here.
     allow_dac_gate_outputs = False
+    # Expected End shows the gate point count across all positions instead (on_progress_updated).
+    estimate_sweep_time = False
 
     def __init__(self, station, embed=False):
         self.store = None

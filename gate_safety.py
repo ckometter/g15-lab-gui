@@ -87,3 +87,49 @@ def validate_map_gate_targets(params, x_values, y_values):
         validate_gate_targets(v1, v2)
         channels.update((1, 2))
     return channels
+
+
+# Dual Gate's (lowest, highest) voltage per gate until the user sets them, also
+# used in place of a missing or unusable saved value.
+DEFAULT_GATE_LIMITS_V = (-1.0, 1.0)
+
+
+def validate_gate_limits(lowest, highest, channel=None):
+    """A user's voltage window for one gate: lowest <= 0 V <= highest, within the SMU range.
+
+    Both sides include 0 V: switching an output on and the optional end ramp pass through it.
+    """
+    lowest, highest = float(lowest), float(highest)
+    label = f"Channel {channel}" if channel is not None else "Gate channel"
+    if not (math.isfinite(lowest) and -GATE_MAX_ABS_VOLTAGE_V <= lowest <= 0):
+        raise ValueError(f"{label}: the lowest voltage must be between -{GATE_MAX_ABS_VOLTAGE_V:g} V and 0 V.")
+    if not (math.isfinite(highest) and 0 <= highest <= GATE_MAX_ABS_VOLTAGE_V):
+        raise ValueError(f"{label}: the highest voltage must be between 0 V and +{GATE_MAX_ABS_VOLTAGE_V:g} V.")
+    return lowest, highest
+
+
+def check_gate_limits(channel_1_values, channel_2_values, limits):
+    """Refuse any physical target outside its gate's window before a write.
+
+    ``limits`` maps channel 1 and 2 to (lowest, highest) in volts; a channel without
+    one is not limited here (the SMU range still applies). Allows 1 nV for rounding in
+    the matrix. The message names the target farthest outside its window.
+    """
+    import numpy as np
+
+    for channel, values in enumerate((channel_1_values, channel_2_values), 1):
+        window = (limits or {}).get(channel)
+        if window is None:
+            continue
+        lowest, highest = validate_gate_limits(*window, channel)
+        array = np.asarray(values, dtype=float).ravel()
+        below, above = array < lowest - 1e-9, array > highest + 1e-9
+        if not (np.any(below) or np.any(above)):
+            continue
+        under = lowest - array[below].min() if np.any(below) else -1.0
+        over = array[above].max() - highest if np.any(above) else -1.0
+        if over >= under:
+            raise ValueError(f"Channel {channel} would reach {array[above].max():+.4g} V, "
+                             f"above its highest allowed {highest:+g} V.")
+        raise ValueError(f"Channel {channel} would reach {array[below].min():+.4g} V, "
+                         f"below its lowest allowed {lowest:+g} V.")

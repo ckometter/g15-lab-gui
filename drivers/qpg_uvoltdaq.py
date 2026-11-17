@@ -5,13 +5,15 @@ Command set as in qcodes-qpg ``QPG_uVoltDAQ_4O4I.py``: ``GET_DAC,ch``,
 jumps: every write (``dac0.voltage(v)`` or ``ramp_to``) re-reads the actual
 setpoint, moves in increments no larger than the gate-safety step at the
 channel's ramp rate, and confirms the final setpoint. ``INITIALIZE`` is never
-sent automatically, so existing output voltages are retained on connection.
+sent automatically, so existing output voltages are retained on connection;
+``initialize_outputs()`` sends it only when asked (Device Manager button).
 """
 import math
 import random
 import threading
 import time
 
+import pyvisa
 from qcodes.instrument import Instrument, InstrumentChannel, VisaInstrument
 
 from gate_safety import (DEFAULT_GATE_RAMP_RATE_V_PER_S, GATE_MAX_RAMP_STEP_V,
@@ -19,6 +21,8 @@ from gate_safety import (DEFAULT_GATE_RAMP_RATE_V_PER_S, GATE_MAX_RAMP_STEP_V,
 
 DAC_RANGE_V = 10.0
 READBACK_TOLERANCE_V = 1e-3
+# The reply to INITIALIZE is not documented: wait this long for one line, then go on without.
+INITIALIZE_REPLY_TIMEOUT_MS = 1500
 
 
 class UVoltDacChannel(InstrumentChannel):
@@ -149,6 +153,67 @@ class QPGuVoltDAQ(VisaInstrument):
 
     def adc(self, channel):
         return getattr(self, f"adc{int(channel)}")
+
+    def setpoints(self):
+        """{output: setpoint in V} for all four outputs, as the DAC reports them."""
+        return {channel: float(self.dac(channel).voltage()) for channel in range(4)}
+
+    def ramp_outputs_to_zero(self, callback=None):
+        """Ramp every nonzero output to 0 V together, along a straight line in steps of
+        at most GATE_MAX_RAMP_STEP_V at each output's ramp rate, so the voltage between
+        outputs only shrinks. callback(step, steps) after each step. Returns the start values."""
+        start = self.setpoints()
+        moving = {channel: value for channel, value in start.items() if abs(value) > READBACK_TOLERANCE_V}
+        if not moving:
+            return start
+        steps = math.ceil(max(abs(value) for value in moving.values()) / GATE_MAX_RAMP_STEP_V - 1e-12)
+        for index in range(1, steps + 1):
+            for channel, value in moving.items():
+                self.dac(channel).ramp_to(0.0 if index == steps else value * (1 - index / steps))
+            if callback is not None:
+                callback(index, steps)
+        return start
+
+    def initialize_outputs(self):
+        """Send INITIALIZE: the outputs leave tri-state (their state after power-on) for
+        normal mode, and all four go to 0 V at once, without a ramp.
+
+        A one-line reply and no reply are both accepted; stray bytes are discarded so
+        later queries stay in step. Returns the reply ('' if none). Raises if any output
+        does not read 0 V afterwards, naming it.
+        """
+        if self.simulated:
+            for channel in range(4):
+                self.dac(channel)._sim_voltage = 0.0
+                self.dac(channel).voltage.cache.set(0.0)
+            return ""
+        with self._lock:
+            if any(self.dac(channel).ramping for channel in range(4)):
+                raise RuntimeError("A uVoltDAQ output is ramping; INITIALIZE was not sent.")
+            self.write("INITIALIZE")
+            handle = self.visa_handle
+            previous = handle.timeout
+            handle.timeout = INITIALIZE_REPLY_TIMEOUT_MS
+            try:
+                reply = str(handle.read()).strip()
+            except pyvisa.errors.VisaIOError as exc:
+                if exc.error_code != pyvisa.constants.StatusCode.error_timeout:
+                    raise
+                reply = ""
+            finally:
+                handle.timeout = previous
+            waiting = getattr(handle, "bytes_in_buffer", 0) or 0
+            if waiting:
+                handle.read_bytes(waiting)
+        readings = self.setpoints()
+        for channel, value in readings.items():
+            self.dac(channel).voltage.cache.set(value)
+        wrong = {channel: value for channel, value in readings.items()
+                 if not math.isfinite(value) or abs(value) > READBACK_TOLERANCE_V}
+        if wrong:
+            raise RuntimeError("INITIALIZE was sent, but " + ", ".join(
+                f"DAC{channel} reads {value:g} V" for channel, value in wrong.items()) + " instead of 0 V.")
+        return reply
 
     def ask(self, cmd: str) -> str:
         if self.simulated:

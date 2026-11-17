@@ -41,12 +41,27 @@ pessimistic just after a refill, then about 2× too optimistic from roughly
 
 The forecast instead converts the level into a helium amount using that shape.
 It measures the boil-off from the last 24 hours below the neck (neck readings
-are unreliable just after a refill), falling back to the rate from before the
-refill and then to a typical 4 mm/h. Its median error on the same refills was
+are unreliable just after a refill). Its median error on the same refills was
 5 h. The status bar shows the present mm/h. The 24-hour plot still shows a
 plain straight-line fit of what was measured. The Slack alerts use the same
 model (`levelmeter_slack.py` in the level-meter folder; keep the constants in
 step).
+
+Just after a refill, until about 3 hours of readings below the neck exist, the
+forecast uses the rate from before the refill, but **at least the typical
+4 mm/h**. It errs early on purpose, because a late forecast is the costly
+mistake:
+
+- **Use can rise after a refill.** After the 12 Nov 2026 refill the level fell
+  about twice as fast as before it. The refill message said 230 mm in about
+  5 days, but the level fell from 751 to 555 mm in 23 h.
+- **The rate from before a refill only uses readings since the refill before
+  that one.** On 13 Nov 2026, two refills a day apart made the fit run across the
+  first refill's jump. It came out far too low: the message forecast Wednesday
+  04:37, but 230 mm is due on Monday evening.
+
+Backtested on all refills since 3 Oct 2026, this cut the late forecasts made in
+the first day after a refill from 10.5 h to 5.7 h late (90th percentile).
 
 ## Colours
 
