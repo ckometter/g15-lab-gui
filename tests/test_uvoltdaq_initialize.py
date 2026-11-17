@@ -14,8 +14,8 @@ import pyvisa
 from PyQt6 import QtWidgets
 
 from device_manager import DeviceManagerWindow
-from drivers.qpg_uvoltdaq import INITIALIZE_REPLY_TIMEOUT_MS, QPGuVoltDAQ
-from gate_safety import GATE_MAX_RAMP_STEP_V
+from drivers.qpg_uvoltdaq import INITIALIZE_RAMP_RATE_V_PER_S, INITIALIZE_REPLY_TIMEOUT_MS, QPGuVoltDAQ
+from gate_safety import GATE_MAX_RAMP_STEP_V, GateRampCancelled
 
 
 class FakeDacPort:
@@ -49,6 +49,38 @@ class FakeDacPort:
 
     def close(self):
         pass
+
+
+class FakeClock:
+    """Stands in for the driver's time module: sleeping only moves the clock."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class RampingDacPort(FakeDacPort):
+    """Keeps the four setpoints, logs every query, and takes reply_s per reply ('stuck' outputs ignore SET)."""
+
+    def __init__(self, clock, values, reply_s=0.0, stuck=()):
+        super().__init__()
+        self.clock, self.values, self.reply_s, self.stuck = clock, dict(values), reply_s, set(stuck)
+        self.log = []
+
+    def query(self, cmd):
+        self.clock.now += self.reply_s
+        self.log.append((self.clock.now, cmd))
+        name, channel, *value = cmd.split(",")
+        if name == "SET":
+            if int(channel) not in self.stuck:
+                self.values[int(channel)] = float(value[0])
+            return "OK"
+        return f"{self.values.get(int(channel), 0.0):.6f}"
 
 
 class InitializeDriverTests(unittest.TestCase):
@@ -119,6 +151,70 @@ class InitializeDriverTests(unittest.TestCase):
         self.assertEqual(dac.initialize_outputs(), "")
         self.assertEqual(dac.setpoints(), {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0})
 
+    def ramping(self, values, **port_settings):
+        dac, _ = self.connect()
+        clock = FakeClock()
+        port = RampingDacPort(clock, values, **port_settings)
+        dac._visa_handle = port
+        patcher = patch("drivers.qpg_uvoltdaq.time", clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return dac, port, clock
+
+    def test_ramp_to_zero_moves_all_outputs_together_with_one_set_each_per_step(self):
+        dac, port, clock = self.ramping({0: 1.0, 1: -0.5, 2: 0.25, 3: 0.0})
+        seen = []
+        start = dac.ramp_outputs_to_zero(lambda step, steps: seen.append((step, steps)))
+        self.assertEqual(start, {0: 1.0, 1: -0.5, 2: 0.25, 3: 0.0})
+        self.assertEqual(seen[-1], (20, 20))  # 1 V in steps of 0.05 V
+        commands = [command for _, command in port.log]
+        self.assertEqual(commands[:4], [f"GET_DAC,{channel}" for channel in range(4)])
+        steps = commands[4:-3]
+        self.assertEqual(len(steps), 20 * 3)
+        self.assertTrue(all(command.startswith("SET,") for command in steps))  # nothing read in between
+        self.assertEqual(commands[-3:], ["GET_DAC,0", "GET_DAC,1", "GET_DAC,2"])
+        self.assertAlmostEqual(clock.now, 1.0)  # 1 V at 1 V/s, whatever the number of outputs
+        self.assertEqual(port.values, {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0})
+        written = [command.split(",") for command in steps]
+        dac0 = [float(value) for _, channel, value in written if channel == "0"]
+        dac1 = [float(value) for _, channel, value in written if channel == "1"]
+        for before, after in zip([1.0] + dac0, dac0):
+            self.assertLessEqual(before - after, GATE_MAX_RAMP_STEP_V + 1e-9)
+        for first, second in zip(dac0[:-1], dac1[:-1]):
+            self.assertAlmostEqual(second / first, -0.5)  # along a straight line to 0 V
+        self.assertFalse(any(dac.dac(channel).ramping for channel in range(4)))
+
+    def test_the_dacs_reply_time_overlaps_the_wait(self):
+        dac, port, clock = self.ramping({0: 0.5, 1: 0.0, 2: 0.0, 3: 0.0}, reply_s=0.03)
+        dac.ramp_outputs_to_zero()
+        # Four reads (0.12 s); ten steps due every 0.05 s, each SET's 0.03 s reply inside the wait;
+        # one read at the end: 0.68 s, where waiting after each reply would take 0.12 + 10 x 0.08 + 0.03.
+        self.assertAlmostEqual(clock.now, 0.12 + 0.5 + 0.03 + 0.03)
+
+    def test_an_output_that_does_not_reach_0_v_stops_before_initialize(self):
+        dac, port, _ = self.ramping({0: 0.1, 1: 0.0, 2: 0.0, 3: 0.0}, stuck={0})
+        with self.assertRaisesRegex(RuntimeError, "DAC0 reads 0.1 V after the ramp to 0 V; INITIALIZE was not sent"):
+            dac.ramp_outputs_to_zero()
+        self.assertFalse(dac.dac0.ramping)
+        self.assertNotIn("INITIALIZE", port.written)
+
+    def test_a_stop_request_keeps_the_last_step(self):
+        dac, port, _ = self.ramping({0: 0.2, 1: 0.0, 2: 0.0, 3: 0.0})
+
+        def stop_after_two(step, steps):
+            if step == 2:
+                dac.dac0.ramp_stop_requested = True
+
+        with self.assertRaises(GateRampCancelled):
+            dac.ramp_outputs_to_zero(stop_after_two)
+        self.assertAlmostEqual(port.values[0], 0.1)
+        self.assertFalse(dac.dac0.ramping)
+
+    def test_the_ramp_time_is_set_by_the_largest_output(self):
+        self.assertAlmostEqual(QPGuVoltDAQ.zero_ramp_seconds({0: 10.0, 1: -3.0, 2: 0.0, 3: 0.0}),
+                               10.0 / INITIALIZE_RAMP_RATE_V_PER_S)
+        self.assertEqual(QPGuVoltDAQ.zero_ramp_seconds({channel: 0.0 for channel in range(4)}), 0.0)
+
 
 class InitializeButtonTests(unittest.TestCase):
     @classmethod
@@ -161,7 +257,8 @@ class InitializeButtonTests(unittest.TestCase):
         text = box.text()
         for part in ("from tri-state", "sets all four outputs to 0 V at once",
                      "DAC0 +0.120 V, DAC1 +0.000 V, DAC2 -0.070 V, DAC3 +0.000 V",
-                     "DAC0, DAC2 are not at 0 V", "(about 2 s)", "Initialize now drops them to 0 V at once"):
+                     "DAC0, DAC2 are not at 0 V", "together at 1 V/s, in steps of at most 0.05 V (about 2 s)",
+                     "Initialize now drops them to 0 V at once"):
             self.assertIn(part, text)
         self.assertEqual(list(buttons), ["ramp", "now", "cancel"])
         self.assertIs(box.defaultButton(), buttons["ramp"])
@@ -189,7 +286,7 @@ class InitializeButtonTests(unittest.TestCase):
         dac.dac0._sim_voltage = 0.12
         ask, _ = self.press_initialize(manager, "ramp")
         self.assertEqual(ask.call_args.args[0][0], 0.12)
-        self.assertAlmostEqual(ask.call_args.args[2], 1.2)  # 0.12 V at 0.1 V/s
+        self.assertAlmostEqual(ask.call_args.args[2], 0.12)  # 0.12 V at 1 V/s
         self.assertEqual(dac.setpoints(), {channel: 0.0 for channel in range(4)})
         self.assertIn("Ramped to 0 V from DAC0 +0.120 V", manager.results["dac"][2])
 

@@ -14,6 +14,34 @@ it sends `INITIALIZE` (outputs from tri-state to normal mode, all four at 0 V)
 after asking, and can ramp nonzero outputs to 0 V first. See
 [GATE_CURRENT_PROTECTION.md](GATE_CURRENT_PROTECTION.md#initializing-the-uvoltdaq-after-power-on).
 
+## When serial devices hang or fail
+
+The ANC150, ANC300 and uVoltDAQ are opened on serial ports through NI-VISA.
+NI-VISA guards every serial-port search and open with one lock, shared by all
+programs on the PC. If the program holding it gets stuck, every serial search
+and open waits forever, in any program, including `rm.list_resources()` in a
+Python console. GPIB, USB and network devices are not affected. On 17 Nov 2026
+the stuck holder was NI Configuration Manager (`nimxs.exe`), the service behind
+NI MAX.
+
+- Before opening one of these three devices, the Device Manager reads the
+  lock's state; it never takes the lock or opens a port for this. If the lock
+  stays taken for 5 s, the device fails at once and its details give the fix
+  below. In Auto mode it falls back to simulation. Further serial devices in
+  the same check fail without waiting again.
+- The AWG and the power meter search only USB resources, so they never wait on
+  this lock.
+- **To clear it**, open PowerShell with **Run as administrator** and run
+  `Stop-Process -Name nimxs -Force`, then
+  `Start-Service mxssvr, nidevldu, NITaggerService`. Restarting the PC also
+  works. `Restart-Service mxssvr -Force` is not enough on its own: it stops NI
+  Device Loader and NI Variable Engine, then waits for the stuck service, and
+  until all three run again the level meter's NI-DAQ cannot be read.
+- To check the lock without the GUI, run
+  `python -c "import visa_serial_lock as v; print(v.serial_lock_owned())"` in
+  the repository folder. `True` several times in a row means it is stuck;
+  `False` or `None` means serial devices can be opened.
+
 The separate-process manager was reverted because it did not initialize
 reliably alongside the GUI. Close the old processes and relaunch this version
 once to restore the shared manager/dashboard workflow.
