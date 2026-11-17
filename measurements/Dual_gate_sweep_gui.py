@@ -5,6 +5,7 @@ import json
 import time
 import math
 import re
+from decimal import Decimal
 from time import perf_counter  # durations; unaffected when a test replaces the time module
 import h5py
 import numpy as np
@@ -88,10 +89,20 @@ class ScientificPointSpinBox(QtWidgets.QSpinBox):
 
 _OriginalQDoubleSpinBox = QtWidgets.QDoubleSpinBox
 
+# Powers of ten a number may carry before a box's unit, e.g. 10 nA or 50 ms.
+SI_PREFIX_EXPONENTS = {'p': -12, 'n': -9, 'u': -6, 'µ': -6, 'μ': -6, 'm': -3, 'k': 3, 'M': 6}
+
+
 class ScientificDoubleSpinBox(_OriginalQDoubleSpinBox):
-    """A double spin box that displays and accepts float values in scientific notation with high precision."""
-    
-    _sci_pattern = re.compile(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d*)?$')
+    """A double spin box that displays and accepts float values in scientific notation with high precision.
+
+    A box with a unit suffix also reads an SI prefix: 10 nA, 10nA, or 10n where the
+    unit itself starts with no prefix letter (A, not pF). Text it cannot read is kept
+    as typed and Enter keeps the previous value; it is never cut down to the number
+    in front, which would turn 1 nA into 1 A.
+    """
+
+    _number_pattern = re.compile(r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?')
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -126,35 +137,50 @@ class ScientificDoubleSpinBox(_OriginalQDoubleSpinBox):
                     s += '0'
             return s
 
+    def number_text(self, text):
+        """``text`` without the box's prefix and suffix, which Qt passes in with it."""
+        prefix, suffix = self.prefix(), self.suffix()
+        if prefix and text.startswith(prefix):
+            text = text[len(prefix):]
+        if suffix and text.endswith(suffix):
+            text = text[:len(text) - len(suffix)]
+        return text.strip()
+
+    def number_from_text(self, text):
+        """The value ``text`` (the whole field) stands for, or None if it is not a number."""
+        special = self.specialValueText()
+        if special and text == special:
+            return self.minimum()
+        number = self.number_text(text)
+        match = self._number_pattern.match(number)
+        if match is None:
+            return None
+        value = Decimal(match.group())
+        tail = ''.join(number[match.end():].split())
+        unit = ''.join(self.suffix().split())
+        if tail and tail != unit:
+            prefix = tail[:-len(unit)] if unit and tail.endswith(unit) else tail
+            if prefix not in SI_PREFIX_EXPONENTS or not unit or (prefix == tail and unit[0] in SI_PREFIX_EXPONENTS):
+                return None
+            value = value.scaleb(SI_PREFIX_EXPONENTS[prefix])
+        value = float(value)
+        return value if math.isfinite(value) else None
+
     def valueFromText(self, text):
-        try:
-            if text.strip() in ("", "-", "+", "-.", "+.", "."):
-                return max(self.minimum(), min(self.maximum(), 0.0))
-            value = float(text)
-            if not math.isfinite(value):
-                raise ValueError
-            return value
-        except Exception:
-            return max(self.minimum(), min(self.maximum(), 0.0))
+        value = self.number_from_text(text)
+        return max(self.minimum(), min(self.maximum(), 0.0)) if value is None else value
 
     def validate(self, text, pos):
-        if text.strip() == "":
-            return QtGui.QValidator.State.Intermediate, text, pos
-        if text.strip() in ("-", "+", "-.", "+.", "."):
-            return QtGui.QValidator.State.Intermediate, text, pos
-        if not self._sci_pattern.match(text):
-            return QtGui.QValidator.State.Invalid, text, pos
-        if len(text) > 0 and text[-1] in 'eE+-':
-            return QtGui.QValidator.State.Intermediate, text, pos
-        try:
-            value = float(text)
-            if not math.isfinite(value):
-                return QtGui.QValidator.State.Invalid, text, pos
-            if self.minimum() <= value <= self.maximum():
-                return QtGui.QValidator.State.Acceptable, text, pos
-            return QtGui.QValidator.State.Intermediate, text, pos
-        except ValueError:
-            return QtGui.QValidator.State.Invalid, text, pos
+        value = self.number_from_text(text)
+        if value is not None and self.minimum() <= value <= self.maximum():
+            return QtGui.QValidator.State.Acceptable, text, pos
+        # Never Invalid: Qt would drop that keystroke and read what is left.
+        return QtGui.QValidator.State.Intermediate, text, pos
+
+    def fixup(self, text):
+        # Qt's own fixup deletes the locale's group separator, so a decimal comma
+        # (1,5) would be read as 15. Unread text stays unread instead.
+        return text
 
 # Override the default QDoubleSpinBox class dynamically
 QtWidgets.QDoubleSpinBox = ScientificDoubleSpinBox
@@ -1127,6 +1153,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plotter_mode = False
         self._compliance_readbacks = {}
         self._compliance_edits = set()
+        self._compliance_typed = {}
         self._applying_compliance = False
         install_parameter_wheel_guard(self)
         self.setWindowTitle("Electrostatic Gate Control & 2D Sweep Spectrometer")
@@ -1679,7 +1706,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ch1_compliance.setSingleStep(0.001)
         self.ch1_compliance.setKeyboardTracking(False)
         self.ch1_compliance.valueChanged.connect(lambda _value: self._compliance_edits.add(1))
-        self.ch1_compliance.lineEdit().textEdited.connect(lambda _text: self._compliance_edits.add(1))
+        self.ch1_compliance.lineEdit().textEdited.connect(lambda text: self.on_compliance_text_edited(1, text))
         self.ch1_compliance.editingFinished.connect(lambda: self.on_compliance_changed(1))
         self.ch1_compliance.setSuffix(" A")
         grid1.addWidget(self.ch1_compliance, 4, 1)
@@ -1807,7 +1834,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ch2_compliance.setSingleStep(0.001)
         self.ch2_compliance.setKeyboardTracking(False)
         self.ch2_compliance.valueChanged.connect(lambda _value: self._compliance_edits.add(2))
-        self.ch2_compliance.lineEdit().textEdited.connect(lambda _text: self._compliance_edits.add(2))
+        self.ch2_compliance.lineEdit().textEdited.connect(lambda text: self.on_compliance_text_edited(2, text))
         self.ch2_compliance.editingFinished.connect(lambda: self.on_compliance_changed(2))
         self.ch2_compliance.setSuffix(" A")
         grid2.addWidget(self.ch2_compliance, 4, 1)
@@ -2954,7 +2981,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ch1_compliance.setSingleStep(0.001)
         self.ch1_compliance.setKeyboardTracking(False)
         self.ch1_compliance.valueChanged.connect(lambda _value: self._compliance_edits.add(1))
-        self.ch1_compliance.lineEdit().textEdited.connect(lambda _text: self._compliance_edits.add(1))
+        self.ch1_compliance.lineEdit().textEdited.connect(lambda text: self.on_compliance_text_edited(1, text))
         self.ch1_compliance.editingFinished.connect(lambda: self.on_compliance_changed(1))
         self.ch1_compliance.setSuffix(" A")
         grid1.addWidget(self.ch1_compliance, 4, 1)
@@ -3084,7 +3111,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ch2_compliance.setSingleStep(0.001)
         self.ch2_compliance.setKeyboardTracking(False)
         self.ch2_compliance.valueChanged.connect(lambda _value: self._compliance_edits.add(2))
-        self.ch2_compliance.lineEdit().textEdited.connect(lambda _text: self._compliance_edits.add(2))
+        self.ch2_compliance.lineEdit().textEdited.connect(lambda text: self.on_compliance_text_edited(2, text))
         self.ch2_compliance.editingFinished.connect(lambda: self.on_compliance_changed(2))
         self.ch2_compliance.setSuffix(" A")
         grid2.addWidget(self.ch2_compliance, 4, 1)
@@ -4347,12 +4374,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def toggle_ch2_output(self, enabled):
         self._toggle_output(2, enabled)
 
+    def on_compliance_text_edited(self, axis, text):
+        self._compliance_edits.add(axis)
+        self._compliance_typed[axis] = text
+
     def on_compliance_changed(self, axis=None):
         # Only an edited current-limit field commits a hardware change. Calls
         # from loading settings, mode changes and display refresh are read-only.
+        typed = self._compliance_typed.pop(axis, None)
         if axis is None or axis not in self._compliance_edits:
             if axis is None:
                 self._compliance_edits.clear()
+                self._compliance_typed.clear()
             self._update_compliance_controls(force=axis is None)
             return
         self._compliance_edits.discard(axis)
@@ -4367,8 +4400,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if dashboard and dashboard.measurement_active():
             self._update_compliance_controls(force=True)
             return
+        box = getattr(self, f'ch{axis}_compliance')
+        if typed is not None and box.number_from_text(typed) is None:
+            # Enter kept the previous limit: say why, rather than apply that one again.
+            self._update_compliance_controls(force=True)
+            self.status_lbl.setText(f'Status: "{box.number_text(typed)}" is not a current. '
+                                    'Type e.g. 1e-8, 10 nA or 10n, then press Enter.')
+            return
         try:
-            value = validate_current_compliance(getattr(self, f'ch{axis}_compliance').value())
+            value = validate_current_compliance(box.value())
         except ValueError as error:
             self._update_compliance_controls(force=True)
             QtWidgets.QMessageBox.warning(self, 'Invalid current compliance', str(error))
@@ -4422,7 +4462,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 box.setSuffix(' V' if current_mode else ' A')
                 box.setValue(value)
                 box.setSingleStep(1e-9 if not current_mode else .1)
-                box.setToolTip('Current compliance in amperes (1 nA to 3 A). Press Enter or leave the edited field to apply and verify.'
+                box.setToolTip('Current compliance in amperes (1 nA to 3 A), e.g. 1e-8, 10 nA or 10n. '
+                               'Press Enter or leave the edited field to apply and verify.'
                                if editable else 'Read-only DC-source compliance readback.')
                 channel = getattr(self.station.smu, f'ch{axis}', None)
                 expected = getattr(channel, 'current_compliance_target', GATE_CURRENT_COMPLIANCE_A)

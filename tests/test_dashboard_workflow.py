@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import h5py
 import numpy as np
-from PyQt6 import QtWidgets, QtTest
+from PyQt6 import QtCore, QtWidgets, QtTest
 from qcodes.station import Station
 from lab_gui import LabMainWindow
 from measurements.position_tab import PositionTab
@@ -499,6 +499,79 @@ class DashboardWorkflowTests(unittest.TestCase):
         window.ch1_compliance.editingFinished.emit()
         self.wait_for(lambda: not window._applying_compliance and not window.ramp_worker.isRunning())
         self.assertEqual(self.station.smu.ch1.curr_limit(), 2e-6)
+        self.errors.assert_not_called()
+
+    def type_and_enter(self, box, text):
+        """Type into a spin box as a user does: replace its number, then press Enter."""
+        box.selectAll()
+        QtTest.QTest.keyClicks(box, text)
+        QtTest.QTest.keyClick(box, QtCore.Qt.Key.Key_Return)
+
+    def wait_for_compliance(self, window):
+        self.wait_for(lambda: not window._applying_compliance
+                      and not (window.ramp_worker and window.ramp_worker.isRunning()))
+
+    def test_typed_current_limit_is_applied_on_enter(self):
+        window = self.dashboard.dual_window
+        self.dashboard.tab_widget.setCurrentIndex(1)
+        # Each entry differs from the last, so a value that was not read cannot pass.
+        for axis, typed, limit in ((1, '1e-8', 1e-8), (2, '0.00000002', 2e-8),
+                                   (1, '30 nA', 3e-8), (2, '40n', 4e-8)):
+            with self.subTest(typed=typed):
+                box = getattr(window, f'ch{axis}_compliance')
+                other = getattr(self.station.smu, f'ch{3 - axis}').curr_limit()
+                self.type_and_enter(box, typed)
+                self.wait_for_compliance(window)
+                channel = getattr(self.station.smu, f'ch{axis}')
+                self.assertEqual(channel.curr_limit(), limit)
+                self.assertEqual(channel.current_compliance_target, limit)
+                self.assertEqual(getattr(self.station.smu, f'ch{3 - axis}').curr_limit(), other)
+                self.assertEqual(box.text(), f'{limit / 1e-8:.1f}e-8 A')
+                self.assertIn('applied and verified', window.status_lbl.text())
+        self.errors.assert_not_called()
+
+    def test_unreadable_current_limit_is_not_applied_and_says_why(self):
+        window = self.dashboard.dual_window
+        with patch.object(self.station.smu.ch1.curr_limit, 'set') as setter:
+            # Read up to the unknown text, "1 E-9" would be 1 A and "10 x" 10 A.
+            for typed in ('1 E-9', '10 x', 'ten'):
+                with self.subTest(typed=typed):
+                    window.status_lbl.setText('')
+                    self.type_and_enter(window.ch1_compliance, typed)
+                    setter.assert_not_called()
+                    self.assertFalse(window._applying_compliance)
+                    self.assertEqual(window.ch1_compliance.text(), '1.0e-7 A')
+                    self.assertIn(f'"{typed}" is not a current', window.status_lbl.text())
+        self.assertEqual(self.station.smu.ch1.curr_limit(), 1e-7)
+        self.errors.assert_not_called()
+
+    def test_typed_current_limit_is_written_and_read_back_on_a_b2902b(self):
+        from fake_b2902b import connect_fake_b2902b
+        window = self.dashboard.dual_window
+        self.assertTrue(self.dashboard.prepare_device_change())
+        remove_device(self.station, 'smu')
+        smu, resource = connect_fake_b2902b('smu')
+        self.station.add_component(smu, update_snapshot=False)
+        self.dashboard.finish_device_change()
+        self.assertFalse(self.station.smu.simulated)
+        for axis in (1, 2):
+            self.assertEqual(resource.settings[f':SENS{axis}:CURR:PROT'], 1e-7)
+        for axis, typed in ((1, '1e-8'), (2, '0.00000001')):
+            with self.subTest(typed=typed):
+                resource.commands.clear()
+                box = getattr(window, f'ch{axis}_compliance')
+                self.type_and_enter(box, typed)
+                self.wait_for_compliance(window)
+                write = resource.commands.index(f':SENS{axis}:CURR:PROT 1.000000e-08')
+                self.assertIn(f':SENS{axis}:CURR:PROT?', resource.commands[write + 1:])
+                self.assertEqual(resource.settings[f':SENS{axis}:CURR:PROT'], 1e-8)
+                self.assertEqual(getattr(smu, f'ch{axis}').current_compliance_target, 1e-8)
+                self.assertEqual(box.text(), '1.0e-8 A')
+                self.assertIn('applied and verified', window.status_lbl.text())
+        # A typed limit changes only the current limit: no voltage, mode or output command.
+        self.assertFalse(any(command.startswith((':SOUR', ':OUTP')) and not command.endswith('?')
+                             for command in resource.commands))
+        self.assertEqual(resource.unexpected, [])
         self.errors.assert_not_called()
 
     def test_failed_compliance_update_reports_error_and_keeps_previous_target(self):
