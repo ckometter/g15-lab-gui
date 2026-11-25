@@ -3,13 +3,33 @@
 The Dashboard's **Scanner safety settings** apply to every ANC300 axis, manual
 move, vector/scalar map, and position dual-gate scan. Press **Apply and save safety
 settings** to persist changes in `value_storage`. Applying settings does not move
-the scanner.
+the scanner. Typed values change nothing until applied: meanwhile the button reads
+**(not applied yet)** in red, and its tooltip gives the settings ramps still use.
 
 Defaults are 0–60 V, a maximum ramp rate of **0.2 V/s**, and a maximum increment of
 **0.01 V**. The settings permit voltage bounds within 0–150 V, rates from
-0.001–1 V/s, and increments from 0.001–0.05 V. Choose limits appropriate to the
-connected scanner. Position dual-gate scans also retain their existing 60 V
-ceiling; their forward/return rates are capped by the Dashboard rate.
+0.001–5 V/s, and increments from 0.001–1 V (`MAX_RAMP_RATE` and `MAX_INCREMENT`
+in [`scanner_safety.py`](../scanner_safety.py); until 18 Nov 2026 they were 1 V/s
+and 0.05 V). Choose limits appropriate to the connected scanner. Position
+dual-gate scans also retain their existing 60 V ceiling; their forward/return
+rates are capped by the Dashboard rate.
+
+Every ramp, including maps, position scans and their slow X return, moves in equal
+steps no larger than the maximum increment and waits step ÷ rate before each one.
+Each step also exchanges 4 commands with the ANC300: offset and mode check
+(`geta`, `getm`), the write (`seta`) and the readback (`geta`). A small increment
+therefore makes long moves much slower than the set rate. While a ramp runs, the
+Dashboard stops polling the scanner; the ramp shows each verified step instead.
+Until 18 Nov 2026 a step also sent 5 more commands, the Dashboard's once-per-second
+poll added 6 between steps, and a step was limited to 0.05 s of travel at the
+rate, so at 1 V/s it never exceeded 0.05 V. An arrow click moves by the
+**Step size** beside the arrows (default 0.1 V); the increment only sets how that
+move is divided.
+
+A position scan's time per line is mostly these ramps. For example, X positions
+2 V apart at 1 V/s take at least 2 s per move, and a 40 V return at 0.2 V/s takes
+over 3 minutes. Raise the Dashboard rate and the scan's forward and return rates to
+shorten them.
 
 Entering an individual voltage and pressing Enter, clicking a scanner arrow,
 or using either XY motion button starts a background ramp. Both XY targets are
@@ -24,6 +44,13 @@ validated before either axis moves; X completes before Y starts.
 
 Every increment waits before writing and verifies the offset afterward. Errors,
 changed controller state, and readback mismatches halt motion without retries.
+An offset or mode reading that does not match within 1 mV is read once more after
+0.05 s, without writing anything: one stray reading only adds a line to the Device
+Manager's application log, and a second mismatch stops motion. The error then gives
+both readings, e.g. `Scanner axis 1 readback mismatch: requested 9.0500 V, read back
+9.0470 V, then 9.0470 V; ramp stopped.` (Until 18 Nov 2026 a single reading stopped
+it and the message gave no values; a position scan stopped that way once in about
+170 steps.)
 An existing offset outside newly tightened limits can ramp slowly back into the
 allowed range. Loading settings or opening the Dashboard never restores saved
 voltage targets. Invalid saved safety settings block motion until valid settings

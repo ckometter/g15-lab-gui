@@ -19,6 +19,7 @@ from measurement_data_paths import measurement_data_dir, measurement_start_text
 from measurement_filenames import dgs_filename
 from position_dgs import (SCANNER_MAX_VOLTAGE, MAX_SCAN_POSITIONS, PositionScanStore,
                           PositionSweepWorker, scan_axis, scanner_state, read_scanner_offsets)
+from scanner_safety import MAX_RAMP_RATE
 
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -67,7 +68,9 @@ class PositionDGSWindow(MainWindow):
                 ('settle', 'Position settling (s)', 0.2)), 3):
             box = QtWidgets.QDoubleSpinBox()
             box.setDecimals(3)
-            box.setRange(0 if key == 'settle' else 0.001, 10 if key == 'settle' else 1)
+            box.setRange(0 if key == 'settle' else 0.001, 10 if key == 'settle' else MAX_RAMP_RATE)
+            if key != 'settle':
+                box.setSingleStep(0.1)  # the default step of 1 V/s per arrow click is too coarse
             box.setValue(default)
             self.scan_inputs[key] = box
             layout.addWidget(QtWidgets.QLabel(title), row, 0, 1, 2)

@@ -17,6 +17,7 @@ from PyQt6 import QtCore, QtWidgets, QtTest
 from qcodes.station import Station
 from lab_gui import LabMainWindow
 from measurements.position_tab import PositionTab
+from scanner_safety import MAX_RAMP_RATE
 from station_devices import configure_device, remove_device
 
 
@@ -1066,6 +1067,15 @@ class DashboardWorkflowTests(unittest.TestCase):
         self.assertAlmostEqual(self.station.piezo300.get_voltage(1), 9)
         self.assertAlmostEqual(self.station.piezo300.get_voltage(2), 32.01)
         self.errors.assert_not_called()
+
+    def test_position_dgs_rates_go_up_to_the_dashboard_rate_cap(self):
+        # They stopped at 1 V/s, the Dashboard's cap until 18 Nov 2026.
+        window = self.dashboard.position_dgs_window
+        for key in ('move_rate', 'return_rate'):
+            box = window.scan_inputs[key]
+            self.assertEqual(box.maximum(), MAX_RAMP_RATE)
+            self.type_and_enter(box, '5')
+            self.assertEqual(box.value(), 5)
 
     def test_position_dgs_offset_button_reads_fresh_values_without_movement_or_mode_query(self):
         window = self.dashboard.position_dgs_window

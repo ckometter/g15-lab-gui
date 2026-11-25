@@ -143,20 +143,28 @@ if PhysicalANC300 is not None:
                 mode = str(self.ask(f'getm {axis}')).strip()
                 return {'offset': offset, 'output': output, 'mode': mode}
 
+        def get_offset_and_mode(self, axis):
+            """What a ramp checks before each step: 2 commands, without the output readback."""
+            with self.comm_lock:
+                offset = self.get_voltage(axis)
+                if self.simulated:
+                    return {'offset': offset, 'mode': 'off'}
+                return {'offset': offset, 'mode': str(self.ask(f'getm {axis}')).strip()}
+
         def _write_voltage_step(self, axis: int, val: float) -> None:
-            """Set a DC offset only in offset mode and verify its readback."""
+            """Send one ramp step: a single seta, no queries.
+
+            Only scanner_safety.ramp_offsets calls this, holding comm_lock. It has just
+            checked that the axis is in offset mode at the expected offset, and it reads
+            the offset back right after. Repeating both checks here, as until 18 Nov 2026,
+            cost 5 more commands per step.
+            """
             value = self._validate_voltage(axis, val)
             with self.comm_lock:
-                state = self.get_axis_status(axis)
-                if state['mode'] != 'off':
-                    raise RuntimeError(f"ANC300 axis {axis} is in {state['mode']!r} mode, not offset mode ('off'). No voltage or mode was changed.")
                 if self.simulated:
                     self._voltages[axis] = value
                     return
                 self._exchange(f'seta {axis} {value:.6f}')
-                actual = self.get_voltage(axis)
-                if not math.isclose(actual, value, rel_tol=0, abs_tol=0.01):
-                    raise RuntimeError(f"ANC300 axis {axis} offset readback is {actual:.3f} V after requesting {value:.3f} V. Check the controller before retrying.")
 
         def _set_voltage(self, val: float) -> None:
             # Backward compatibility method (acts on channel 1)

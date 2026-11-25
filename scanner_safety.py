@@ -8,8 +8,14 @@ import threading
 import time
 
 STORAGE_PATH = Path(__file__).resolve().parent / 'value_storage'
-MAX_RAMP_RATE = 1.0
-MAX_INCREMENT = 0.05
+# Fastest ramp rate the Dashboard accepts (1 V/s until 18 Nov 2026). Position DGS rates share it.
+MAX_RAMP_RATE = 5.0
+# Largest step the Dashboard accepts (0.05 V until 18 Nov 2026). Ramps move in equal steps of at
+# most the applied increment, and every step also exchanges 4 commands with the ANC300 (9 until
+# 18 Nov 2026), so a tiny increment makes long moves crawl.
+MAX_INCREMENT = 1.0
+READBACK_TOLERANCE_V = 0.001  # an offset readback must match the expected value this closely
+RECHECK_S = 0.05              # pause before reading an offset that did not match once more
 
 
 @dataclass(frozen=True)
@@ -60,12 +66,28 @@ def wait_for_motion(seconds, keep_running):
     return keep_running()
 
 
+def _offset_close(value, expected):
+    return math.isfinite(value) and math.isclose(value, expected, abs_tol=READBACK_TOLERANCE_V, rel_tol=0)
+
+
+def _ready_at(state, expected):
+    return state['mode'] == 'off' and _offset_close(float(state['offset']), expected)
+
+
+def _state_text(state):
+    return f"{float(state['offset']):.4f} V in mode {state['mode']!r}"
+
+
 def ramp_offsets(scanner, targets, settings, *, rate=None, keep_running=lambda: True,
                  progress=None, write=None, wait=None):
     """Validate every target before motion; never catch up with a larger step.
 
-    Wait BEFORE each increment, including the first and last. Cancellation leaves
-    the last verified voltage in place. No rollback or automatic write retries.
+    Move in equal steps no larger than the increment, and wait step / rate BEFORE
+    each one, including the first and last. Each step checks the axis mode and
+    offset, writes, and reads the offset back. A reading that does not match is
+    read once more before the ramp stops, so one stray reply does not end a scan;
+    both readings go into the error. Cancellation leaves the last verified voltage
+    in place. No rollback or automatic write retries.
     """
     rate = settings.rate if rate is None else float(rate)
     if not math.isfinite(rate) or rate <= 0:
@@ -86,25 +108,44 @@ def ramp_offsets(scanner, targets, settings, *, rate=None, keep_running=lambda: 
         starts[axis] = start
     write = write or scanner.set_voltage
     wait = wait or (lambda seconds: wait_for_motion(seconds, keep_running))
+    # The ANC300 driver skips the output readback here: 2 commands instead of 3.
+    check = getattr(scanner, 'get_offset_and_mode', scanner.get_axis_status)
     for axis, target in targets.items():
         start = starts[axis]
         distance = abs(target - start)
-        count = math.ceil(distance / min(settings.increment, rate * 0.05))
+        # The rate sets only the waits: steps used to be capped at 0.05 s of travel too,
+        # which kept them at 0.05 V even at 1 V/s. A rounding error adds no extra step.
+        count = math.ceil(distance / settings.increment - 1e-9) if distance else 0
         previous = start
         for index in range(1, count + 1):
             value = target if index == count else start + (target - start) * index / count
             if not keep_running() or not wait(abs(value - previous) / rate) or not keep_running():
                 return False
             with getattr(scanner, 'comm_lock', nullcontext()):
-                state = scanner.get_axis_status(axis)
-                if state['mode'] != 'off' or not math.isclose(float(state['offset']), previous, abs_tol=0.001, rel_tol=0):
-                    raise RuntimeError(f'Scanner axis {axis} changed during ramp; stopped.')
+                state = check(axis)
+                if not _ready_at(state, previous):
+                    time.sleep(RECHECK_S)
+                    again = check(axis)
+                    if not _ready_at(again, previous):
+                        raise RuntimeError(
+                            f'Scanner axis {axis} changed during ramp: expected {previous:.4f} V in offset '
+                            f"mode 'off', read {_state_text(state)}, then {_state_text(again)}; stopped.")
+                    print(f'Scanner axis {axis}: read {_state_text(state)} where {previous:.4f} V was '
+                          f'expected; a second read gave {_state_text(again)}, so the ramp continued.')
                 if not keep_running():
                     return False
                 write(axis, value)
                 actual = float(scanner.get_voltage(axis))
-                if not math.isfinite(actual) or not math.isclose(actual, value, abs_tol=0.001, rel_tol=0):
-                    raise RuntimeError(f'Scanner axis {axis} readback mismatch; ramp stopped.')
+                if not _offset_close(actual, value):
+                    time.sleep(RECHECK_S)
+                    again = float(scanner.get_voltage(axis))
+                    if not _offset_close(again, value):
+                        raise RuntimeError(
+                            f'Scanner axis {axis} readback mismatch: requested {value:.4f} V, read back '
+                            f'{actual:.4f} V, then {again:.4f} V; ramp stopped.')
+                    print(f'Scanner axis {axis}: read back {actual:.4f} V after requesting {value:.4f} V; '
+                          f'a second read gave {again:.4f} V, so the ramp continued.')
+                    actual = again
             previous = value
             if progress:
                 progress(axis, actual)
@@ -121,6 +162,10 @@ class SafeScannerMotion:
         except (ValueError, TypeError, OSError) as exc:
             self.scanner_settings = ScannerSettings()
             self.scanner_settings_error = f'Invalid saved scanner settings: {exc}. Apply valid settings before moving.'
+
+    def get_offset_and_mode(self, axis):
+        """Offset and mode, checked before every ramp step; drivers may skip slower readbacks."""
+        return self.get_axis_status(axis)
 
     def configure_motion(self, settings):
         if not isinstance(settings, ScannerSettings):
