@@ -187,3 +187,23 @@ Manager once the DAC is connected:
   details.
 - The GUI cannot tell whether the DAC is in tri-state, so initialize it whenever
   it has been powered off. A simulated DAC simply sets its outputs to 0 V.
+
+## Queued Dual-Gate runs
+
+The measurement queue ([MEASUREMENT_QUEUE.md](MEASUREMENT_QUEUE.md)) starts each
+run through Begin, so every run gets the checks above:
+
+- the whole sweep against ±210 V, the DAC range and the voltage windows;
+- voltage-source mode;
+- current limits confirmed on the instrument.
+
+Every entry is checked before the first run. The queue never changes outputs,
+windows, current limits, source modes or ramp rates, and it sends no instrument
+command of its own.
+
+- **Between runs**, the next Begin ramps the gates from where the last run left
+  them: V1, then V2, in steps of at most 0.05 V.
+- **After the last complete sweep**, the gates ramp to 0 V together if the
+  queue's **Ramp gates to 0 V after the last entry** (on by default) or the
+  entry's own box is on.
+- **On an error**, the queue stops and holds the gates.

@@ -68,3 +68,8 @@ start date: `yyyy_mm_dd_rest`, for example
 The date is also retained in measurement metadata and the existing dated data
 directory. A custom name chosen in the save dialog receives the same prefix.
 Programmatic saves to an explicitly supplied path keep that exact path.
+
+A Dual-Gate autosave never replaces an earlier one: a run that ends in the same
+second as another gets `_2`. A run started by the measurement queue is also saved
+under the name Save Dataset proposes plus its start time, for example
+`..._21x41_221930.h5`. See [MEASUREMENT_QUEUE.md](MEASUREMENT_QUEUE.md#files-and-the-record).

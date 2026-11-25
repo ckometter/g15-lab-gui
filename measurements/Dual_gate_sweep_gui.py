@@ -1145,6 +1145,20 @@ class MainWindow(QtWidgets.QMainWindow):
     allow_dac_gate_outputs = True
     # Expected End shows the estimated end, duration and pace (Position DGS: its own count).
     estimate_sweep_time = True
+    # After a run that Begin started: "finished", "error" or "stopped" (Reset), and a message.
+    # The measurement queue (measurements/dgs_queue.py) waits for it.
+    run_ended = QtCore.pyqtSignal(str, str)
+    # Set by the measurement queue for the run it starts ({"record", "entry", ...}). That run's
+    # messages then go to the status line and the log, not to dialogs that wait for a click,
+    # and its files get queue_* attributes.
+    queued_run = None
+
+    def tell_user(self, kind, title, text):
+        """A message box ("information", "warning" or "critical"); for a queued run, a log line."""
+        if self.queued_run is not None:
+            print(f"Dual-Gate Sweep (queue entry {self.queued_run.get('entry')}): {title}: {text}")
+            return
+        getattr(QtWidgets.QMessageBox, kind)(self, title, text)
 
     def __init__(self, station, embed=False):
         super().__init__()
@@ -4614,6 +4628,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if self.is_running:
             return
+        # Why this Begin did not start a run, for the measurement queue's record.
+        self.begin_blocked_reason = None
 
         try:
             validate_dgs_parameters({
@@ -4629,8 +4645,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if any(self.gate_is_dac(axis) for axis in (1, 2)):
                 find_dac(self.station)
         except Exception as exc:
+            self.begin_blocked_reason = str(exc)
             self.status_lbl.setText(f'Sweep blocked: {exc}')
-            QtWidgets.QMessageBox.critical(self, 'Gate protection', str(exc))
+            self.tell_user('critical', 'Gate protection', str(exc))
             return
         self.reset_slice_levels = True
 
@@ -4665,8 +4682,9 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as e:
                 self.station.live_status_paused = False
                 self.live_status_worker.resume()
+                self.begin_blocked_reason = f'cannot confirm current compliance: {e}'
                 self.status_lbl.setText(f'Sweep blocked: cannot confirm current compliance: {e}')
-                QtWidgets.QMessageBox.critical(self, 'Gate protection', self.status_lbl.text())
+                self.tell_user('critical', 'Gate protection', self.status_lbl.text())
                 return
 
         # Prepare parameters and validate
@@ -4748,8 +4766,9 @@ class MainWindow(QtWidgets.QMainWindow):
         _d = self.coeff_d.value()
         _det = _a * _d - _b * _c
         if abs(_det) < 1e-9:
-            QtWidgets.QMessageBox.warning(
-                self, "Singular Matrix",
+            self.begin_blocked_reason = f"The gate transformation matrix is singular (det = {_det:.2e})."
+            self.tell_user(
+                "warning", "Singular Matrix",
                 f"The gate transformation matrix is singular (det = {_det:.2e}).\n"
                 "Virtual gates cannot be converted to physical voltages.\n"
                 "Please adjust coefficients so that a·d − b·c ≠ 0."
@@ -4901,7 +4920,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.is_running = True
         self.is_paused = False
         self._autosaved_this_run = False
-        
+        # What the measurement queue's record keeps of this run.
+        self.last_autosave_path = None
+        self.last_timing_text = None
+        self.last_gate_targets = None
+        self.sweep_seconds_left = self.sweep_total_duration if self.estimate_sweep_time else None
+
         # Pause background status polling during active sweep to avoid SMU PyVISA collisions
         if hasattr(self, 'live_status_worker') and self.live_status_worker:
             self.live_status_worker.pause()
@@ -4994,7 +5018,7 @@ class MainWindow(QtWidgets.QMainWindow):
         was_running = self.is_running
         if self.is_running:
             self.trigger_autosave(was_interrupted=True)
-            self.sweep_timing_report()
+            self.last_timing_text = self.sweep_timing_report()
         if self.sweep_worker and self.sweep_worker.isRunning():
             self.sweep_worker.stop()
             self.sweep_worker.wait()
@@ -5017,6 +5041,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress_bar.setValue(0)
         self.lbl_expected_end.setText("Expected End: --:--:--")
         self.status_lbl.setText("Status: Reset complete")
+        if was_running:
+            self.run_ended.emit("stopped", "Stopped with Reset.")
 
     def on_point_measured(self, i, j, c1, c2, v1, v2, spectrum, curr_ch1, curr_ch2, meas_v1, meas_v2, meas_b, raw_frames):
         # Sort spectrum to align with increasing energy values
@@ -5073,6 +5099,7 @@ class MainWindow(QtWidgets.QMainWindow):
         active_elapsed = time.time() - self.sweep_start_time - paused
         # From a few points on, the overhead per point is this sweep's own pace.
         seconds_left = estimate.update(current, active_elapsed)
+        self.sweep_seconds_left = seconds_left
         self.lbl_expected_end.setText(expected_end_text(
             seconds_left, active_elapsed + seconds_left, total, basis=estimate.basis))
         # Kept (save_storage) as the next sweep's first estimate, when measured on hardware.
@@ -5118,6 +5145,7 @@ class MainWindow(QtWidgets.QMainWindow):
         group.attrs["point_overhead_basis"] = estimate.basis
 
     def on_sweep_voltage_updated(self, c1, c2, v1, v2):
+        self.last_gate_targets = (float(v1), float(v2))
         self.ch1_setpoint.setValue(v1)
         self.ch2_setpoint.setValue(v2)
         c1_label = self.c1_name_edit.text() if hasattr(self, "c1_name_edit") and self.c1_name_edit.text() else "C1"
@@ -5139,8 +5167,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.live_status_worker.resume()
         self.station.live_status_paused = False
         timing = self.sweep_timing_report()
-        QtWidgets.QMessageBox.information(self, "Sweep Complete", "Electrostatic gate sweep finished successfully!"
-                                          + (f"\n\n{timing}" if timing else ""))
+        self.last_timing_text = timing
+        self.tell_user("information", "Sweep Complete", "Electrostatic gate sweep finished successfully!"
+                       + (f"\n\n{timing}" if timing else ""))
+        self.run_ended.emit("finished", "")
 
     def on_sweep_error(self, err_msg):
         self.trigger_autosave(was_interrupted=True)
@@ -5153,8 +5183,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'live_status_worker') and self.live_status_worker:
             self.live_status_worker.resume()
         self.station.live_status_paused = False
-        self.sweep_timing_report()
-        QtWidgets.QMessageBox.critical(self, "Sweep Error", f"Measurement aborted due to error:\n{err_msg}")
+        self.last_timing_text = self.sweep_timing_report()
+        self.tell_user("critical", "Sweep Error", f"Measurement aborted due to error:\n{err_msg}")
+        self.run_ended.emit("error", str(err_msg))
 
     def prompt_save_on_interrupt(self):
         if not np.any(self.data_measured_mask):
@@ -5754,9 +5785,14 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.reset_slice_levels = False
 
+    def current_grid_matches(self):
+        """False after the point counts changed: the fields then describe the next sweep while
+        the current maps still hold the last one, and their slices cannot be cut."""
+        return np.shape(self.data_measured_mask) == (len(self.c2_coords), len(self.c1_coords))
+
     def on_tab2_crosshair_moved(self):
         """Update Tab 2 slices when its crosshair is dragged."""
-        if not np.any(self.data_measured_mask):
+        if not np.any(self.data_measured_mask) or not self.current_grid_matches():
             return
 
         c1_val = self.cross2_v.value()
@@ -5776,7 +5812,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_tab3_crosshair_moved(self):
         """Update Tab 3 slices when its crosshair is dragged."""
-        if not np.any(self.data_measured_mask):
+        if not np.any(self.data_measured_mask) or not self.current_grid_matches():
             return
 
         c1_val = self.cross3_v.value()
@@ -5921,6 +5957,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 f.attrs["measurement_started_at"] = measurement_start_text(
                     getattr(self, "measurement_started_at", None)
                 )
+                # A queued run: its record, entry number and note (docs/MEASUREMENT_QUEUE.md).
+                for key, value in (self.queued_run or {}).items():
+                    f.attrs[f"queue_{key}"] = value
 
             self.status_lbl.setText(f"Status: Saved {os.path.basename(filename)}")
             if file_path is None:
@@ -5928,6 +5967,7 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 print(f"Auto-saved data to {filename}")
             self.save_storage()
+            return filename
         except Exception as e:
             if file_path is None:
                 QtWidgets.QMessageBox.critical(self, "Save Error", f"Could not save dataset:\n{e}")
@@ -5949,8 +5989,12 @@ class MainWindow(QtWidgets.QMainWindow):
         filename = f"autosave_gate_sweep_{timestamp[-6:]}{suffix}.h5"
         filename = dated_measurement_filename(filename, getattr(self, "measurement_started_at", None))
         file_path = os.path.join(autosave_dir, filename)
+        # Never replace an earlier run's autosave: queued runs can end in the same second.
+        stem, number = file_path[:-len(".h5")], 2
+        while os.path.exists(file_path):
+            file_path, number = f"{stem}_{number}.h5", number + 1
         try:
-            self.save_sweep_data(file_path=file_path)
+            self.last_autosave_path = self.save_sweep_data(file_path=file_path)
             self._autosaved_this_run = True
         except Exception as e:
             print(f"Auto-save trigger failed: {e}")
