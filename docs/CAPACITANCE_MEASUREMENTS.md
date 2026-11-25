@@ -186,8 +186,8 @@ The tests use simulated instruments and fake I/O only:
 - The voltage limits are code/GUI bounds, not a guarantee for a particular
   sample. Set **Max |V|** and the dielectric limits for your device before
   measuring; the defaults (10 V) are not sample-specific.
-- Stop, errors and Data plotter mode leave the electrodes at their present
-  voltages; nothing is grounded automatically.
+- Stop and errors leave the electrodes at their present voltages; nothing is
+  grounded automatically.
 - With **Configure AWG at start** checked, Begin and Balance now enable both
   AWG outputs, as the original script did.
 - The uVoltDAQ has no current compliance; only Keysight outputs limit leakage.

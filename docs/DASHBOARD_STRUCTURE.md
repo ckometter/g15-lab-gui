@@ -15,6 +15,17 @@
 
 Indices are positional; new tabs are appended so earlier indices stay valid.
 
+## Data plotter (a separate program)
+
+Saved files open in the Data plotter, [`data_plotter.py`](../data_plotter.py),
+which runs as its own process ([DATA_PLOTTER_AND_LIVE.md](DATA_PLOTTER_AND_LIVE.md)).
+It hosts the analysis windows of every measurement tab (0–4 and 7–9; not the
+Dashboard or Polarization control tabs) on simulated devices, with their
+acquisition controls hidden and their pollers stopped. The dashboard's **Open
+Data plotter…** button only starts that program; the dashboard has no plotter
+mode of its own. A new measurement tab needs a reader and a display function in
+`data_plotter.py` to appear there.
+
 ## Gate-map tabs (8, 9)
 
 These tabs sweep the same three electrodes (top gate, bottom gate, sample)
@@ -41,10 +52,10 @@ changes to the dashboard's tab handling.
 - **Spectroscopy tabs (0–4, 7).** Each has its own view popup, live poller and
   sweep worker. The copies have diverged (45–70 % similar line by line). Each
   one carries tab-specific safety behaviour: current compliance, manual ramps,
-  live alignment and Data plotter mode. Merging them, or Vector Map with
-  Scalar Map (57 % similar), would mean rewriting working, safety-tuned code
-  for little gain in use. If they are reworked later, a good first step is one
-  shared view popup in `measurements/utils.py`.
+  live alignment and the plotter mode the Data plotter uses. Merging them, or
+  Vector Map with Scalar Map (57 % similar), would mean rewriting working,
+  safety-tuned code for little gain in use. If they are reworked later, a good
+  first step is one shared view popup in `measurements/utils.py`.
 - **Capacitance and Transport** stay separate tabs, although they share all
   of the code above. They need different instruments and wiring, and two tabs
   keep each one's settings and last run on screen.

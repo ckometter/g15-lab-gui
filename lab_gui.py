@@ -40,8 +40,6 @@ class LabMainWindow(QtWidgets.QMainWindow):
         self.station = station
         self.device_manager = device_manager
         self.devices_changing = False
-        self.plotter_mode = False
-        self._plotter_transition = False
         from station_devices import ensure_simulated_devices
         ensure_simulated_devices(station)
         self.setWindowTitle("G15‑Qcodes Lab Dashboard")
@@ -108,31 +106,19 @@ class LabMainWindow(QtWidgets.QMainWindow):
         # save_storage(), reload_gui_from_storage(), live_status_worker, shutdown().
         self.gate_map_tabs = {CAPACITANCE_TAB: self.capacitance_window, TRANSPORT_TAB: self.transport_window}
 
-        for index, window in ((0, self.single_window), (1, self.dual_window), (7, self.position_dgs_window)):
+        for window in (self.single_window, self.dual_window):
             window.dashboard = self
-            window.plotter_mode = False
-            # QTabWidget reparents the embedded central widgets away from their
-            # QMainWindow wrappers; retain the actual panel for display state.
-            window._panel_widget = self.tab_widget.widget(index)
-        from data_plotter import DataPlotter
-        self.data_plotter = DataPlotter(self)
-        self.mode_toolbar = QtWidgets.QToolBar('App mode', self)
-        self.mode_toolbar.setMovable(False)
-        self.mode_toolbar.addWidget(QtWidgets.QLabel('  Measurement  '))
-        self.mode_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.mode_slider.setRange(0, 1)
-        self.mode_slider.setFixedWidth(58)
-        self.mode_slider.setAccessibleName('Measurement or Data plotter mode')
-        self.mode_slider.setToolTip('Switch while idle. Data plotter pauses device polling and preserves measurement setup.')
-        self.mode_slider.valueChanged.connect(lambda value: self.set_plotter_mode(bool(value)))
-        self.mode_toolbar.addWidget(self.mode_slider)
-        self.mode_toolbar.addWidget(QtWidgets.QLabel('  Data plotter  '))
-        self.mode_status = QtWidgets.QLabel('Measurement controls active')
-        self.mode_toolbar.addWidget(self.mode_status)
-        self.addToolBar(self.mode_toolbar)
-        self._plotter_timer = QtCore.QTimer(self)
-        self._plotter_timer.setInterval(25)
-        self._plotter_timer.timeout.connect(self._finish_plotter_entry)
+        # Saved data open in the separate Data plotter program (data_plotter.py), so
+        # loading and plotting never compete with a running acquisition.
+        self.plotter_toolbar = QtWidgets.QToolBar('Data plotter', self)
+        self.plotter_toolbar.setMovable(False)
+        self.plotter_button = QtWidgets.QPushButton('Open Data plotter…')
+        self.plotter_button.setToolTip('Open the saved files of any measurement tab in a separate, '
+                                       'read-only program. It is safe during measurements: it never '
+                                       'locks or writes files and never contacts devices.')
+        self.plotter_button.clicked.connect(self.open_data_plotter)
+        self.plotter_toolbar.addWidget(self.plotter_button)
+        self.addToolBar(self.plotter_toolbar)
 
         # Connect tab change signal to reload values from value_storage
         self.tab_widget.currentChanged.connect(self.on_tab_changed)
@@ -209,95 +195,18 @@ class LabMainWindow(QtWidgets.QMainWindow):
         from gui_safety import install_parameter_wheel_guard
         install_parameter_wheel_guard(self)
 
-    def set_plotter_mode(self, enabled):
-        """Switch only when idle; do not issue source or movement commands."""
-        if self._plotter_transition or self.data_plotter.busy():
-            with QtCore.QSignalBlocker(self.mode_slider):
-                self.mode_slider.setValue(int(self.plotter_mode))
-            return False
-        if enabled == self.plotter_mode:
-            return True
-        if self.devices_changing or self.measurement_active() or (self.device_manager and self.device_manager.is_busy()):
-            with QtCore.QSignalBlocker(self.mode_slider):
-                self.mode_slider.setValue(int(self.plotter_mode))
-            self.statusBar().showMessage('Finish the active measurement, motion, or device connection before switching modes.', 6000)
-            return False
-        with QtCore.QSignalBlocker(self.mode_slider):
-            self.mode_slider.setValue(int(enabled))
-        if enabled:
-            self._measurement_tab = self.tab_widget.currentIndex()
-            self._previous_polling_paused = getattr(self.station, 'live_status_paused', False)
-            self.plotter_mode = True
-            self._plotter_transition = True
-            for window in self.data_plotter.windows.values():
-                window.plotter_mode = True
-            self.station.live_status_paused = True
-            self.mode_slider.setEnabled(False)
-            self.tab_widget.setEnabled(False)
-            self.mode_status.setText('Waiting for the current device read to finish…')
-            self.position_tab.polling_timer.stop()
-            self._plotter_pollers = []
-            for window, attribute in ((self.single_window, 'status_worker'),
-                                      (self.dual_window, 'live_status_worker'),
-                                      (self.position_dgs_window, 'live_status_worker'),
-                                      (self.pl_map_window, 'live_status_worker'),
-                                      (self.scalar_map_window, 'live_status_worker'),
-                                      *[(window, 'live_status_worker') for window in self.gate_map_tabs.values()],
-                                      (self.pol_window, 'worker')):
-                worker = getattr(window, attribute, None)
-                if worker is not None and worker.isRunning():
-                    self._plotter_pollers.append(worker)
-                    worker.stop()
-            self._plotter_timer.start()
-            self._finish_plotter_entry()
-        else:
-            self.data_plotter.leave()
-            self.plotter_mode = False
-            for window in self.data_plotter.windows.values():
-                window.plotter_mode = False
-            self.station.live_status_paused = self._previous_polling_paused
-            with QtCore.QSignalBlocker(self.tab_widget):
-                for index in range(self.tab_widget.count()):
-                    self.tab_widget.setTabVisible(index, True)
-                    self.tab_widget.setTabEnabled(index, True)
-                self.tab_widget.setCurrentIndex(self._measurement_tab)
-            self.current_tab_idx = self._measurement_tab
-            for worker in self._plotter_pollers:
-                if hasattr(worker, '_stop_requested'):
-                    worker._stop_requested = False
-                if hasattr(worker, '_is_running'):
-                    worker._is_running = True
-                if hasattr(worker, '_is_paused'):
-                    worker._is_paused = True
-                worker.start()
-            self.mode_status.setText('Measurement controls active')
-            self.check_measurement_status()
-        return True
+    def open_data_plotter(self):
+        """Start the separate, read-only Data plotter; allowed at any time, also while measuring.
 
-    def _finish_plotter_entry(self):
-        if not self._plotter_transition:
-            return
-        if any(worker.isRunning() for worker in self._plotter_pollers):
-            return
-        self._plotter_timer.stop()
+        It changes nothing in this program: no polling, tab, setting or device state.
+        """
+        from data_plotter import launch
         try:
-            self.data_plotter.enter()
-        except Exception as exc:
-            self._plotter_transition = False
-            self.tab_widget.setEnabled(True)
-            self.set_plotter_mode(False)
-            self.statusBar().showMessage(f'Could not enter Data plotter: {exc}', 10000)
+            launch()
+        except OSError as exc:
+            self.statusBar().showMessage(f'Could not start the Data plotter: {exc}', 10000)
             return
-        with QtCore.QSignalBlocker(self.tab_widget):
-            for index in range(self.tab_widget.count()):
-                self.tab_widget.setTabVisible(index, index in (0, 1, 7))
-                self.tab_widget.setTabEnabled(index, index in (0, 1, 7))
-            if self.tab_widget.currentIndex() not in (0, 1, 7):
-                self.tab_widget.setCurrentIndex(0)
-        self._plotter_transition = False
-        self.tab_widget.setEnabled(True)
-        self.mode_slider.setEnabled(True)
-        self.mode_status.setText('Read-only saved data · polling and acquisition off')
+        self.statusBar().showMessage('Data plotter is starting as a separate, read-only program.', 6000)
 
     def apply_theme(self):
         """Premium light theme styling matching Single Spectra applied globally to the main dashboard window, tab bar, and unstyled tabs."""
@@ -315,8 +224,7 @@ class LabMainWindow(QtWidgets.QMainWindow):
 
     def show_levelmeter(self):
         """Clicking the helium status shows its plot (refused while another tab measures)."""
-        if not self.plotter_mode:
-            self.tab_widget.setCurrentIndex(5)
+        self.tab_widget.setCurrentIndex(5)
 
     def measurement_active(self):
         # The polarization worker runs continuously for polling, even when idle.
@@ -394,7 +302,7 @@ class LabMainWindow(QtWidgets.QMainWindow):
             self.lf_label.setStyleSheet("color: #059669; font-weight: bold;")
 
     def prepare_device_change(self):
-        if self.plotter_mode or self.devices_changing or self.measurement_active():
+        if self.devices_changing or self.measurement_active():
             return False
         self.devices_changing = True
         self.centralWidget().setEnabled(False)
@@ -461,9 +369,6 @@ class LabMainWindow(QtWidgets.QMainWindow):
         self.check_measurement_status()
 
     def on_tab_changed(self, index):
-        if self.plotter_mode:
-            self.data_plotter.show_current_file()
-            return
         previous = getattr(self, 'current_tab_idx', 0)
         if index != previous and self.measurement_active():
             live_alignment = (getattr(self.single_window, 'is_running', False)
@@ -564,9 +469,6 @@ class LabMainWindow(QtWidgets.QMainWindow):
         self.check_measurement_status()
 
     def check_measurement_status(self):
-        if self.plotter_mode:
-            return
-        self.mode_slider.setEnabled(not self.devices_changing and not self.measurement_active())
         camera = getattr(self.station, "camera", None)
         if camera is not None and not camera.simulated and camera.spectrometer_type == "lightfieldG11":
             health = camera.remote_lf.acquisition_health
@@ -706,10 +608,6 @@ class LabMainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage('Stopping scanner / stepper motion before closing...')
             QtCore.QTimer.singleShot(100, self.close)
             return
-        if self.data_plotter.busy() or self._plotter_transition:
-            event.ignore()
-            self.statusBar().showMessage('Wait for file loading or the mode transition to finish before closing.', 5000)
-            return
         control_worker = getattr(self.single_window, "control_worker", None)
         if control_worker is not None and control_worker.isRunning():
             event.ignore()
@@ -828,13 +726,6 @@ class LabMainWindow(QtWidgets.QMainWindow):
                 window.shutdown()
             except Exception:
                 pass
-        if self.plotter_mode:
-            # Restore the measurement forms before the usual close-time saves.
-            # Keep plotter guards active; shutdown must not restart polling.
-            self.data_plotter.leave()
-            for window in self.data_plotter.windows.values():
-                window.plotter_mode = True
-        self.data_plotter.shutdown()
         from gui_safety import uninstall_parameter_wheel_guard
         # Embedded DGS wrappers retain their own filters even after their
         # central widgets are reparented into the dashboard's tabs.

@@ -374,21 +374,25 @@ def write_capacitance_file(path, *, plan, data, mask, balances, attrs, settings,
 
 def read_capacitance_file(path):
     with h5py.File(path, "r") as f:
-        if f.attrs.get("schema") != FILE_SCHEMA:
-            raise ValueError("This file is not a capacitance-bridge measurement saved by this dashboard.")
-        settings = json.loads(f["metadata/settings"][()])
-        names = {"capacitance": "capacitance_ratio", "dissipation": "dissipation_ratio",
-                 "sensitivity": "lockin_sensitivity"}
-        data = {key: np.array(f[names.get(key, key)]) for key in POINT_FIELDS}
-        for key in INT_FIELDS:
-            data[key] = np.array(f[key])
-        result = {
-            "settings": settings, "data": data, "mask": np.array(f["measured_mask"], dtype=bool),
-            **read_plan_datasets(f),
-            "balances": json.loads(f["balance/records_json"][()]),
-            "attrs": {key: f.attrs[key] for key in f.attrs},
-        }
-    return result
+        return parse_capacitance_file(f)
+
+
+def parse_capacitance_file(f):
+    """The contents of an open capacitance file; the Data plotter opens it without a lock."""
+    if f.attrs.get("schema") != FILE_SCHEMA:
+        raise ValueError("This file is not a capacitance-bridge measurement saved by this dashboard.")
+    settings = json.loads(f["metadata/settings"][()])
+    names = {"capacitance": "capacitance_ratio", "dissipation": "dissipation_ratio",
+             "sensitivity": "lockin_sensitivity"}
+    data = {key: np.array(f[names.get(key, key)]) for key in POINT_FIELDS}
+    for key in INT_FIELDS:
+        data[key] = np.array(f[key])
+    return {
+        "settings": settings, "data": data, "mask": np.array(f["measured_mask"], dtype=bool),
+        **read_plan_datasets(f),
+        "balances": json.loads(f["balance/records_json"][()]),
+        "attrs": {key: f.attrs[key] for key in f.attrs},
+    }
 
 
 # ---------------------------------------------------------------------------
