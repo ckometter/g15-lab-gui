@@ -1,7 +1,7 @@
 """Background scanner ramps and counted stepper moves."""
 from PyQt6 import QtCore, QtWidgets
 
-from scanner_safety import ScannerSettings, move_scanner, wait_for_motion
+from scanner_safety import MAX_INCREMENT, MAX_RAMP_RATE, ScannerSettings, move_scanner, wait_for_motion
 
 STEPPER_AXES = {1: 'X', 2: 'Y', 3: 'Z'}
 # Counted stepper moves are sent as bursts: one "stepu/stepd <axis> <n>" command makes n steps at the
@@ -11,6 +11,7 @@ STEPPER_AXES = {1: 'X', 2: 'Y', 3: 'Z'}
 BURST_S = 0.25
 BURST_MARGIN_S = 0.02    # extra wait so a burst has finished before the next command
 ERROR_STYLE = 'color: #b91c1c; font-weight: bold;'
+APPLY_SETTINGS_TEXT = 'Apply and save safety settings'
 
 
 class ScannerMotionWorker(QtCore.QThread):
@@ -151,8 +152,8 @@ class PositionMotionControls:
         for key, label, limits in (
                 ('minimum', 'Minimum voltage (V)', (0, 150)),
                 ('maximum', 'Maximum voltage (V)', (0, 150)),
-                ('rate', 'Maximum ramp rate (V/s)', (0.001, 1)),
-                ('increment', 'Maximum increment (V)', (0.001, 0.05))):
+                ('rate', 'Maximum ramp rate (V/s)', (0.001, MAX_RAMP_RATE)),
+                ('increment', 'Maximum increment (V)', (0.001, MAX_INCREMENT))):
             box = QtWidgets.QDoubleSpinBox()
             box.setDecimals(3)
             box.setRange(*limits)
@@ -160,9 +161,22 @@ class PositionMotionControls:
             box.setKeyboardTracking(False)
             self.scanner_setting_inputs[key] = box
             form.addRow(label, box)
-        self.apply_scanner_settings_btn = QtWidgets.QPushButton('Apply and save safety settings')
+        # Arrow clicks change these in small steps; the default step of 1 is far too coarse here.
+        self.scanner_setting_inputs['rate'].setSingleStep(0.1)
+        increment = self.scanner_setting_inputs['increment']
+        increment.setSingleStep(0.01)
+        increment.setToolTip(f'Largest voltage step of every scanner ramp (0.001 to {MAX_INCREMENT:g} V). '
+                             'Ramps move in equal steps of at most this size and wait step / rate before '
+                             'each. Every step also waits for several controller readbacks, so a small '
+                             'increment makes long moves slow.')
+        self.apply_scanner_settings_btn = QtWidgets.QPushButton(APPLY_SETTINGS_TEXT)
         self.apply_scanner_settings_btn.clicked.connect(self.apply_scanner_settings)
         form.addRow(self.apply_scanner_settings_btn)
+        # Typed values change nothing until applied (easy to miss, as on 18 Nov 2026): mark the button.
+        for box in self.scanner_setting_inputs.values():
+            box.valueChanged.connect(lambda _value: self.show_unapplied_scanner_settings())
+            box.editingFinished.connect(self.show_unapplied_scanner_settings)
+            box.lineEdit().textEdited.connect(lambda _text: self.show_unapplied_scanner_settings(typing=True))
         layout.addWidget(self.scanner_settings_group)
         note = QtWidgets.QLabel('All moves ramp slowly, including arrow buttons, Enter, setscan and measurement scans. '
                                'Stop holds the reached voltage. Targets outside the saved limits are rejected.')
@@ -176,6 +190,20 @@ class PositionMotionControls:
         error = getattr(self.scanner_controller, 'scanner_settings_error', '')
         if error:
             self._scanner_command_error = error
+        self.show_unapplied_scanner_settings()
+
+    def show_unapplied_scanner_settings(self, typing=False):
+        """Mark the Apply button while the boxes hold values that ramps do not use yet."""
+        applied = getattr(self.scanner_controller, 'scanner_settings', None)
+        pending = applied is not None and (typing or any(
+            abs(box.value() - getattr(applied, key)) > 5e-4 for key, box in self.scanner_setting_inputs.items()))
+        button = self.apply_scanner_settings_btn
+        button.setText(APPLY_SETTINGS_TEXT + (' (not applied yet)' if pending else ''))
+        button.setStyleSheet(ERROR_STYLE if pending else '')
+        button.setToolTip('' if applied is None else
+                          f'Ramps now use {applied.minimum:g} to {applied.maximum:g} V, at most '
+                          f'{applied.rate:g} V/s, in steps of at most {applied.increment:g} V.'
+                          + (' Values typed above take effect only when you press this button.' if pending else ''))
 
     def apply_scanner_settings(self):
         try:
@@ -188,6 +216,7 @@ class PositionMotionControls:
                                            'Safety settings applied for this session, but saving failed.')
         except Exception as exc:
             self._scanner_command_error = str(exc)
+        self.show_unapplied_scanner_settings()
         self.refresh_scanner_readbacks()
 
     def execute_scan_command(self):

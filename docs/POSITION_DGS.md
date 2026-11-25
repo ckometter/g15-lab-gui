@@ -54,8 +54,11 @@ The software does not change the controller mode to force movement.
 
 Each line scans X from low to high. X then ramps back to the line start **before**
 Y advances. The last line also returns X to its start; Y stays at the final line.
-The default forward/Y ramp rate is 0.5 V/s and return rate is 0.2 V/s, with
-increments at most 0.05 V. Both rates and the position settling time are editable.
+The default forward/Y ramp rate is 0.5 V/s and return rate is 0.2 V/s, in steps
+no larger than the Dashboard's maximum increment (see
+[position_motion.md](position_motion.md)). Both rates (up to 5 V/s, and never
+faster than the Dashboard's maximum ramp rate) and the position settling time
+are editable.
 The return rate cannot exceed the forward rate. Initial positioning also ramps
 from freshly read offsets, rather than assuming the scanner is at zero.
 

@@ -288,7 +288,12 @@ class PositionTab(PositionMotionControls, QtWidgets.QWidget):
         label.setToolTip(problem)
 
     def poll_voltages(self):
-        self.refresh_scanner_readbacks()
+        # While a ramp (here, a map or a position scan) holds the scanner, it reports each
+        # verified step itself. Reading both axes between its steps took 6 commands and
+        # delayed the next step.
+        motion_lock = getattr(self.scanner_controller, 'motion_lock', None)
+        if motion_lock is None or not motion_lock.locked():
+            self.refresh_scanner_readbacks()
         self.refresh_stepper_coordinates()
         if self.stepper_moving():
             return
