@@ -9,13 +9,13 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from PyQt6 import QtTest, QtWidgets
+from PyQt6 import QtCore, QtTest, QtWidgets
 
 from drivers.attocube_anc150 import AttocubeANC150
 from drivers.attocube_anc300 import AttocubeANC300
 from fake_anc150 import FakeANC150Port, connect_fake
 from measurements.position_tab import PositionTab
-from scanner_safety import ScannerSettings
+from scanner_safety import MAX_INCREMENT, MAX_RAMP_RATE, ScannerSettings
 
 
 class PositionMotionTests(unittest.TestCase):
@@ -86,6 +86,101 @@ class PositionMotionTests(unittest.TestCase):
         self.assertAlmostEqual(elapsed, (.035 + .02 + .02) / .2)
         self.assertAlmostEqual(self.scanner.get_voltage(1), .015)
 
+    def test_increment_above_old_cap_sets_the_step_even_at_full_rate(self):
+        # Until 18 Nov 2026 a step was also capped at 0.05 s of travel, so at 1 V/s
+        # every ramp crawled in 0.05 V steps whatever increment was applied.
+        events = []
+        original = self.scanner._write_voltage_step
+        def write(axis, value):
+            events.append(('write', value))
+            original(axis, value)
+        def wait(seconds, keep_running):
+            events.append(('wait', seconds))
+            return keep_running()
+        self.scanner._voltages[1] = 32.099
+        self.scanner.configure_motion(ScannerSettings(rate=1, increment=.5))
+        with patch('scanner_safety.wait_for_motion', side_effect=wait), \
+             patch.object(self.scanner, '_write_voltage_step', side_effect=write):
+            self.assertTrue(self.scanner.ramp_voltages({1: 33.299}))
+            self.assertEqual([kind for kind, _ in events], ['wait', 'write'] * 3)
+            for (_, seconds), (_, value), expected in zip(events[::2], events[1::2], (32.499, 32.899, 33.299)):
+                self.assertAlmostEqual(seconds, .4)
+                self.assertAlmostEqual(value, expected)
+            # 33.299 + 0.1 differs from 33.299 by slightly more than 0.1 V: still one step.
+            events.clear()
+            self.scanner.configure_motion(ScannerSettings(rate=1, increment=.1))
+            self.assertTrue(self.scanner.ramp_voltages({1: .1}, relative=True))
+            self.assertEqual([kind for kind, _ in events], ['wait', 'write'])
+            self.assertAlmostEqual(events[0][1], .1)
+        self.assertAlmostEqual(self.scanner.get_voltage(1), 33.399)
+
+    def test_dashboard_accepts_typed_rate_and_increment_above_the_old_caps(self):
+        # Until 18 Nov 2026 these boxes stopped at 1 V/s and 0.05 V.
+        tab = self.tab()
+        boxes = tab.scanner_setting_inputs
+        self.assertEqual(boxes['rate'].maximum(), MAX_RAMP_RATE)
+        self.assertEqual(boxes['increment'].maximum(), MAX_INCREMENT)
+        with tempfile.TemporaryDirectory() as directory:
+            with patch('measurements.position_tab.parent_dir', directory), \
+                 patch.object(self.scanner, '_write_voltage_step') as write:
+                for key, text in (('rate', '5'), ('increment', '0.5')):
+                    boxes[key].selectAll()
+                    QtTest.QTest.keyClicks(boxes[key], text)
+                    QtTest.QTest.keyClick(boxes[key], QtCore.Qt.Key.Key_Return)
+                tab.apply_scanner_settings()
+                saved = json.loads((Path(directory) / 'value_storage').read_text())['position']['scanner_safety']
+            write.assert_not_called()
+        self.assertEqual((saved['rate'], saved['increment']), (5, .5))
+        settings = self.scanner.scanner_settings
+        self.assertEqual((settings.rate, settings.increment), (5, .5))
+        waits = []
+        with patch('scanner_safety.wait_for_motion', side_effect=lambda seconds, keep_running: waits.append(seconds) or True):
+            self.assertTrue(self.scanner.ramp_voltages({1: 1}))
+        self.assertEqual(len(waits), 2)  # two 0.5 V steps, each after 0.1 s at 5 V/s
+        for seconds in waits:
+            self.assertAlmostEqual(seconds, .1)
+        self.assertAlmostEqual(self.scanner.get_voltage(1), 1)
+
+    def test_apply_button_is_marked_while_typed_settings_are_not_applied(self):
+        # On 18 Nov 2026 typed values looked applied, but ramps kept using 1 V/s.
+        tab = self.tab()
+        button, rate = tab.apply_scanner_settings_btn, tab.scanner_setting_inputs['rate']
+        def type_text(box, text, enter=True):
+            box.selectAll()
+            QtTest.QTest.keyClicks(box, text)
+            if enter:
+                QtTest.QTest.keyClick(box, QtCore.Qt.Key.Key_Return)
+        self.assertEqual(button.text(), 'Apply and save safety settings')
+        self.assertIn('at most 0.2 V/s', button.toolTip())
+        type_text(rate, '5', enter=False)
+        self.assertEqual(button.text(), 'Apply and save safety settings (not applied yet)')  # while typing
+        QtTest.QTest.keyClick(rate, QtCore.Qt.Key.Key_Return)
+        self.assertIn('not applied yet', button.text())
+        self.assertIn('color: #b91c1c', button.styleSheet())
+        self.assertEqual(self.scanner.scanner_settings.rate, .2)  # ramps still use the old rate
+        with tempfile.TemporaryDirectory() as directory, patch('measurements.position_tab.parent_dir', directory):
+            tab.apply_scanner_settings()
+            self.assertEqual(self.scanner.scanner_settings.rate, 5)
+            self.assertEqual((button.text(), button.styleSheet()), ('Apply and save safety settings', ''))
+            self.assertIn('at most 5 V/s', button.toolTip())
+            type_text(rate, '5')  # the applied value typed again: unmarked after Enter
+            self.assertNotIn('not applied', button.text())
+            type_text(tab.scanner_setting_inputs['minimum'], '70')  # above the maximum: Apply refuses it
+            tab.apply_scanner_settings()
+            self.assertIn('not applied yet', button.text())
+            self.assertEqual(self.scanner.scanner_settings.minimum, 0)
+        tab.sync_scanner_settings()  # reloading the tab shows the applied values again
+        self.assertEqual(tab.scanner_setting_inputs['minimum'].value(), 0)
+        self.assertNotIn('not applied', button.text())
+
+    def test_settings_accept_rates_and_increments_up_to_their_caps_only(self):
+        settings = ScannerSettings(rate=MAX_RAMP_RATE, increment=MAX_INCREMENT)
+        self.assertEqual((settings.rate, settings.increment), (MAX_RAMP_RATE, MAX_INCREMENT))
+        with self.assertRaisesRegex(ValueError, f'0.001 to {MAX_RAMP_RATE:g} V/s'):
+            ScannerSettings(rate=MAX_RAMP_RATE + .001)
+        with self.assertRaisesRegex(ValueError, f'0.001 to {MAX_INCREMENT:g} V'):
+            ScannerSettings(increment=MAX_INCREMENT + .001)
+
     def test_limits_nonfinite_and_multi_axis_preflight_send_no_writes(self):
         self.scanner.configure_motion(ScannerSettings(maximum=10))
         with patch.object(self.scanner, '_write_voltage_step') as write:
@@ -114,14 +209,73 @@ class PositionMotionTests(unittest.TestCase):
 
     def test_external_change_or_readback_mismatch_stops_ramp(self):
         with self.fast_wait(), patch.object(self.scanner, '_write_voltage_step') as write:
-            with self.assertRaisesRegex(RuntimeError, 'readback mismatch'):
+            with self.assertRaisesRegex(RuntimeError, r'readback mismatch: requested 0\.0100 V, '
+                                                      r'read back 0\.0000 V, then 0\.0000 V'):
                 self.scanner.set_voltage(1, .1)
             self.assertEqual(write.call_count, 1)
-        with self.fast_wait(), patch.object(self.scanner, 'get_axis_status', side_effect=[
-                {'offset': 0, 'mode': 'off'}, {'offset': 1, 'mode': 'off'}]), patch.object(self.scanner, '_write_voltage_step') as write:
-            with self.assertRaisesRegex(RuntimeError, 'changed during ramp'):
+        # The check before each step reads the offset and mode; a change seen twice stops the ramp.
+        with self.fast_wait(), patch.object(self.scanner, 'get_axis_status', return_value={'offset': 0, 'mode': 'off'}), \
+             patch.object(self.scanner, 'get_offset_and_mode', return_value={'offset': 1, 'mode': 'off'}) as check, \
+             patch.object(self.scanner, '_write_voltage_step') as write:
+            with self.assertRaisesRegex(RuntimeError, r"changed during ramp: expected 0\.0000 V in offset mode 'off', "
+                                                      r"read 1\.0000 V in mode 'off', then 1\.0000 V in mode 'off'"):
                 self.scanner.set_voltage(1, .1)
             write.assert_not_called()
+            self.assertEqual(check.call_count, 2)
+
+    def test_one_stray_readback_is_read_again_but_a_wrong_offset_still_stops(self):
+        # On 18 Nov 2026 a position scan stopped on a single readback mismatch.
+        self.scanner._voltages[1] = 8.0
+        self.scanner.configure_motion(ScannerSettings(rate=1, increment=1))
+        real = self.scanner.get_voltage
+        replies = iter([None, None, 9.004])  # the third read is the first step's readback
+        def stray_once(axis):
+            reply = next(replies, None)
+            return real(axis) if reply is None else reply
+        with self.fast_wait(), patch.object(self.scanner, 'get_voltage', side_effect=stray_once), \
+             patch('builtins.print') as log:
+            self.assertTrue(self.scanner.ramp_voltages({1: 10}))
+        self.assertEqual(self.scanner._voltages[1], 10)
+        log.assert_called_once()
+        self.assertIn('read back 9.0040 V after requesting 9.0000 V; a second read gave 9.0000 V',
+                      log.call_args.args[0])
+        # An offset that reads wrong twice still stops the ramp before any further step.
+        wrong_at_11 = lambda axis: 10.5 if self.scanner._voltages[1] == 11 else real(axis)
+        with self.fast_wait(), patch.object(self.scanner, 'get_voltage', side_effect=wrong_at_11), \
+             patch.object(self.scanner, '_write_voltage_step', wraps=self.scanner._write_voltage_step) as write:
+            with self.assertRaisesRegex(RuntimeError, r'requested 11\.0000 V, read back 10\.5000 V, then 10\.5000 V'):
+                self.scanner.ramp_voltages({1: 12})
+            self.assertEqual(write.call_count, 1)
+
+    def test_each_ramp_step_sends_four_commands(self):
+        # Until 18 Nov 2026 every step sent 9: the driver repeated the ramp's checks.
+        if not hasattr(self.scanner, 'write_raw'):
+            self.skipTest('Physical ANC300 package unavailable')
+        offsets, sent = {1: 8.0}, []
+        def exchange(command):
+            sent.append(command)
+            op, axis, *value = command.split()
+            if op == 'seta':
+                offsets[int(axis)] = float(value[0])
+                return ''
+            return {'geta': f'{offsets[int(axis)]:.6f}', 'geto': f'{offsets[int(axis)]:.6f}', 'getm': 'off'}[op]
+        self.scanner.configure_motion(ScannerSettings(rate=1, increment=1))
+        with self.fast_wait(), patch.object(self.scanner, 'simulated', False), \
+             patch.object(self.scanner, '_exchange', side_effect=exchange):
+            self.assertTrue(self.scanner.ramp_voltages({1: 10}))
+        self.assertEqual(sent, ['geta 1', 'geto 1', 'getm 1',                      # before any motion
+                                'geta 1', 'getm 1', 'seta 1 9.000000', 'geta 1',  # step to 9 V
+                                'geta 1', 'getm 1', 'seta 1 10.000000', 'geta 1'])
+        self.assertEqual(offsets[1], 10)
+
+    def test_dashboard_does_not_poll_the_scanner_while_a_ramp_holds_it(self):
+        tab = self.tab()
+        with patch.object(self.scanner, 'get_axis_status', wraps=self.scanner.get_axis_status) as status:
+            with self.scanner.motion_lock:
+                tab.poll_voltages()
+            status.assert_not_called()
+            tab.poll_voltages()
+            self.assertEqual(status.call_count, 2)  # both axes again once the ramp is over
 
     def test_settings_and_competing_moves_rejected_while_moving(self):
         with self.scanner.motion_lock:
@@ -342,10 +496,12 @@ class PositionMotionTests(unittest.TestCase):
         # Exercise the physical driver's public command routing using fake I/O.
         writes = []
         def exchange(command):
-            op, axis, value = command.split()
+            op, axis, *value = command.split()
+            if op == 'getm':  # the mode check before each step
+                return 'off'
             self.assertEqual(op, 'seta')
-            writes.append(float(value))
-            self.scanner._voltages[int(axis)] = float(value)
+            writes.append(float(value[0]))
+            self.scanner._voltages[int(axis)] = float(value[0])
         if not hasattr(self.scanner, 'write_raw'):
             self.skipTest('Physical ANC300 package unavailable')
         with self.fast_wait(), patch.object(self.scanner, '_exchange', side_effect=exchange), \
