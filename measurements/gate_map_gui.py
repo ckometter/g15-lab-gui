@@ -1668,17 +1668,25 @@ class GateMapWindow(QtWidgets.QMainWindow):
                 return
         try:
             loaded = self.read_file(path)
-            settings = loaded["settings"]
-            plan = self.build_plan(settings)
-            if plan.shape != loaded["mask"].shape:
-                raise ValueError("The saved grid does not match its recorded sweep settings.")
-            plan.vt, plan.vb, plan.vs = loaded["vt"], loaded["vb"], loaded["vs"]
-            plan.n0, plan.p0, plan.x, plan.y = loaded["n0"], loaded["p0"], loaded["x"], loaded["y"]
-            plan.order = loaded["order"]
+            plan = self.plan_for(loaded)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Open failed", f"{path}\n\n{exc}")
             return
-        self.plan, self.run_settings = plan, settings
+        self.show_loaded(path, loaded, plan)
+
+    def plan_for(self, loaded):
+        """The recorded sweep plan of a read file; raises if the file is inconsistent."""
+        plan = self.build_plan(loaded["settings"])
+        if plan.shape != loaded["mask"].shape:
+            raise ValueError("The saved grid does not match its recorded sweep settings.")
+        plan.vt, plan.vb, plan.vs = loaded["vt"], loaded["vb"], loaded["vs"]
+        plan.n0, plan.p0, plan.x, plan.y = loaded["n0"], loaded["p0"], loaded["x"], loaded["y"]
+        plan.order = loaded["order"]
+        return plan
+
+    def show_loaded(self, path, loaded, plan):
+        """Display a read file (Open, or the separate Data plotter); no device is touched."""
+        self.plan, self.run_settings = plan, loaded["settings"]
         self.data, self.measured_mask = loaded["data"], loaded["mask"]
         self.x_coords, self.y_coords = plan.x, plan.y
         attrs = loaded["attrs"]

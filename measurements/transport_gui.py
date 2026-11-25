@@ -314,14 +314,19 @@ def write_transport_file(path, *, plan, data, mask, attrs, settings, value_stora
 
 def read_transport_file(path):
     with h5py.File(path, "r") as f:
-        if f.attrs.get("schema") != FILE_SCHEMA:
-            raise ValueError("This file is not a four-probe transport measurement saved by this dashboard.")
-        data = {key: np.array(f[FIELD_INFO[key][0]]) for key in POINT_FIELDS}
-        for key in INT_FIELDS:
-            data[key] = np.array(f[key])
-        return {"settings": json.loads(f["metadata/settings"][()]), "data": data,
-                "mask": np.array(f["measured_mask"], dtype=bool), **read_plan_datasets(f),
-                "attrs": {key: f.attrs[key] for key in f.attrs}}
+        return parse_transport_file(f)
+
+
+def parse_transport_file(f):
+    """The contents of an open transport file; the Data plotter opens it without a lock."""
+    if f.attrs.get("schema") != FILE_SCHEMA:
+        raise ValueError("This file is not a four-probe transport measurement saved by this dashboard.")
+    data = {key: np.array(f[FIELD_INFO[key][0]]) for key in POINT_FIELDS}
+    for key in INT_FIELDS:
+        data[key] = np.array(f[key])
+    return {"settings": json.loads(f["metadata/settings"][()]), "data": data,
+            "mask": np.array(f["measured_mask"], dtype=bool), **read_plan_datasets(f),
+            "attrs": {key: f.attrs[key] for key in f.attrs}}
 
 
 # ---------------------------------------------------------------------------

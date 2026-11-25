@@ -167,7 +167,6 @@ model. The simulation never reconfigures a physical lock-in.
   with a small series resistor that drives a large current.
 - Autorange changes the lock-in sensitivity during the run.
 - The uVoltDAQ has no current compliance; only Keysight outputs limit leakage.
-- Stop, errors and Data plotter mode leave the electrodes at their present
-  voltages.
+- Stop and errors leave the electrodes at their present voltages.
 - Validation used simulated instruments and fake I/O only; no physical
   instrument was operated.

@@ -8,7 +8,7 @@
 - [x] Gate ramp, then GUI settling delay, then acquisition; failures/cancellation stop capture.
 - [x] Scroll gestures cannot modify numeric inputs, dropdowns or sliders, even when focused.
 - [x] Stop remains available during manual ramps; competing tabs/Start/Reset are blocked.
-- [x] Spectrum/DGS/PSDGS data-plotter slider, asynchronous file loading and measurement-state restoration.
+- [x] Data plotter for the files of every measurement tab, as a separate read-only program usable during measurements (replaces the dashboard's slider and plotter mode): lock-free reads with retries, background loading, simulated devices only.
 - [x] Recorded physical grids/calibrations retained; missing points stay visibly missing.
 - [x] Last completed live spectrum retained; automatic scaling yields to manual zoom/pan.
 - [x] Latest-frame display avoids stale-frame queues and the former 100 ms artificial delay.
@@ -64,8 +64,8 @@ was restarted or updated on its host PC.
   cap nor 100 nA compliance establishes a sample-specific safe electric field.
 - Manual current-source mode cannot guarantee voltage slew rate; gate sweeps
   require voltage sourcing. Explicit OFF remains immediate.
-- Stop and Data plotter mode leave gate outputs at existing setpoints; they do
-  not automatically disconnect or ground the sample. The optional Dual-Gate end
+- Stop leaves gate outputs at existing setpoints; it does not automatically
+  disconnect or ground the sample. The optional Dual-Gate end
   ramp only brings the setpoints to 0 V after a complete sweep; outputs stay on.
 - Other programs and instrument front-panel changes remain outside GUI control.
 
