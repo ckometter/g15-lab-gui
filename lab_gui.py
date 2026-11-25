@@ -208,6 +208,7 @@ class LabMainWindow(QtWidgets.QMainWindow):
         self.apply_theme()
         from gui_safety import install_parameter_wheel_guard
         install_parameter_wheel_guard(self)
+        self.setup_measurement_queue()
 
     def set_plotter_mode(self, enabled):
         """Switch only when idle; do not issue source or movement commands."""
@@ -319,6 +320,10 @@ class LabMainWindow(QtWidgets.QMainWindow):
             self.tab_widget.setCurrentIndex(5)
 
     def measurement_active(self):
+        # A running measurement queue counts between its runs too (docs/MEASUREMENT_QUEUE.md).
+        queue = getattr(self, "queue_panel", None)
+        if queue is not None and queue.runner.running():
+            return True
         # The polarization worker runs continuously for polling, even when idle.
         for name in ("single_window", "dual_window", "bv_window", "pl_map_window",
                      "scalar_map_window", "position_dgs_window", "capacitance_window", "transport_window"):
@@ -746,6 +751,9 @@ class LabMainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"Stopping the {' and '.join(names)} measurement before closing…")
             QtCore.QTimer.singleShot(100, self.close)
             return
+        # The window closes now: end the queue. A queued run in progress is autosaved.
+        if getattr(self, "queue_panel", None) is not None:
+            self.queue_panel.abort("The dashboard was closed.")
         self.lockout_timer.stop()
         self.levelmeter_worker.stop()
         self.levelmeter_worker.wait(3000)
@@ -872,6 +880,36 @@ class LabMainWindow(QtWidgets.QMainWindow):
         if self.device_manager is not None:
             self.device_manager.close()
         super().closeEvent(event)
+
+    def setup_measurement_queue(self):
+        """The measurement queue (docs/MEASUREMENT_QUEUE.md): a dock below the tabs, shown
+        from the status bar or by Add to queue on the Dual-Gate tab."""
+        from measurements.dgs_queue import DualGateQueueAdapter
+        from measurements.queue_panel import MeasurementQueuePanel
+        adapter = DualGateQueueAdapter(self.dual_window, tab_index=1, parent=self)
+        self.queue_panel = MeasurementQueuePanel(self, {adapter.key: adapter})
+        self.queue_dock = QtWidgets.QDockWidget("Measurement queue", self)
+        self.queue_dock.setObjectName("measurement_queue_dock")
+        self.queue_dock.setWidget(self.queue_panel)
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, self.queue_dock)
+        self.queue_dock.hide()
+        self.queue_panel.title_changed.connect(self.queue_dock.setWindowTitle)
+        toggle = self.queue_dock.toggleViewAction()
+        toggle.setToolTip("Show or hide the measurement queue.")
+        self.queue_button = QtWidgets.QToolButton()
+        self.queue_button.setDefaultAction(toggle)
+        self.statusBar().addPermanentWidget(self.queue_button)
+        # Next to Begin on the Dual-Gate tab only; Position DGS shares that tab's code, not this button.
+        window = self.dual_window
+        self.queue_add_button = QtWidgets.QPushButton("+ Add to queue")
+        self.queue_add_button.setToolTip(
+            "Add these sweep settings to the measurement queue, to run one after another later. "
+            "Ramp rates, current limits, outputs and voltage windows stay as set on this tab.")
+        self.queue_add_button.clicked.connect(lambda: self.queue_panel.add_from(adapter, show_dock=True))
+        layout = window.begin_btn.parentWidget().layout()
+        layout.insertWidget(layout.indexOf(window.begin_btn) + 1, self.queue_add_button)
+        self.queue_panel.add_buttons[self.queue_add_button] = adapter
+        self.queue_panel.update_buttons()
 
 
 def main():

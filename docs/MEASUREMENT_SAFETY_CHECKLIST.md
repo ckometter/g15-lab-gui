@@ -18,6 +18,7 @@
 - [x] Dual-Gate outputs: Keysight or a uVoltDAQ DAC per gate; DAC gates checked against +/-10 V, currents saved as NaN.
 - [x] Dual-Gate per-gate voltage windows (lowest and highest for ch1 and ch2): checked after the matrix before a sweep and at every point, and for manual setpoints.
 - [x] Transport tab: both lock-ins' input modes are checked against the selected wiring before any electrode moves; whole-map limits as in the Capacitance tab (default top-gate dielectric limit 0.8 V, from the script's station).
+- [x] Measurement queue: Dual-Gate runs one after another through Begin. Every entry is checked before the first run, and the queue never changes outputs, windows, current limits or ramp rates. An error stops the queue and holds the gates ([MEASUREMENT_QUEUE.md](MEASUREMENT_QUEUE.md)).
 
 ## To do after editing
 
@@ -27,6 +28,7 @@
 - [ ] Set the Dual-Gate voltage windows (**ch1/ch2 allowed from … to …**) for the device before sweeping with a matrix (default: -1 V to +1 V, which blocks larger sweeps and setpoints until widened).
 - [ ] Before the first Transport run: connect `lockin2` (SR830 at `GPIB0::10::INSTR`) in the Device Manager, set the Transport tab's gate limits for the device, and compare one live R4 reading with the qcodes-qpg script.
 - [ ] Review `GATE_COORDINATE_PROPOSAL.md` before implementing a new coordinate convention.
+- [ ] Before the first overnight queue, run a queue of two small sweeps at safe voltages. Then check its record in `data/<date>/queue/` and its files in `data/<date>/`.
 
 ## Validation (2026-10-01)
 
@@ -68,6 +70,9 @@ was restarted or updated on its host PC.
   not automatically disconnect or ground the sample. The optional Dual-Gate end
   ramp only brings the setpoints to 0 V after a complete sweep; outputs stay on.
 - Other programs and instrument front-panel changes remain outside GUI control.
+- A measurement queue runs unattended for hours with one set of windows, current
+  limits and ramp rates. Between runs, Begin's ramp moves V1 before V2. After an
+  error the gates stay where it happened until someone returns.
 
 See `GATE_CURRENT_PROTECTION.md` for the exact protections and
 `DATA_PLOTTER_AND_LIVE.md` for operation and performance limits.

@@ -36,6 +36,16 @@ format. The dashboard handles every gate-map tab through
 changes and shutdown), so adding another one, such as a DC IV map, needs no
 changes to the dashboard's tab handling.
 
+## Measurement queue
+
+A dock below the tabs runs Dual-Gate Sweeps one after another through that tab's
+own Begin ([MEASUREMENT_QUEUE.md](MEASUREMENT_QUEUE.md)). The runner
+(`measurements/queue_panel.py`) talks to a tab only through an adapter,
+`QueueAdapter`; the Dual-Gate adapter is in `measurements/dgs_queue.py`.
+While a queue runs, `LabMainWindow.measurement_active()` is True, also between
+its runs. So the tab lock, the Device Manager and the pollers treat the whole
+queue as one measurement. Another tab joins the queue by adding an adapter.
+
 ## Evaluated and left separate
 
 - **Spectroscopy tabs (0–4, 7).** Each has its own view popup, live poller and
